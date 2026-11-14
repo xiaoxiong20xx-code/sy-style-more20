@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>45 金缮 · Kintsugi</title>
+<script src="../../lib/core.js"></script><script src="../../lib/track.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 45 金缮 · KINTSUGI =====
+   Real world: a Jian-ware tea bowl (束口盏) — black iron glaze with hare's-fur streaks, a rust-brown rim where the glaze
+   runs thin, a fat glaze roll stopping short of the gritty dark foot — broken into six shards on indigo linen.
+   On each beat a shard lifts and seats itself back into the bowl with a click. On 4.0 gold lacquer runs into the
+   cracks: down from the rim, round the base, up every other crack, until the whole bowl is stitched in gold; a strip
+   light rakes across on 5.0 and the gold flashes. The bowl turns to show its best face and stops on 8.0.
+   Lathe SDF (outer/inner profile table) cut by analytic crack surfaces; each shard is the bowl ∩ its cell, moved by
+   its own rigid transform; the gold is a ribbon around the crack/surface intersection. */
+const { E, clamp, inv, lerp } = Reel;
+const stage = Reel.makeStage('#050506');
+Reel.ownJitter = true;
+const C = Reel.cfg({});
+const TAU = Math.PI * 2;
+
+/* ---------------- profile: outer and inner radius by height (1 unit = 10 cm) ---------------- */
+const NP = 1024, YT = 0.69, YIB = 0.118;
+const RO = new Float32Array(NP), RI = new Float32Array(NP);
+function smoothArr(a, S) {
+  const o = new Float32Array(a.length), K = [], W = Math.ceil(S * 3);
+  for (let j = -W; j <= W; j++) K.push(Math.exp(-j * j / (2 * S * S)));
+  for (let k = 0; k < a.length; k++) { let s = 0, w = 0; for (let j = -W; j <= W; j++) { const kk = Math.min(a.length - 1, Math.max(0, k + j)); s += a[kk] * K[j + W]; w += K[j + W]; } o[k] = s / w; }
+  return o;
+}
+(function () {
+  const ro = new Float32Array(NP), ri = new Float32Array(NP);
+  for (let k = 0; k < NP; k++) {
+    const y = k / (NP - 1) * YT;
+    let r;
+    if (y < 0.072) r = 0.205 - 0.008 * (1 - clamp(y / 0.018));                       // foot ring, bevelled
+    else if (y < 0.088) r = lerp(0.205, 0.232, E.inOutSine(inv(0.072, 0.088, y)));     // the step up into the body
+    else { const u = clamp((y - 0.08) / 0.53); r = 0.225 + 0.357 * (1 - Math.pow(1 - u, 1.75)); }
+    if (y > 0.6) r += 0.0035 * (y - 0.6) / 0.09 - 0.0085 * Math.exp(-Math.pow((y - 0.632) / 0.011, 2)); // 束口 groove
+    ro[k] = r;
+    const w = 0.024 + 0.05 * Math.exp(-(y - 0.1) / 0.09) - 0.006 * clamp((y - 0.6) / 0.09);
+    const bowlIn = Math.sqrt(Math.max(0, (y - YIB) * 2 * 0.6));                        // the well at the bottom
+    ri[k] = y < YIB ? -0.05 : Math.min(r - w, bowlIn);
+  }
+  RO.set(smoothArr(ro, 3)); RI.set(smoothArr(ri, 4));
+  for (let k = 0; k < NP; k++) if (k / (NP - 1) * YT < YIB) RI[k] = -0.05;
+})();
+const rOut = (y) => { const x = clamp(y / YT) * (NP - 1), i = Math.min(NP - 2, Math.floor(x)), f = x - i; return RO[i] * (1 - f) + RO[i + 1] * f; };
+const rIn = (y) => { const x = clamp(y / YT) * (NP - 1), i = Math.min(NP - 2, Math.floor(x)), f = x - i; return RI[i] * (1 - f) + RI[i + 1] * f; };
+
+/* ---------------- cracks (shared JS/GLSL) ---------------- */
+const CK = [0.35, 1.62, 2.75, 3.95, 5.15];
+const crackTh = (k, y) => CK[k] + 0.13 * Math.sin(y * 9 + k * 1.7) + 0.05 * Math.sin(y * 23 + k * 2.3) + 0.012 * Math.sin(y * 71 + k);
+const ringY = (th) => 0.235 + 0.045 * Math.sin(2 * th + 1) + 0.025 * Math.sin(5 * th + 0.4) + 0.006 * Math.sin(17 * th);
+const angIn = (a, lo, hi) => { const w = ((hi - lo) % TAU + TAU) % TAU; return (((a - lo) % TAU) + TAU) % TAU <= w; };
+function pieceOf(th, y) {
+  if (y < ringY(th)) return 5;
+  for (let k = 0; k < 5; k++) if (angIn(th, crackTh(k, y), crackTh((k + 1) % 5, y))) return k;
+  return 0;
+}
+
+/* ---------------- shard rest poses ---------------- */
+const qmul = (a, b) => [a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1], a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0], a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3], a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]];
+const qax = (ax, an) => { const l = Math.hypot(...ax), s = Math.sin(an / 2); return [ax[0] / l * s, ax[1] / l * s, ax[2] / l * s, Math.cos(an / 2)]; };
+function qslerp(a, b, t) {
+  let d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]; let bb = b; if (d < 0) { d = -d; bb = b.map((v) => -v); }
+  if (d > 0.9995) { const r = a.map((v, i) => v + (bb[i] - v) * t), l = Math.hypot(...r); return r.map((v) => v / l); }
+  const th = Math.acos(d), s = Math.sin(th); return a.map((v, i) => (Math.sin((1 - t) * th) * v + Math.sin(t * th) * bb[i]) / s);
+}
+const qmat = (q) => { const [x, y, z, w] = q; return [1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w), 2 * (x * y - z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w), 2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y)]; }; // column-major
+const mv = (m, v) => [m[0] * v[0] + m[3] * v[1] + m[6] * v[2], m[1] * v[0] + m[4] * v[1] + m[7] * v[2], m[2] * v[0] + m[5] * v[1] + m[8] * v[2]];
+const PIECES = [];
+(function () {
+  const R = Reel.rng(45);
+  for (let k = 0; k < 5; k++) {
+    // sample the shard's surface
+    const pts = []; let thc = 0, n = 0;
+    for (let i = 0; i <= 24; i++) for (let j = 0; j <= 12; j++) {
+      const y = lerp(0.2, YT, j / 12);
+      const a0 = crackTh(k, y), a1 = crackTh((k + 1) % 5, y), w = ((a1 - a0) % TAU + TAU) % TAU, th = a0 + w * i / 24;
+      if (y < ringY(th)) continue;
+      pts.push([rOut(y) * Math.cos(th), y, rOut(y) * Math.sin(th)], [rIn(y) * Math.cos(th), y, rIn(y) * Math.sin(th)]);
+      if (j === 6) { thc += th; n++; }
+    }
+    // the shard's own centre angle (unwrap around its start crack)
+    const a0 = crackTh(k, 0.45), a1 = crackTh((k + 1) % 5, 0.45), mid = a0 + (((a1 - a0) % TAU + TAU) % TAU) / 2;
+    // lie it on its back: outward normal -> down, then a random turn
+    const no = [Math.cos(mid) * 0.82, -0.57, Math.sin(mid) * 0.82];
+    const cr = [no[1] * 0 - no[2] * -1, no[2] * 0 - no[0] * 0, no[0] * -1 - no[1] * 0];  // cross(no, (0,-1,0))
+    const ang = Math.acos(clamp(-no[1], -1, 1));
+    let q = qax(cr, ang);
+    q = qmul(qax([0, 1, 0], (R() - 0.5) * 2.2), q);
+    const M = qmat(q);
+    let minY = 1e9, cx = 0, cz = 0;
+    for (const p of pts) { const w = mv(M, p); minY = Math.min(minY, w[1]); cx += w[0] / pts.length; cz += w[2] / pts.length; }
+    const dist = 1.12 + 0.18 * R();
+    const T = [Math.cos(mid) * dist - cx, -minY + 0.006, Math.sin(mid) * dist - cz];
+    PIECES.push({ q, T, mid, tLand: 0.5 + k * 0.5 });
+  }
+})();
+
+/* ---------------- renderer ---------------- */
+const rm = Reel.RM(stage, {
+  bloom: 0.55, th: 1.0, expo: 1.0, vig: 0.45, grain: 0.03, ca: 0.4, contrast: 1.06, sat: 1.0, bands: 4,
+  lift: [0.004, 0.004, 0.006],
+  uniforms: `
+uniform sampler2D uProf;
+uniform vec3 uRo, uTa; uniform float uF, uT;
+uniform vec3 uR[18]; uniform vec3 uTr[6];
+uniform float uSpin, uAsm;      // bowl turn; 1 once every shard is home
+uniform vec4 uGold;             // flow clock (s since 4.0), on, sweep azimuth, sweep gain
+uniform float uKey;`,
+  scene: `
+const float TAUf = 6.2831853, YT = ${YT.toFixed(4)}, YIB = ${YIB.toFixed(4)};
+vec4 prof(float y){
+  float x = clamp(y / YT, 0., 1.) * ${NP - 1}.; int i = min(int(floor(x)), ${NP - 2}); float f = x - float(i);
+  return mix(texelFetch(uProf, ivec2(i, 0), 0), texelFetch(uProf, ivec2(i + 1, 0), 0), f);
+}
+float sdBowl(vec3 p){
+  float rho = length(p.xz), y = p.y, yc = clamp(y, 0., YT);
+  vec4 pr = prof(yc);
+  float dout = (y >= 0. && y <= YT) ? (rho - pr.x) * inversesqrt(1. + pr.y * pr.y) : (rho < pr.x ? abs(y - yc) : length(vec2(rho - pr.x, y - yc)));
+  float din = (rho - pr.z) * inversesqrt(1. + pr.w * pr.w);
+  if (y < YIB) din = max(din, YIB - y);
+  float d = smax(dout, -din, .006);
+  // the fat roll where the glaze stopped short of the foot
+  float th = atan(p.z, p.x);
+  float yg = .158 + .012 * sin(th * 7. + 1.) + .03 * pow(max(sin(th * 3. + .6), 0.), 12.);
+  d -= .0035 * exp(-pow((y - yg) / .009, 2.)) * smoothstep(.02, .0, abs(rho - pr.x));
+  return d;
+}
+float crackTh(int k, float y){
+  float c = k == 0 ? ${CK[0]} : k == 1 ? ${CK[1]} : k == 2 ? ${CK[2]} : k == 3 ? ${CK[3]} : ${CK[4]};
+  float fk = float(k);
+  return c + .13 * sin(y * 9. + fk * 1.7) + .05 * sin(y * 23. + fk * 2.3) + .012 * sin(y * 71. + fk);
+}
+float ringY(float th){ return .235 + .045 * sin(2. * th + 1.) + .025 * sin(5. * th + .4) + .006 * sin(17. * th); }
+float wrapA(float a){ return mod(a + 3.14159265, TAUf) - 3.14159265; }
+// signed distance (in the surface, ~physical) to shard k's cell: negative inside. k = 5: the foot piece
+float cellD(vec3 p, int k){
+  float th = atan(p.z, p.x), rho = max(length(p.xz), .05), y = p.y;
+  float dr = (y - ringY(th)) * .9;
+  if (k == 5) return dr;
+  float a0 = crackTh(k, y), a1 = crackTh(k == 4 ? 0 : k + 1, y);
+  float da = wrapA(th - a0) * rho, db = wrapA(a1 - th) * rho;
+  return max(max(-da, -db), -dr);
+}
+// distance to the nearest crack line + which crack (0..4 wall, 5 ring) and where along it
+float crackDist(vec3 p, out int ck){
+  float th = atan(p.z, p.x), rho = max(length(p.xz), .05), y = p.y;
+  float best = abs(y - ringY(th)) * .9; ck = 5;
+  for (int k = 0; k < 5; k++){
+    if (y < ringY(crackTh(k, y)) - .01) continue;
+    float d = abs(wrapA(th - crackTh(k, y))) * rho; if (d < best) { best = d; ck = k; }
+  }
+  return best;
+}
+// when the gold reaches this point of the network (s since 4.0)
+float goldArrive(vec3 p, int ck){
+  float th = atan(p.z, p.x), y = p.y;
+  const float V = 1.5, VR = 2.6, RR = .4;
+  float tRing0 = (YT - ringY(crackTh(0, ringY(crackTh(0, .25))))) / V;
+  float a0 = crackTh(0, ringY(crackTh(0, .25)));
+  if (ck == 0) return (YT - y) / V;
+  if (ck == 5) return tRing0 + abs(wrapA(th - a0)) * RR / VR;
+  float ak = crackTh(ck, .25);
+  return tRing0 + abs(wrapA(ak - a0)) * RR / VR + max(y - ringY(ak), 0.) / V;
+}
+vec3 bowlLocal(vec3 p){ return rotY(uSpin) * p; }
+mat3 RK(int k){ return mat3(uR[k * 3], uR[k * 3 + 1], uR[k * 3 + 2]); }
+int gM = 0; int gK = 0; float gFrac = 0.;
+float mapShards(vec3 p, out int kk, out float frac){
+  float d = 1e3; kk = 0; frac = 0.;
+  for (int k = 0; k < 6; k++){
+    vec3 q = RK(k) * (p - uTr[k]);
+    q = bowlLocal(q);
+    float bb = length(q - vec3(0., .35, 0.)) - .66;
+    if (bb > d) continue;
+    float db = sdBowl(q), dc = cellD(q, k);
+    float s = max(db, dc + .0006 * (1. - uAsm));
+    if (s < d) { d = s; kk = k; frac = dc > db - .0004 ? 1. : 0.; }
+  }
+  return d;
+}
+float goldSD(vec3 p, out float fresh){
+  fresh = 0.;
+  if (uGold.y < .5) return 1e3;
+  vec3 q = bowlLocal(p);
+  if (length(q - vec3(0., .35, 0.)) > .72) return length(q - vec3(0., .35, 0.)) - .7;
+  int ck; float dc = crackDist(q, ck);
+  float db = sdBowl(q);
+  float ta = goldArrive(q, ck);
+  float age = uGold.x - ta;
+  float on = smoothstep(-.02, .03, age);
+  fresh = exp(-max(age, 0.) / .35) * on;
+  float w = mix(.0, .0055, on) * (1. + .5 * fresh), h = mix(-.002, .0012, on) * (1. + 1.2 * fresh);
+  vec2 e = vec2(dc - w, abs(db) - h);
+  return min(max(e.x, e.y), 0.) + length(max(e, 0.)) - .0009;
+}
+// indigo linen, flat near the bowl, soft folds further out
+// the runner: undyed linen laid on a dark elm tea table; small soft wrinkles toward its edges
+float clothH(vec2 xz){ return .006 + .004 * smoothstep(.9, 1.4, abs(xz.y)) * (fbm2(xz * 2.2) - .4) + .0012 * (vnoise2(xz * 9.) - .5); }
+float clothSD(vec3 p){ return max(p.y - clothH(p.xz), max(abs(p.z) - 1.45, abs(p.x) - 2.62)); }
+float tableSD(vec3 p){ return sdRoundBox(p - vec3(0., -.07, 0.), vec3(2.6, .07, 1.8), .025); }
+// a lacquer box of gold powder, a makie brush on its rest, a bamboo tea scoop, a lacquer tea caddy
+const vec3 PB = vec3(-1.85, 0., -1.15), PR = vec3(1.75, 0., -1.35), PS = vec3(-.15, 0., 1.7), PC = vec3(2.05, 0., .35);
+float propSD(vec3 p, out int k){
+  float d = sdRoundBox(p - PB - vec3(0., .1, 0.), vec3(.2, .1, .15), .015); k = 0;
+  d = max(d, -sdBox(p - PB - vec3(0., .2, 0.), vec3(.17, .07, .12)));                         // open: hollow
+  float gp = sdBox(p - PB - vec3(0., .14, 0.), vec3(.17, .012, .12)); if (gp < d) { d = gp; k = 1; }   // the gold powder in it
+  float rs = sdRoundBox(p - PR - vec3(0., .03, 0.), vec3(.05, .03, .04), .02); if (rs < d) { d = rs; k = 2; }
+  float br = sdCapsule(p, PR + vec3(-.75, .02, .35), PR + vec3(.05, .075, 0.), .018); if (br < d) { d = br; k = 3; }
+  vec3 q = p - PS; q.xz = mat2(.8, .6, -.6, .8) * q.xz;
+  float sc = sdRoundBox(q - vec3(0., .012 + .015 * smoothstep(.6, .9, q.x), 0.), vec3(.9, .006, .045), .005); if (sc < d) { d = sc; k = 4; }
+  float cd = sdRoundCylinder(p - PC - vec3(0., .17, 0.), .085, .045, .13); if (cd < d) { d = cd; k = 5; }
+  return d;
+}
+float propD(vec3 p){ int k; return propSD(p, k); }
+float map(vec3 p){
+  int kk; float fr;
+  float d = mapShards(p, kk, fr); gM = 1; gK = kk; gFrac = fr;
+  float fresh; float g = goldSD(p, fresh); if (g < d) { d = g; gM = 2; }
+  float c = clothSD(p); if (c < d) { d = c * .9; gM = 3; }
+  float tb = tableSD(p); if (tb < d) { d = tb; gM = 4; }
+  int pk; float pr = propSD(p, pk); if (pr < d) { d = pr; gM = 5 + pk; }
+  return d;
+}
+float mapS(vec3 p){ int kk; float fr, fresh; return min(min(min(mapShards(p, kk, fr), goldSD(p, fresh)), min(clothSD(p), tableSD(p))), propD(p)); }
+vec3 calcN(vec3 p){ vec2 e = vec2(.0003, 0.); return normalize(vec3(mapS(p + e.xyy) - mapS(p - e.xyy), mapS(p + e.yxy) - mapS(p - e.yxy), mapS(p + e.yyx) - mapS(p - e.yyx))); }
+float gJit = 0.;
+float softSh(vec3 p, vec3 L, float k){
+  float res = 1., t = .002 + .006 * gJit;
+  for (int i = 0; i < 72; i++){ float h = mapS(p + L * t); res = min(res, k * h / t); if (res < .002 || t > 3.) break; t += clamp(h, .002, .12) * (.85 + .3 * gJit); }
+  res = clamp(res, 0., 1.); return res * res * (3. - 2. * res);
+}
+float aoF(vec3 p, vec3 n){ float o = 0., s = 1.; for (int i = 1; i <= 5; i++){ float h = .015 * float(i) * float(i); o += (h - mapS(p + n * h)) * s; s *= .6; } return clamp(1. - o * 2., 0., 1.); }
+const vec3 LK = normalize(vec3(-.55, .75, -.38));     // big soft window, behind-left, high
+const vec3 LIGHT_COL = vec3(1.);   // key window colour (all key-lit surfaces, the window in reflections, the shoji wall); vec3(1.) = original
+const vec3 LF = normalize(vec3(.7, .35, .62));        // low warm card, front-right
+float rectL(vec3 d, vec3 c, vec2 sz, float soft){
+  float z = dot(d, c); if (z <= 0.) return 0.;
+  vec3 r = normalize(cross(vec3(0., 1., 0.), c)), u = cross(c, r);
+  vec2 q = vec2(dot(d, r), dot(d, u)) / z; vec2 e = abs(q) - sz;
+  return (1. - smoothstep(-soft, soft, e.x)) * (1. - smoothstep(-soft, soft, e.y)) * (.8 + .2 * (1. - length(q / sz) * .7));
+}
+vec3 env(vec3 d){
+  vec3 c = vec3(.008, .009, .012) * (.5 + .5 * d.y);
+  { float z = dot(d, LK); if (z > 0.) { vec3 r = normalize(cross(vec3(0., 1., 0.), LK)), u = cross(LK, r); vec2 q = vec2(dot(d, r), dot(d, u)) / z;
+      vec2 e = abs(q) - vec2(.6, .42);
+      float paper = (1. - smoothstep(-.04, .04, e.x)) * (1. - smoothstep(-.04, .04, e.y));
+      vec2 g = abs(fract(q / vec2(.15, .1) + .5) - .5) * vec2(.15, .1);
+      float lat = smoothstep(.006, .003, min(g.x, g.y));                                    // kumiko lattice
+      c += LIGHT_COL * vec3(1., .95, .86) * paper * (1. - .75 * lat) * (.9 + .1 * vnoise2(q * 30.)) * 4.2 * uKey; } }
+  c += vec3(1., .86, .7) * rectL(d, LF, vec2(.35, .22), .1) * .9;
+  c += vec3(.16, .12, .08) * smoothstep(-.1, .4, d.y) * smoothstep(.9, .3, d.y) * .5;      // the room: earth walls, wood, tatami
+  vec3 sd = normalize(vec3(sin(uGold.z), .28, cos(uGold.z)));
+  c += vec3(1., .96, .9) * rectL(d, sd, vec2(.03, .7), .015) * 16. * uGold.w;
+  c += vec3(.02, .025, .05) * smoothstep(.0, -.5, d.y);
+  return c;
+}
+vec3 room(vec3 ro, vec3 rd, out float tw){
+  tw = 30.; vec3 c = vec3(.03, .025, .02);
+  float t1 = rd.z < 0. ? (-8.5 - ro.z) / rd.z : 1e9;          // shoji wall
+  float t2 = rd.y < 0. ? (-3. - ro.y) / rd.y : 1e9;           // tatami
+  float t3 = rd.x < 0. ? (-8. - ro.x) / rd.x : rd.x > 0. ? (8. - ro.x) / rd.x : 1e9;   // earthen walls
+  float t = min(t1, min(t2, t3)); if (t > 1e8) return c;
+  vec3 P = ro + rd * t; tw = t;
+  if (t == t1) {
+    vec2 q = P.xy;
+    vec2 g = abs(fract(q / vec2(.9, .6) + .5) - .5) * vec2(.9, .6);
+    float lat = smoothstep(.035, .02, min(g.x, g.y));
+    float post = smoothstep(.12, .08, abs(fract(q.x / 5.4 + .5) - .5) * 5.4);
+    c = LIGHT_COL * vec3(1., .93, .82) * .78 * (1. - .7 * lat) * smoothstep(-3., -2.4, q.y) * smoothstep(9., 7.5, q.y);
+    c = mix(c, vec3(.08, .055, .035), post);
+  } else if (t == t2) {
+    vec2 q = P.xz; float st = .5 + .5 * sin(q.y * 60.) * .3 + .2 * vnoise2(vec2(q.x * 2., q.y * 40.));
+    float border = smoothstep(.09, .06, abs(fract(q.y / 3.6 + .5) - .5) * 3.6);
+    c = mix(vec3(.3, .27, .17) * (.8 + .25 * st), vec3(.06, .05, .04), border) * (.35 + .5 * exp(-max(-q.y - 4., 0.) * .2));
+  } else {
+    c = vec3(.3, .22, .15) * (.65 + .35 * fbm2(P.zy * 1.2)) * .45;
+  }
+  return c;
+}
+vec3 glaze(vec3 q, vec3 nl, bool inside, out float rough){
+  // hare's fur: fine streaks running down from the rim, rust at the thin rim, a black pool in the well
+  float th = atan(q.z, q.x), y = q.y;
+  // 兔毫: fine brown filaments that ran down from the rim as the glaze melted, tapering to points;
+  // two interleaved layers so they are dense but never regular; glossy black glaze between them
+  vec3 c = vec3(.006, .0065, .009);
+  float fur = 0., gold = 0.;
+  for (int L = 0; L < 2; L++) {
+    float fl = float(L);
+    float u = th * (L == 0 ? 150. : 233.) + .9 * sin(y * 7. + th * 3. + fl * 2.) + fl * .37;
+    float cell = floor(u), fu = fract(u) - .5;
+    float h = hash11(cell + 17. + fl * 41.), h2 = hash11(cell * 3.7 + 5. + fl * 13.);
+    float yb = YT - (.06 + .3 * h2 * h2);                   // how far down this hair ran (most are short)
+    float along = clamp((y - yb) / (YT - yb), 0., 1.);      // 0 at its tip, 1 at the rim
+    float w = (.045 + .1 * h) * (.2 + .8 * along);
+    float aa = fwidth(u) * .7;
+    float hair = (1. - smoothstep(w - aa, w + aa, abs(fu))) * step(.5, h) * smoothstep(0., .3, along) * step(y, YT - .002);
+    fur = max(fur, hair * (.6 + .4 * h2));
+    gold = max(gold, hair * step(.8, h));
+  }
+  vec3 furC = mix(vec3(.085, .042, .016), vec3(.19, .11, .05), gold);
+  c = mix(c, furC, fur * (inside ? .8 : .5));
+  // 酱色口: the glaze thins at the lip and turns soy-brown, fading into the fur
+  c = mix(c, vec3(.1, .045, .018), smoothstep(.662, .68, y) * .8);
+  c = mix(c, vec3(.075, .04, .02), smoothstep(.685, .69, y) * .6);
+  rough = .03;
+  return c;
+}
+vec3 shade(vec3 ro, vec3 rd, float tt, vec3 P){
+  vec3 V = -rd;
+  vec3 n = calcN(P);
+  float sh = softSh(P + n * .003, LK, 10.);
+  float ao = aoF(P, n);
+  if (gM == 3) {     // linen
+    vec2 q = P.xz;
+    float wa = 1. - smoothstep(.5, 1.2, tt);
+    float wx = mix(.5, sin(q.x * 820.) * .5 + .5, wa), wz = mix(.5, sin(q.y * 790.) * .5 + .5, wa);
+    float slub = vnoise2(vec2(q.x * 60., q.y * 3.)) * .6 + vnoise2(vec2(q.x * 3., q.y * 64.)) * .4;
+    vec3 alb = vec3(.3, .265, .21) * (.78 + .22 * max(wx, wz) + .3 * (slub - .5) + .2 * (vnoise2(q * 240.) - .5));
+    vec3 nn = normalize(n + vec3((wx - .5) * .12, 0., (wz - .5) * .12));
+    float dif = max(dot(nn, LK), 0.) * mix(.12, 1., softSh(P + n * .003, LK, 4.));
+    vec3 c = alb * (LIGHT_COL * vec3(1., .95, .88) * dif * 2.6 * uKey + vec3(1., .86, .7) * max(dot(nn, LF), 0.) * .5 + env(nn) * .15) * ao;
+    c += vec3(.25, .3, .45) * pow(1. - max(dot(nn, V), 0.), 4.) * .05 * dif;                 // fibre sheen
+    return c;
+  }
+  if (gM == 4) {     // dark elm tea table, oiled
+    vec2 q = P.xz;
+    float gr = fbm2(vec2(q.x * 2.5, q.y * 22.)) * .6 + vnoise2(vec2(q.x * 9., q.y * 90.)) * .4;
+    vec3 alb = mix(vec3(.05, .03, .018), vec3(.12, .075, .042), gr);
+    vec3 R = reflect(rd, n);
+    return alb * (LIGHT_COL * vec3(1., .95, .88) * max(dot(n, LK), 0.) * sh * 1.8 * uKey + env(n) * .2) * ao + (env(R) * .5 + env(normalize(R + vec3(0., .25, 0.))) * .5) * schlick(max(dot(n, V), 0.), .04) * .22;
+  }
+  if (gM >= 5) {     // lacquer box (black outside, vermilion inside, gold powder), brush rest, brush, bamboo scoop, tea caddy
+    int k = gM - 5;
+    vec3 R = reflect(rd, n);
+    float F = schlick(max(dot(n, V), 0.), .045);
+    vec3 alb; float gloss = 1.;
+    if (k == 0) { bool inner = P.y > PB.y + .12 && abs(P.x - PB.x) < .171 && abs(P.z - PB.z) < .121; alb = inner ? vec3(.32, .04, .02) : vec3(.012, .01, .01); }
+    else if (k == 1) { alb = vec3(.8, .58, .22) * (.75 + .5 * hash12(floor(P.xz * 900.))); gloss = .15; }
+    else if (k == 2) { alb = vec3(.75, .74, .7); }
+    else if (k == 3) { float tip = smoothstep(.12, .0, length(P - (PR + vec3(-.75, .02, .35)))); alb = mix(vec3(.25, .12, .05), vec3(.03, .025, .02), tip); }
+    else if (k == 4) { alb = vec3(.52, .4, .22) * (.8 + .3 * vnoise2(P.xz * vec2(4., 60.))); gloss = .3; }
+    else { alb = vec3(.015, .012, .012); }
+    vec3 c = alb * (LIGHT_COL * vec3(1., .95, .88) * max(dot(n, LK), 0.) * sh * 1.6 * uKey + env(n) * .25) * ao;
+    return c + env(R) * F * gloss * (k == 1 ? 0. : 1.);
+  }
+  if (gM == 2) {     // gold: lacquer still wet at the front, powdered gold behind it
+    vec3 q = bowlLocal(P);
+    float fresh; goldSD(P, fresh);
+    vec3 gn = n;
+    float grain = hash13(floor(q * 2600.));
+    gn = normalize(n + (hash33(floor(q * 2600.)) - .5) * .18 * (1. - fresh));
+    vec3 F0 = vec3(1., .76, .34);
+    vec3 R = reflect(rd, gn);
+    float rs = mix(1., softSh(P + n * .003, R, 8.), .7);
+    vec3 spec = env(R) * F0 * rs;
+    // rough powder: blur the reflection with the diffuse-ish light
+    vec3 dif = F0 * (LIGHT_COL * vec3(1., .95, .88) * (max(dot(n, LK), 0.) * .8 + .2) * mix(.35, 1., sh) * 1.5 * uKey + env(n) * .9 + vec3(.06, .05, .04));
+    vec3 c = mix(dif * .55 + spec * .55, spec * 1.1, fresh);
+    c *= .8 + .4 * grain;
+    c += vec3(1., .7, .3) * fresh * .05;
+    return c * ao;
+  }
+  // the bowl
+  vec3 q = bowlLocal(RK(gK) * (P - uTr[gK]));
+  float rho = length(q.xz), y = q.y;
+  vec4 pr = prof(clamp(y, 0., YT));
+  bool inside = rho < (pr.x + max(pr.z, 0.)) * .5 && y > YIB - .01;
+  float th = atan(q.z, q.x);
+  float yg = .158 + .012 * sin(th * 7. + 1.) + .03 * pow(max(sin(th * 3. + .6), 0.), 12.);
+  bool bare = !inside && y < yg - .004;
+  int ck; float dcr = crackDist(q, ck);
+  if (gFrac > .5 && uAsm < .999) {        // fracture face: the dark iron body
+    vec3 alb = vec3(.055, .042, .034) * (.7 + .6 * vnoise2(vec2(th * 300., y * 400.)));
+    alb = mix(alb, vec3(.01), smoothstep(.006, .0, min(abs(rho - pr.x), abs(rho - pr.z))) * .8);   // the glaze skin at the edge
+    return alb * (LIGHT_COL * vec3(1., .95, .88) * max(dot(n, LK), 0.) * sh * 2. * uKey + env(n) * .3) * ao;
+  }
+  if (bare) {      // unglazed foot: gritty iron-rich body
+    vec3 alb = vec3(.085, .06, .045) * (.75 + .5 * vnoise2(vec2(th * 200., y * 300.)));
+    alb *= 1. - .4 * step(.9, hash12(floor(vec2(th * 500., y * 800.))));
+    vec3 c = alb * (LIGHT_COL * vec3(1., .95, .88) * max(dot(n, LK), 0.) * sh * 2.2 * uKey + vec3(1., .86, .7) * max(dot(n, LF), 0.) * .5 + env(n) * .2) * ao;
+    return c + env(reflect(rd, n)) * .01;
+  }
+  float rough;
+  vec3 alb = glaze(q, n, inside, rough);
+  // orange-peel in the glaze
+  vec3 gn = normalize(n + (vec3(vnoise2(q.xy * 22.), vnoise2(q.yz * 22.), vnoise2(q.zx * 22.)) - .5) * .008);
+  float F = schlick(max(dot(gn, V), 0.), .045);
+  vec3 R = reflect(rd, gn);
+  float rs = mix(1., softSh(P + n * .003, R, 10.), .85);
+  vec3 c = alb * (LIGHT_COL * vec3(1., .95, .88) * max(dot(n, LK), 0.) * sh * 1.6 * uKey + vec3(1., .86, .7) * max(dot(n, LF), 0.) * .35 + env(n) * .12) * ao;
+  // the streaks hold a little iridescence in the highlight
+  c = c * (1. - F) + env(R) * F * rs * mix(vec3(1.), vec3(.85, .95, 1.15), smoothstep(.6, .9, vnoise2(vec2(th * 420., y * 6.))));
+  // hairline of the cracks before the gold
+  c *= 1. - .85 * smoothstep(.0035, .0008, dcr) * uAsm;
+  return c;
+}
+vec3 render(vec2 fc){
+  vec2 uv = (fc - .5 * uRes) / uRes.y * 2.;
+  mat3 cm = camMat(uRo, uTa, 0.);
+  vec3 rd = normalize(cm * vec3(uv, uF)), ro = uRo;
+  float t = .01; bool hit = false;
+  for (int i = 0; i < 240; i++){
+    vec3 p = ro + rd * t; float d = map(p);
+    if (d < .00012 * t + .00003) { hit = true; break; }
+    t += d * .8; if (t > 12.) break;
+  }
+  if (!hit) { float tw; vec3 rc = room(ro, rd, tw); gDepth = tw; return rc; }
+  gDepth = t;
+  gJit = hash12(fc + fract(uT * 7.13) * 97.);
+  vec3 col = shade(ro, rd, t, ro + rd * t);
+  return col;
+}`,
+});
+const gl = rm.canvas.getContext('webgl2');
+let texProf;
+function uploads() {
+  gl.getExtension('EXT_color_buffer_float');
+  const pd = new Float32Array(NP * 4), h = YT / (NP - 1);
+  for (let i = 0; i < NP; i++) {
+    const a = Math.max(0, i - 1), b = Math.min(NP - 1, i + 1);
+    pd[i * 4] = RO[i]; pd[i * 4 + 1] = (RO[b] - RO[a]) / ((b - a) * h);
+    pd[i * 4 + 2] = RI[i]; pd[i * 4 + 3] = (RI[b] - RI[a]) / ((b - a) * h);
+  }
+  texProf = gl.createTexture(); gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, texProf);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, NP, 1, 0, gl.RGBA, gl.FLOAT, pd);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.activeTexture(gl.TEXTURE0);
+}
+
+/* ---------------- timeline ---------------- */
+// each shard: rests on the cloth, lifts, arcs in and seats on its beat (0.5, 1.0 ... 2.5)
+function shardPose(k, t) {
+  const P = PIECES[k], u = clamp((t - (P.tLand - 0.46)) / 0.46);
+  const e = u * u * u * (u * (u * 6 - 15) + 10);                       // smootherstep: lifts gently, seats softly
+  const q = qslerp(P.q, [0, 0, 0, 1], E.inOutSine(clamp(u * 1.15)));
+  const T = P.T.map((v, i) => v * (1 - e) + (i === 1 ? 0.32 * Math.sin(Math.PI * Math.min(1, u * 1.05)) : 0));
+  return { q, T };
+}
+const CAM = Track([
+  { t: 0.0, v: [0.35, 2.25, 2.45, 0.0, 0.12, 0.05, 2.15] },
+  { t: 1.6, v: [0.9, 1.9, 2.25, 0.0, 0.18, 0.0, 2.25] },
+  { t: 3.2, v: [0.75, 1.25, 1.75, 0.0, 0.3, 0.0, 2.55] },
+  { t: 4.25, v: [0.25, 1.25, 1.45, 0.02, 0.36, 0.1, 2.6] },
+  { t: 5.4, v: [-0.85, 0.95, 1.05, 0.0, 0.32, 0.0, 2.6] },
+  { t: 6.8, v: [-1.25, 1.2, 0.35, 0.0, 0.3, 0.0, 2.6] },
+  { t: 8.0, v: [-0.45, 1.25, 1.35, 0.0, 0.3, 0.0, 2.7], stop: true },
+  { t: 10.0, v: [-0.447, 1.25, 1.345, 0.0, 0.3, 0.0, 2.705] },
+]);
+// the bowl turns to show its front once it is mended, slowing to a stop on 8.0
+function spinOf(t) {
+  if (t < 3.2) return 0;
+  const u = clamp((t - 3.2) / 4.8);
+  return -1.9 * (1 - Math.pow(1 - u, 2.2));
+}
+const mA = new Float32Array(54), tA = new Float32Array(18); mA.__vec = 3; tA.__vec = 3;
+
+Reel.scene({
+  duration: 10, fps: 30,
+  async setup() { uploads(); },
+  cues: [
+    { t: 0.5, sfx: 'shard_click', gain: 0.7 }, { t: 1.0, sfx: 'shard_click', gain: 0.7 }, { t: 1.5, sfx: 'shard_click', gain: 0.72 },
+    { t: 2.0, sfx: 'shard_click', gain: 0.75 }, { t: 2.5, sfx: 'shard_click', gain: 0.8 }, { t: 3.0, sfx: 'bowl_ring', gain: 0.6 },
+    { t: 4.0, sfx: 'gold_flow', gain: 0.85 }, { t: 5.0, sfx: 'gold_glint', gain: 0.8 }, { t: 8.0, sfx: 'bowl_settle', gain: 0.8 },
+  ],
+  render(t) {
+    for (let k = 0; k < 6; k++) {
+      let q = [0, 0, 0, 1], T = [0, 0, 0];
+      if (k < 5) ({ q, T } = shardPose(k, t));
+      // world = R*local + T  ->  local = R^T (world - T): pass R^T (column-major)
+      const M = qmat(q);
+      const Mt = [M[0], M[3], M[6], M[1], M[4], M[7], M[2], M[5], M[8]];
+      mA.set(Mt, k * 9); tA.set(T, k * 3);
+    }
+    const asm = clamp((t - 2.5) / 0.05);
+    const cv = CAM(t), ro = [cv[0], cv[1], cv[2]], ta = [cv[3], cv[4], cv[5]];
+    const sw = inv(4.7, 5.3, t);          // the strip light peaks on the 5.0 glint
+    const focus = Math.hypot(ro[0] - ta[0], ro[1] - ta[1], ro[2] - ta[2]) - 0.25;
+    gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, texProf); gl.activeTexture(gl.TEXTURE0);
+    rm.set('uProf', { __ints: 1, v: 5 }).set('uRo', ro).set('uTa', ta).set('uF', cv[6]).set('uT', t)
+      .set('uSpin', spinOf(t)).set('uAsm', asm)
+      .set('uGold', [t - 4.0, t >= 3.98 ? 1 : 0, lerp(-1.4, 1.5, E.inOutSine(sw)), Math.sin(Math.PI * sw) * (sw > 0 && sw < 1 ? 1 : 0)])
+      .set('uKey', 1.0);
+    rm.set('uR', mA).set('uTr', tA);
+    rm.render(t, { focus, aperture: 21, maxCoc: 20 });
+  },
+});
+</script></body></html>

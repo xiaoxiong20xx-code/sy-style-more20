@@ -1,0 +1,601 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>46 榫卯 · Wood Joinery</title>
+<script src="../../lib/core.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script><script src="../../lib/track.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 46 榫卯 · WOOD JOINERY =====
+   A carpenter's bench in a dim workshop, late sun through a lattice window (窗棂) laying a grid of light across the
+   bench, dust hanging in the beam. A Chinese wooden plane (刨子) runs along a fir board by itself and a golden shaving
+   rolls out of its throat. Then a dougong bracket set (斗拱) assembles itself on a column stub: arms drop into the cross
+   slot of the big block and lock with cross-halving joints, small blocks land on the arm ends, tier after tier, the
+   camera threading between the arms. On 8.0 the last member, the beam head (耍头), is pushed home through the top slots.
+   Renderer: SDF pieces (blocks with tapered bottoms and slots, arms with curved undersides and half-lap notches),
+   procedural fir grain (rings on end grain, cathedral figure on faces), soft sun shadows, gobo window light,
+   in-scattering haze with occlusion, 3D dust motes, depth of field (lib/rm.js). */
+const { E, clamp, inv, lerp } = Reel;
+const stage = Reel.makeStage('#0b0806');
+Reel.ownJitter = true;
+
+const BW = 0.10, BH = 0.15, NP = 32;
+const rm = Reel.RM(stage, {
+  bloom: 0.22, th: 1.1, expo: 1.0, vig: 0.38, grain: 0.028, ca: 0.4, contrast: 1.05, sat: 1.0, bands: 6,
+  lift: [0.004, 0.003, 0.002], gain: [1.0, 0.985, 0.96],
+  uniforms: `
+uniform vec4 uP[${NP}]; uniform vec4 uQ[${NP}]; uniform vec4 uR[${NP}]; uniform vec4 uB[${NP}]; uniform float uNP;
+uniform vec3 uRo, uTa; uniform float uTanF, uFocusD;
+uniform vec3 uL, uLc; uniform vec4 uPl; uniform float uShv, uTm, uHaze, uAp;`,
+  scene: `
+const float BW = ${BW.toFixed(3)}, BH = ${BH.toFixed(3)};
+const float WX = -2.6;
+const vec3 LIGHT_COL = vec3(1.);   // sun colour knob: multiplies uLc (lit faces, haze shafts) and the dust motes
+// ---------------------------------------------------------------- piece SDFs (local: origin bottom-centre, long axis X)
+float boxD(vec3 q){ return length(max(q,0.)) + min(max(q.x,max(q.y,q.z)),0.); }
+float sdBlock(vec3 p, float hw, float h, float fl){
+  // 斗: 耳 (top 4/10, carries the slot), 平 (2/10, straight), 欹 (bottom 4/10, a cove drawn in to ~3/4 width)
+  float yt = h*.40;
+  float u = clamp(p.y/yt, 0., 1.);
+  float w = p.y < yt ? mix(hw*.76, hw, u*u*(1.15 - .15*u)) : hw;
+  float r = .0035;
+  vec3 q = vec3(abs(p.x) - w + r, abs(p.y - h*.5) - h*.5 + r, abs(p.z) - w + r);
+  float d = (boxD(q) - r)*.72;
+  d = max(d, -max(abs(p.y - yt) - .0012, -(max(abs(p.x), abs(p.z)) - w + .0012)));   // the crisp line where 欹 meets 平
+  float sd = h*.40, y0 = h - sd;
+  if (fl == 1. || fl == 3.) d = max(d, -max(abs(p.z) - BW*.5 - .001, y0 - p.y));   // slot along X
+  if (fl == 2. || fl == 3.) d = max(d, -max(abs(p.x) - BW*.5 - .001, y0 - p.y));   // slot along Z
+  return d;
+}
+float jsk(float e){
+  // 卷杀: the underside of the arm end is cut in four straight facets that follow a quarter circle
+  float k = clamp(e, 0., 1.)*4.; float i = min(floor(k), 3.), f = k - i;
+  float a0 = i*.25, a1 = (i + 1.)*.25;
+  float y0 = 1. - sqrt(max(1. - a0*a0, 0.)), y1 = 1. - sqrt(max(1. - a1*a1, 0.));
+  return mix(y0, y1, f);
+}
+float sdArm(vec3 p, float hl, float fl){
+  float ax = abs(p.x);
+  float L = .22;
+  float e = clamp((ax - (hl - L))/L, 0., 1.);
+  float yb = BH*.52*jsk(e);
+  float r = .0035;
+  vec3 q = vec3(ax - hl + r, max(yb - p.y, p.y - BH) + r, abs(p.z) - BW*.5 + r);
+  float d = (boxD(q) - r)*.66;
+  float tp = dot(vec2(ax - hl, p.y - BH), normalize(vec2(1., 1.8))) + .010;   // a small bevel on the top of the end
+  d = max(d, tp);
+  if (hl > .4) d = max(d, -max(max(abs(ax - (hl*.5 - .02)) - (hl*.5 - .17), abs(p.y - BH*.52) - .022), BW*.5 - .004 - abs(p.z)));   // 拱眼: a shallow carved panel
+  if (fl == 1.) d = max(d, -max(abs(p.x) - BW*.5 - .001, BH*.5 - p.y));         // half-lap from the top
+  if (fl == 2.) d = max(d, -max(abs(p.x) - BW*.5 - .001, p.y - BH*.5));         // half-lap from below
+  return d;
+}
+float sdBeam(vec3 p, float hl){
+  float r = .004;
+  vec3 q = vec3(abs(p.x) - hl + r, abs(p.y - BH*.5) - BH*.5 + r, abs(p.z) - BW*.5 + r);
+  float d = boxD(q) - r;
+  d = max(d, dot(p.xy - vec2(hl - .015, BH*.34), normalize(vec2(1., .62))));     // the beak: a slanted cut at the front
+  d = max(d, -max(max(p.x - hl + .05, -(p.x - hl + .11)), max(BH*.22 - p.y, p.y - BH*.30)) );  // a small carved groove under the beak
+  return d;
+}
+float sdCol(vec3 p){
+  float r = .15, h = .55;
+  vec2 d = vec2(length(p.xz) - r + .02, abs(p.y - h*.5) - h*.5 + .02);
+  return min(max(d.x,d.y),0.) + length(max(d,0.)) - .02;
+}
+float sdPiece(int i, vec3 p, out vec3 lp){
+  vec4 P = uP[i], Q = uQ[i], R = uR[i];
+  vec3 q = p - P.xyz;
+  float c = cos(P.w), s = sin(P.w);
+  q.xz = mat2(c, -s, s, c)*q.xz;
+  // wobble while falling: tilt about the piece centre
+  float hc = R.z;
+  q.y -= hc;
+  if (R.x != 0.) { float a = R.x; q.yz = mat2(cos(a), -sin(a), sin(a), cos(a))*q.yz; }
+  if (R.y != 0.) { float a = R.y; q.xy = mat2(cos(a), -sin(a), sin(a), cos(a))*q.xy; }
+  q.y += hc;
+  lp = q;
+  float ty = Q.x;
+  if (ty < .5) return sdCol(q);
+  if (ty < 1.5) return sdBlock(q, .16, .20, 3.);
+  if (ty < 2.5) return sdBlock(q, .08, .10, Q.z);
+  if (ty < 3.5) return sdArm(q, Q.y, Q.z);
+  return sdBeam(q, Q.y);
+}
+// ---------------------------------------------------------------- the plane (刨子) and its shaving
+float gShvPsi; float gShvK;
+float sdShaving(vec3 p){
+  float L = uShv*.75; if (L < .01) return 1e3;
+  float a = .016, b = .0040;
+  float Psi = (-a + sqrt(a*a + 2.*b*L))/b;
+  float ro = a + b*Psi;
+  vec2 C = vec2(-.018, .075 + ro + .0015);
+  vec2 d2 = p.xy - C;
+  float rho = length(d2), ph = atan(d2.y, d2.x);
+  float base = Psi - mod(ph + 1.5707963, 6.2831853);          // outer end at the throat, winding forward and up
+  float k = floor(max(base, 0.)/6.2831853);
+  float kk = clamp(floor((a + b*base - rho)/(6.2831853*b) + .5), 0., k);
+  float psi = base - 6.2831853*kk;
+  float rr = a + b*psi + .0045*sin(psi*1.15 + 1.3) + .002*sin(psi*2.7);   // a hand-made curl: never a perfect spiral
+  float dr = base < 0. ? 1e3 : abs(rho - rr);
+  gShvPsi = psi;
+  // the coil telescopes sideways as it rolls, and its edges are torn a little
+  float zo = (Psi - psi)*.0026;
+  float hw = .046 + .003*sin(psi*2.3 + 1.) + .0015*sin(psi*9.1);
+  float d = max(dr - .0013, abs(p.z - zo) - hw);
+  return d;
+}
+float sdPlaneBody(vec3 p){
+  // body: x -0.26..0.18, y 0..0.075, z +-0.06
+  vec3 c = vec3(-.04, .0375, 0.);
+  float r = .008;
+  vec3 q = abs(p - c) - vec3(.22, .0375, .06) + r;
+  float d = boxD(q) - r;
+  d = max(d, dot(vec2(p.x - .18, p.y - .075), normalize(vec2(1., 1.))) + .012);      // chamfered nose
+  d = max(d, dot(vec2(-p.x - .26, p.y - .075), normalize(vec2(1., 1.))) + .010);     // chamfered heel
+  // throat: an opening through the top, between the bed (45 deg, behind) and the front wall
+  float th = max(max(-(p.x + p.y*1.0) - .0, p.x - .03 - p.y*.25), max(abs(p.z) - .046, -p.y + .002));
+  d = max(d, -th);
+  return d;
+}
+float sdPlaneIron(vec3 p){
+  // the iron on the 45-degree bed, poking out of the top
+  vec2 uv = vec2(dot(p.xy, normalize(vec2(-1., 1.))), dot(p.xy, normalize(vec2(1., 1.))));   // along the bed, normal
+  float d = boxD(vec3(abs(uv.x - .085) - .085, abs(uv.y + .004) - .003, abs(p.z) - .044));
+  return d - .001;
+}
+float sdPlaneWedge(vec3 p){
+  vec2 uv = vec2(dot(p.xy, normalize(vec2(-1., 1.))), dot(p.xy, normalize(vec2(1., 1.))));
+  float thick = .004 + uv.x*.09;
+  float d = boxD(vec3(abs(uv.x - .085) - .075, abs(uv.y - thick*.5 - .0) - thick*.5, abs(p.z) - .038)) - .002;
+  return d;
+}
+float sdPlaneHandle(vec3 p){
+  vec3 q = p - vec3(.10, .048, 0.);
+  vec2 d = vec2(length(q.xy) - .0135, abs(q.z) - .175);
+  return min(max(d.x,d.y),0.) + length(max(d,0.)) - .002;
+}
+vec3 toPlane(vec3 p){ return vec3(-(p.x - uPl.x), p.y - uPl.y, -(p.z - uPl.z)); }
+// ---------------------------------------------------------------- scene
+// ids: 0..31 pieces, 40 bench, 41 board, 42 plane body, 43 iron, 44 wedge, 45 handle, 46 shaving, 47 wall
+const vec3 BRD_C = vec3(.55, .05, .95); const vec3 BRD_H = vec3(.75, .05, .07);
+float mapPieces(vec3 p, out float id, float best){
+  id = -1.;
+  float d = best;
+  int n = int(uNP);
+  for (int i = 0; i < ${NP}; i++){
+    if (i >= n) break;
+    vec4 B = uB[i];
+    float bd = length(p - B.xyz) - B.w;
+    if (bd > d) continue;
+    vec3 lp; float di = sdPiece(i, p, lp);
+    if (di < d) { d = di; id = float(i); }
+  }
+  return d;
+}
+vec2 map(vec3 p){
+  float id; float d = mapPieces(p, id, 1e3);
+  vec2 r = vec2(d, id);
+  // bench top
+  float db = p.y;
+  if (db < r.x) r = vec2(db, 40.);
+  // planed board on the bench
+  vec3 qb = abs(p - BRD_C) - BRD_H + .006; float dbd = boxD(qb) - .006;
+  if (dbd < r.x) r = vec2(dbd, 41.);
+  // plane + shaving (bounded)
+  vec3 lp = toPlane(p);
+  if (length(lp - vec3(-.04, .08, 0.)) < .42) {
+    float a = sdPlaneBody(lp); if (a < r.x) r = vec2(a, 42.);
+    a = sdPlaneIron(lp); if (a < r.x) r = vec2(a, 43.);
+    a = sdPlaneWedge(lp); if (a < r.x) r = vec2(a, 44.);
+    a = sdPlaneHandle(lp); if (a < r.x) r = vec2(a, 45.);
+    a = sdShaving(lp)*.8; if (a < r.x) r = vec2(a, 46.);
+  } else r.x = min(r.x, length(lp - vec3(-.04, .08, 0.)) - .40);
+  return r;
+}
+float mapS(vec3 p){   // for shadows / AO / haze occlusion
+  return map(p).x;
+}
+vec3 calcN(vec3 p, float e){
+  vec2 k = vec2(1., -1.);
+  return normalize(k.xyy*map(p + k.xyy*e).x + k.yyx*map(p + k.yyx*e).x + k.yxy*map(p + k.yxy*e).x + k.xxx*map(p + k.xxx*e).x);
+}
+float softShadow(vec3 ro, vec3 rd, float k){
+  float res = 1., t = .004;
+  for (int i = 0; i < 56; i++){
+    float h = map(ro + rd*t).x;
+    res = min(res, k*h/t);
+    t += clamp(h, .004, .12);
+    if (res < .002 || t > 3.) break;
+  }
+  return clamp(res, 0., 1.);
+}
+float calcAO(vec3 p, vec3 n){
+  float o = 0., s = 1.;
+  for (int i = 0; i < 5; i++){ float h = .008 + .05*float(i); float d = map(p + n*h).x; o += (h - d)*s; s *= .7; }
+  return clamp(1. - 2.6*o, 0., 1.);
+}
+// lattice window light (projected along the sun direction onto the window plane)
+float gobo(vec3 p){
+  float s = (WX - p.x)/uL.x; if (s < 0.) return 0.;
+  vec3 q = p + uL*s; vec2 w = q.zy;
+  float soft = .006 + s*.010;
+  float open = smoothstep(-soft, soft, min(min(w.x + 1.9, 2.0 - w.x), min(w.y - .2, 3.2 - w.y)));
+  vec2 g = vec2(.30, .30);
+  vec2 dd = abs(fract(w/g + .5) - .5)*g;
+  float bars = smoothstep(.018 - soft, .018 + soft, min(dd.x, dd.y));
+  float mull = smoothstep(.04 - soft, .04 + soft, abs(w.x - .05));
+  return open*bars*mull;
+}
+// ---------------------------------------------------------------- materials
+float hsh(float n){ return fract(sin(n*127.1 + 311.7)*43758.5453); }
+vec3 woodFir(vec3 q, vec3 nl, float seed, out float rough){
+  // q: grain along x. The pith lies well outside one side face (flat-sawn): its rings meet that face at a shallow
+  // angle and, because the log axis wanders against the stick (runout), they draw the arches of 山形纹 on it.
+  float sd = hsh(seed*1.7) < .5 ? -1. : 1.;
+  vec2 pith = vec2((hsh(seed) - .5)*.10, sd*(.24 + .22*hsh(seed*2.9)));
+  vec2 run = vec2((hsh(seed*2.3) - .5)*.04, sd*(.035 + .05*hsh(seed*3.1)));
+  vec3 qw = q + vec3(0., .010*(vnoise(vec3(q.x*1.6, q.y*3. + seed, q.z*3.)) - .5), .012*(vnoise(vec3(q.x*1.3 + 9., q.y*3., q.z*3. + seed)) - .5));
+  vec2 c = qw.yz - pith - vec2(q.x*q.x*.02, 0.) - q.x*run;
+  float r = length(c);
+  // a knot: the rings swirl round a dark core whose axis crosses the stick
+  float hasK = step(.55, hsh(seed*5.3));
+  vec2 kc = vec2((hsh(seed*6.1) - .5)*.5, .03 + (hsh(seed*7.7) - .5)*.08);
+  float rk = length(vec2(q.x - kc.x, q.y - kc.y));
+  float wk = hasK*exp(-rk*rk/(.028*.028));
+  float ring = r*84. + seed*7.;
+  ring += 3.0*vnoise(vec3(ring*.11, seed, 1.)) + .9*vnoise(vec3(ring*.6, seed, 2.));   // years wide and narrow
+  ring = mix(ring, rk*150. + seed, wk*.85);
+  float f = fract(ring);
+  // earlywood pale, latewood a thin dark band that ends sharply where next spring begins
+  float late = smoothstep(.60, .90, f)*(1. - smoothstep(.955, .995, f));
+  float lk = .40 + .50*vnoise(vec3(floor(ring)*.37, seed, 3.));
+  vec3 early = vec3(.90, .77, .57), lateC = vec3(.64, .42, .22);
+  vec3 col = mix(early, lateC, late*lk);
+  col = mix(col, vec3(.30, .17, .08), smoothstep(.016, .006, rk)*hasK);             // the knot's core
+  col = mix(col, col*vec3(.86, .74, .62), wk*.6);
+  // fibres, pores, a few resin specks, colour from piece to piece
+  col *= .93 + .10*vnoise(vec3(q.x*3., q.y*180., q.z*180.));
+  col *= .95 + .08*vnoise(vec3(q.x*.7 + seed, q.yz*3.));
+  col *= 1. - .22*smoothstep(.93, .985, vnoise(vec3(q.x*14., q.yz*60.)));
+  col *= vec3(1. + (hsh(seed*8.3) - .5)*.10, 1. + (hsh(seed*8.3) - .5)*.06, 1. - (hsh(seed*9.1) - .5)*.12);
+  float endg = abs(nl.x);
+  // end grain: darker, rougher, the rings read strongly
+  float eg = smoothstep(.6, .95, endg);
+  col = mix(col, mix(col, lateC*.9, late*lk*.5)*vec3(.80, .72, .64), eg);
+  rough = mix(.44, .78, eg) - late*.05;
+  return pow(col, vec3(2.2))*.95;
+}
+vec3 woodBench(vec3 p, out float rough){
+  vec2 c = vec2(p.z*1.0 + 3.1, p.y + 2.0);
+  float w1 = fbm(vec3(p.x*.6, p.z*7., 1.));
+  float r = c.x + .08*w1;
+  float f = fract(r*9.);
+  float late = smoothstep(.45, .9, f)*(1. - smoothstep(.95, 1., f));
+  vec3 col = mix(vec3(.46, .30, .18), vec3(.28, .16, .08), late*.8);
+  col *= .8 + .3*fbm(vec3(p.x*2.5, p.z*30., 3.));
+  // wear: lighter where hands go, dark stains, scratches
+  col *= .85 + .25*smoothstep(.3, .7, fbm(vec3(p.xz*1.3, 5.)));
+  col = mix(col, col*.55, smoothstep(.62, .7, fbm(vec3(p.xz*2.2, 9.)))*.7);
+  float scr = smoothstep(.985, 1., vnoise(vec3(dot(p.xz, vec2(.94, .34))*2., dot(p.xz, vec2(-.34, .94))*260., 2.)));
+  col = mix(col, vec3(.55, .40, .26), scr*.5);
+  rough = .55 + .2*fbm(vec3(p.xz*4., 1.));
+  return col*col;
+}
+float D_GGX(float nh, float a){ float a2 = a*a; float d = nh*nh*(a2 - 1.) + 1.; return a2/(PI*d*d); }
+vec3 lightIt(vec3 p, vec3 n, vec3 v, vec3 alb, float rough, float metal, float trans, float aoK){
+  float g = gobo(p);
+  float sh = g > .002 ? softShadow(p + n*.003, uL, 14.) : 0.;
+  float ndl = max(dot(n, uL), 0.);
+  vec3 h = normalize(uL + v);
+  float nh = max(dot(n, h), 0.), ndv = max(dot(n, v), 1e-3);
+  float a = max(rough*rough, .003);
+  vec3 F0 = mix(vec3(.04), alb, metal);
+  vec3 F = F0 + (1. - F0)*pow(1. - max(dot(h, v), 0.), 5.);
+  float k = a*.5; float G = ndl/(ndl*(1. - k) + k)*ndv/(ndv*(1. - k) + k);
+  vec3 spec = D_GGX(nh, a)*F*G/max(4.*ndv, 1e-3);
+  float ao = aoK > 0. ? calcAO(p, n) : 1.;
+  vec3 lit = LIGHT_COL*uLc*g*sh;
+  vec3 col = (alb*(1. - metal)*ndl + spec)*lit;
+  col += alb*(1. - metal)*lit*trans*max(dot(-n, uL), 0.)*.8;              // light through a thin shaving
+  // window fill (big soft source on the left) and warm bench bounce
+  vec3 Lw = normalize(vec3(-1., .35, -.15));
+  col += alb*(1. - metal)*vec3(.085, .08, .075)*(.35 + .65*max(dot(n, Lw), 0.))*ao;
+  col += alb*(1. - metal)*vec3(.05, .028, .014)*max(-n.y*.5 + .5, 0.)*ao;
+  col += alb*(1. - metal)*vec3(.012, .013, .016)*ao;
+  col += alb*(1. - metal)*vec3(.035, .028, .022)*max(dot(n, normalize(vec3(1., .25, .5))), 0.)*ao;   // a warm bounce card on the right
+  // reflections of the window
+  vec3 rf = reflect(-v, n);
+  float win = smoothstep(.2, .7, dot(rf, Lw))*.25;
+  col += F*win*vec3(1., .9, .8)*ao*(1. - rough);
+  return col;
+}
+// ---------------------------------------------------------------- dust motes in the beam (3D grid, DDA)
+vec3 motes(vec3 ro, vec3 rd, float tmax){
+  vec3 acc = vec3(0.);
+  float cs = .11;
+  vec3 p = ro/cs; vec3 c = floor(p); vec3 st = sign(rd); vec3 tD = abs(1./rd);
+  vec3 tM = (c + max(st, 0.) - p)/rd;
+  for (int i = 0; i < 64; i++){
+    vec3 h = hash33(c + 17.);
+    if (h.x < .022) {
+      vec3 drift = vec3(sin(uTm*.37 + h.y*6.), sin(uTm*.23 + h.z*6.)*1.4 - uTm*.35*h.z, cos(uTm*.31 + h.x*6.))*.35;
+      vec3 m = (c + .2 + .6*hash33(c + 3.1) + drift*.0)*cs + drift*cs*.6 + vec3(0., -uTm*.012*(.5 + h.y), 0.);
+      vec3 w = m - ro; float z = dot(w, rd);
+      if (z > .05 && z < tmax) {
+        float dperp = length(w - rd*z);
+        float coc = uAp*abs(z/uFocusD - 1.);                            // blur disc of an out-of-focus mote (world units at its depth)
+        float pix = z*uTanF*2./uRes.y;                                  // one pixel at that depth
+        float rad = max(coc, pix*.7);
+        float e = exp(-dperp*dperp/(rad*rad))*(pix*pix)/(rad*rad);
+        float g = gobo(m);
+        acc += LIGHT_COL*vec3(1., .88, .70)*e*g*(.3 + 1.2*h.z*h.z)*1.6;
+      }
+    }
+    if (tM.x < tM.y && tM.x < tM.z) { c.x += st.x; tM.x += tD.x; }
+    else if (tM.y < tM.z) { c.y += st.y; tM.y += tD.y; }
+    else { c.z += st.z; tM.z += tD.z; }
+    if (min(tM.x, min(tM.y, tM.z))*cs > tmax) break;
+  }
+  return acc;
+}
+// ---------------------------------------------------------------- render
+vec3 render(vec2 fc){
+  vec2 uvn = (2.*fc - uRes)/uRes.y;
+  vec3 ww = normalize(uTa - uRo), uu = normalize(cross(ww, vec3(0., 1., 0.))), vv = cross(uu, ww);
+  vec3 rd = normalize(ww + (uu*uvn.x + vv*uvn.y)*uTanF);
+  vec3 ro = uRo;
+  float t = .01; vec2 h = vec2(0., -1.); bool hit = false;
+  float tmax = 12.;
+  for (int i = 0; i < 220; i++){
+    vec3 p = ro + rd*t;
+    if (p.y < -.01 || p.z < -1.6) break;
+    h = map(p);
+    if (abs(h.x) < .0004*t) { hit = true; break; }
+    t += h.x*.9;
+    if (t > tmax) break;
+  }
+  vec3 col;
+  vec3 v = -rd;
+  float tw = 1e4;
+  // back wall and the floor beyond the bench edge
+  if (!hit) {
+    float tz = (-1.6 - ro.z)/rd.z;
+    float ty = (0. - ro.y)/rd.y;
+    if (ty > 0. && (ro + rd*ty).z >= -1.6 && (ty < tz || tz < 0.)) { t = ty; h = vec2(0., 40.); hit = true; }
+    else if (tz > 0.) { t = tz; h = vec2(0., 47.); hit = true; }
+  }
+  if (!hit) { col = vec3(.01, .008, .006); tw = 30.; }
+  else {
+    vec3 p = ro + rd*t; tw = t;
+    float id = h.y;
+    if (id > 46.5) {
+      // back wall: dark plaster; a bench edge: the bench top stops at z=-1.3
+      vec3 n = vec3(0., 0., 1.);
+      vec3 alb = vec3(.10, .085, .07)*(.8 + .4*fbm(p*3.));
+      if (p.y < 0.) alb *= .3;
+      col = lightIt(p, n, v, alb, .9, 0., 0., 0.);
+    } else if (id > 39.5) {
+      vec3 n = id == 40. ? vec3(0., 1., 0.) : calcN(p, .0006);
+      vec3 alb; float rough = .5, metal = 0., trans = 0.;
+      if (id == 40.) {
+        alb = woodBench(p, rough);
+        if (p.z < -1.3) alb *= .25;
+        // sawdust and a few shavings' dust near the work
+        float dust = smoothstep(.55, .9, fbm(vec3(p.xz*5., 2.)))*smoothstep(1.6, .4, length(p.xz - vec2(.4, .7)));
+        alb = mix(alb, vec3(.55, .40, .24), dust*.35);
+      } else if (id == 41.) {
+        vec3 q = p - BRD_C; q.x *= 1.;
+        alb = woodFir(q*vec3(1., 1., 1.), n, 3.3, rough);
+        // freshly planed strip (lighter, glossier) behind the plane
+        float planed = smoothstep(BRD_H.y - .002, BRD_H.y, q.y)*step(abs(q.z), .05)*step(uPl.x, p.x);
+        alb = mix(alb, alb*1.18, planed); rough = mix(rough, .30, planed);
+      } else if (id == 42. || id == 44.) {
+        vec3 q = toPlane(p);
+        float r1; alb = woodFir(q.zyx*vec3(1., 1., 1.) + vec3(0., 0., 0.), n.zyx, 9.1, r1);
+        alb = id == 42. ? alb*vec3(.42, .26, .18) : alb*vec3(.62, .48, .36);          // dark oiled hardwood body, lighter wedge
+        rough = id == 42. ? .32 : .5;
+      } else if (id == 43.) {
+        alb = vec3(.55, .56, .58); rough = .28; metal = 1.;
+      } else if (id == 45.) {
+        vec3 q = toPlane(p); float r1;
+        alb = woodFir(q.zxy*vec3(1., 1., 1.), n.zxy, 5.7, r1)*vec3(.5, .36, .26); rough = .3;
+      } else {
+        // the shaving: fresh fir, matte and thin enough to glow; the grain runs along its length
+        vec3 q = toPlane(p);
+        float zz = q.z*70. + gShvPsi*.15;
+        float ln = smoothstep(.55, .9, fract(zz + .6*vnoise(vec3(zz*.3, gShvPsi*.2, 2.))));
+        alb = mix(vec3(.93, .80, .60), vec3(.78, .55, .32), ln*.6);
+        alb = pow(alb, vec3(2.2))*(.94 + .1*vnoise(vec3(gShvPsi*6., q.z*300., 1.)));
+        rough = .7; trans = 1.4;
+        if (dot(n, v) < 0.) n = -n;
+      }
+      col = lightIt(p, n, v, alb, rough, metal, trans, 1.);
+    } else {
+      int i = int(id + .5);
+      vec3 lp; sdPiece(i, p, lp);
+      vec3 n = calcN(p, .0005);
+      // local normal for end-grain detection
+      vec4 P = uP[i]; float c = cos(P.w), s = sin(P.w);
+      vec3 nl = n; nl.xz = mat2(c, -s, s, c)*nl.xz;
+      float ty = uQ[i].x; float seed = uQ[i].w;
+      vec3 q = lp; vec3 nq = nl;
+      if (ty < 2.5) { q = lp.yxz; nq = nl.yxz; }             // blocks and the column: grain runs vertically
+      float rough; vec3 alb = woodFir(q, nq, seed, rough);
+      if (ty < .5) alb *= vec3(.86, .80, .74);
+      col = lightIt(p, n, v, alb, rough, 0., 0., 1.);
+    }
+  }
+  // haze in the beam (in-scattering with occlusion)
+  float tm = min(tw, 7.);
+  vec3 sc = vec3(0.);
+  float jt = fract(52.9829189*fract(dot(fc, vec2(.06711056, .00583715))) + uTm*7.);
+  float mu = dot(rd, uL);
+  float phase = .35 + (1. - .25)/pow(1. + .0625 - .5*mu, 1.5);
+  const int NS = 18;
+  for (int i = 0; i < NS; i++){
+    float s = (float(i) + jt)/float(NS); s = s*s;
+    vec3 q = ro + rd*(.05 + s*tm);
+    float g = gobo(q);
+    if (g > .01) {
+      float occ = 1.; float tt = .02;
+      for (int k = 0; k < 10; k++){ float hh = mapS(q + uL*tt); if (hh < .002) { occ = 0.; break; } tt += max(hh, .03); if (tt > 2.2) break; }
+      float dens = .25 + 1.5*smoothstep(.3, .9, vnoise(q*1.6 + vec3(0., -uTm*.12, uTm*.05)));
+      sc += g*occ*dens*(2.*s*tm/float(NS));
+    }
+  }
+  col += LIGHT_COL*uLc*sc*phase*uHaze*.0045;
+  col += motes(ro, rd, min(tw, 6.))*uHaze;
+  gDepth = tw;
+  return col;
+}`,
+});
+
+/* ------------------------------------------------------------------ the bracket set */
+const PIECES = [];
+let SEEDN = 1;
+function add(type, x, y, z, o = {}) {
+  const p = { type, x, y, z, yaw: o.yaw || 0, hl: o.hl || 0, fl: o.fl || 0, tl: o.tl ?? -1, seed: (SEEDN++) * 1.37, drop: o.drop ?? 1.6, h: o.h || BH, w: o.w || BW, tilt: o.tilt || [0, 0] };
+  PIECES.push(p); return p;
+}
+const Y_LD = 0.55, Y_A1 = 0.67, Y_B1 = 0.82, Y_A2 = 0.88, Y_B2 = 1.03, Y_A3 = 1.09, Y_B3 = 1.24, Y_BM = 1.30;
+const HZ = Math.PI / 2;
+function build() {
+  add(0, 0, 0, 0, { h: 0.55 });
+  add(1, 0, Y_LD, 0, { h: 0.2 });
+  // tier 1: cross-halved arms in the big block's cross slot
+  add(3, 0, Y_A1, 0, { hl: 0.46, fl: 1, tl: 2.0, tilt: [0.10, -0.06] });
+  add(3, 0, Y_A1, 0, { hl: 0.46, fl: 2, yaw: HZ, tl: 2.5, tilt: [-0.08, 0.07] });
+  add(2, 0, Y_B1, 0, { fl: 3, tl: 3.0, h: 0.1 });
+  add(2, 0.36, Y_B1, 0, { fl: 1, tl: 3.25, h: 0.1 }); add(2, -0.36, Y_B1, 0, { fl: 1, tl: 3.25, h: 0.1 });
+  add(2, 0, Y_B1, 0.36, { fl: 2, tl: 3.5, h: 0.1 }); add(2, 0, Y_B1, -0.36, { fl: 2, tl: 3.5, h: 0.1 });
+  // tier 2
+  add(3, 0, Y_A2, 0, { hl: 0.64, fl: 1, tl: 4.0, tilt: [0.06, 0.05] });
+  add(3, 0, Y_A2, 0, { hl: 0.64, fl: 2, yaw: HZ, tl: 4.25, tilt: [-0.05, -0.06] });
+  add(2, 0.55, Y_B2, 0, { fl: 2, tl: 4.5, h: 0.1 }); add(2, -0.55, Y_B2, 0, { fl: 2, tl: 4.5, h: 0.1 });
+  add(2, 0, Y_B2, 0.55, { fl: 1, tl: 4.75, h: 0.1 }); add(2, 0, Y_B2, -0.55, { fl: 1, tl: 4.75, h: 0.1 });
+  // tier 3: a ring of arms
+  add(3, 0, Y_A3, 0.55, { hl: 0.38, tl: 5.0, tilt: [0.07, 0.04] }); add(3, 0, Y_A3, -0.55, { hl: 0.38, tl: 5.0, tilt: [-0.05, 0.06] });
+  add(3, 0.55, Y_A3, 0, { hl: 0.38, yaw: HZ, tl: 5.5, tilt: [0.05, -0.05] }); add(3, -0.55, Y_A3, 0, { hl: 0.38, yaw: HZ, tl: 5.5, tilt: [-0.06, 0.04] });
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) add(2, sx * 0.30, Y_B3, sz * 0.55, { fl: 1, tl: 6.0, h: 0.1 });
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) add(2, sx * 0.55, Y_B3, sz * 0.30, { fl: 2, tl: 6.25, h: 0.1 });
+  add(2, 0, Y_B3, 0.55, { fl: 2, tl: 6.5, h: 0.1 }); add(2, 0, Y_B3, -0.55, { fl: 2, tl: 6.5, h: 0.1 });
+  // the beam head (耍头): pushed in along -Z through the two top slots, home on 8.0
+  BEAM = add(4, 0, Y_BM, 0.10, { hl: 0.85, yaw: HZ, tl: 8.0 });
+  BEAM.slide = true;
+  PIECES.forEach((p) => { p.r = Math.hypot(p.type === 3 || p.type === 4 ? p.hl : (p.type === 0 ? 0.15 : p.type === 1 ? 0.16 : 0.08) * 1.42, p.h / 2, p.type >= 3 ? BW / 2 : 0) + 0.03; });
+}
+let BEAM = null;
+const G = 14;        // gravity in units/s^2 (a slow, weighty fall)
+function pieceAt(p, t) {
+  let x = p.x, y = p.y, z = p.z, tx = 0, tz = 0, vis = true;
+  if (p.slide) {
+    // pushed home: one continuous glide that decelerates into the stop, a tiny recoil on the hit
+    const t0 = 6.85, u = clamp((t - t0) / (p.tl - t0));
+    const s = 1 - Math.pow(1 - u, 2.2);
+    z = p.z + 1.9 * (1 - s);
+    if (t < t0) vis = false;
+    if (t >= p.tl) z = p.z + 0.004 * Math.exp(-(t - p.tl) * 30) * Math.sin((t - p.tl) * 80);
+    return { x, y, z, tx, tz, vis };
+  }
+  if (p.tl > 0) {
+    const fall = Math.sqrt(2 * p.drop / G);
+    if (t < p.tl - fall) vis = false;
+    else if (t < p.tl) {
+      const u = (t - (p.tl - fall)) / fall;
+      y = p.y + p.drop * (1 - u * u);
+      const w = Math.pow(1 - u, 2);
+      tx = p.tilt[0] * w; tz = p.tilt[1] * w;
+    } else if (t < p.tl + 0.4) {
+      // seated: two small damped hops and a settling wobble, not a hard stop
+      const tau = t - p.tl, A = Math.min(0.014, 0.006 + p.drop * 0.005);
+      y = p.y + A * Math.exp(-tau * 13) * Math.abs(Math.sin(Math.PI * tau / 0.105));
+      const wob = Math.exp(-tau * 11) * Math.sin(tau * 42);
+      tx = p.tilt[0] * 0.10 * wob; tz = p.tilt[1] * 0.10 * wob;
+    }
+  }
+  return { x, y, z, tx, tz, vis };
+}
+const AP = new Float32Array(NP * 4), AQ = new Float32Array(NP * 4), AR = new Float32Array(NP * 4), AB = new Float32Array(NP * 4);
+function setPieces(t) {
+  let n = 0;
+  for (const p of PIECES) {
+    const s = pieceAt(p, t); if (!s.vis) continue;
+    const o = n * 4;
+    AP.set([s.x, s.y, s.z, p.yaw], o);
+    AQ.set([p.type, p.hl, p.fl, p.seed], o);
+    AR.set([s.tx, s.tz, p.h / 2, 0], o);
+    AB.set([s.x, s.y + p.h / 2, s.z, p.r], o);
+    n++;
+  }
+  rm.set('uP', AP).set('uQ', AQ).set('uR', AR).set('uB', AB).set('uNP', n);
+}
+
+/* ------------------------------------------------------------------ the plane stroke */
+// the plane runs along the fir board toward -x, already moving on frame 0, easing out at the end of the board
+const PL_X0 = 1.30, PL_X1 = 0.06;
+function planeAt(t) {
+  const t0 = -0.55, t1 = 1.75;
+  const u = clamp((t - t0) / (t1 - t0));
+  const s = u < 0.75 ? u / 0.75 * 0.84 : 0.84 + 0.16 * E.outCubic((u - 0.75) / 0.25);   // steady push, then it eases to a stop
+  const x = lerp(PL_X0, PL_X1, s);
+  return { x, shv: PL_X0 - x };
+}
+
+/* ------------------------------------------------------------------ camera */
+const DBGCAM = Reel.Q.get('cam');
+const CK = [
+  { t: 0.0, p: [1.22, 0.33, 0.44], a: [0.92, 0.13, 0.95], fov: 32 },
+  { t: 0.6, p: [0.92, 0.35, 0.47], a: [0.60, 0.13, 0.95], fov: 32 },
+  { t: 1.25, p: [0.62, 0.45, 0.55], a: [0.10, 0.22, 0.75], fov: 32 },
+  { t: 2.0, p: [0.98, 0.92, 1.62], a: [0.0, 0.74, 0.0], fov: 32 },
+  { t: 3.0, p: [1.30, 1.00, 1.42], a: [0.0, 0.80, 0.0], fov: 32 },
+  { t: 3.65, p: [1.25, 0.98, 1.22], a: [0.0, 0.84, 0.0], fov: 34 },
+  { t: 4.2, p: [0.84, 0.75, 0.86], a: [0.0, 0.97, 0.0], fov: 46 },
+  { t: 4.62, p: [0.72, 0.80, 0.74], a: [0.0, 1.0, 0.0], fov: 50 },
+  { t: 5.15, p: [0.50, 1.40, 0.52], a: [-0.1, 0.92, -0.1], fov: 44 },
+  { t: 6.0, p: [-0.55, 2.15, 1.05], a: [0.0, 1.0, 0.0], fov: 34 },
+  { t: 7.0, p: [-1.30, 1.85, 1.75], a: [0.0, 1.03, 0.05], fov: 31 },
+  { t: 8.0, p: [-1.22, 1.62, 1.98], a: [0.0, 1.04, 0.05], fov: 30, stop: true },   // lands with the lock and stays: locked off from 8.0
+  { t: 10.0, p: [-1.22, 1.62, 1.98], a: [0.0, 1.04, 0.05], fov: 30 },
+];
+const camT = Track(CK.map((k) => ({ t: k.t, v: [...k.p, ...k.a, k.fov], stop: k.stop })), { easeIn: false, easeOut: true });
+function camAt(t) {
+  if (DBGCAM) { const v = DBGCAM.split(',').map(Number); return { p: v.slice(0, 3), a: v.slice(3, 6), fov: v[6] || 32 }; }
+  const v = camT(t);
+  return { p: v.slice(0, 3), a: v.slice(3, 6), fov: v[6] };
+}
+// focus: what the lens is looking at (distance along the view axis), racked on the beats
+function focusAt(t, cam) {
+  const dA = Math.hypot(cam.a[0] - cam.p[0], cam.a[1] - cam.p[1], cam.a[2] - cam.p[2]);
+  // the opening holds focus on the shaving coil riding on the plane, then racks to the bracket set on the first landing
+  const pl = planeAt(t), b = 0.0040, a = 0.016, Psi = (-a + Math.sqrt(a * a + 2 * b * pl.shv * 0.75)) / b, ro = a + b * Psi;
+  const sv = [pl.x + 0.018, 0.10 + 0.075 + ro, 0.95];
+  const dS = Math.hypot(sv[0] - cam.p[0], sv[1] - cam.p[1], sv[2] - cam.p[2]);
+  return lerp(dS, dA, E.inOutSine(clamp((t - 1.25) / 0.6)));
+}
+Reel.scene({
+  duration: 10, fps: 30,
+  cues: [
+    { t: 0.0, sfx: 'plane_stroke', gain: 0.75 },
+    { t: 2.0, sfx: 'wood_knock', gain: 0.9 }, { t: 2.5, sfx: 'wood_lap', gain: 0.9 },
+    { t: 3.0, sfx: 'wood_tick', gain: 0.75 }, { t: 3.25, sfx: 'wood_tick', gain: 0.7 }, { t: 3.5, sfx: 'wood_tick', gain: 0.7 },
+    { t: 3.7, sfx: 'whoosh', gain: 0.35 },
+    { t: 4.0, sfx: 'wood_knock', gain: 0.85 }, { t: 4.25, sfx: 'wood_lap', gain: 0.8 }, { t: 4.5, sfx: 'wood_tick', gain: 0.7 }, { t: 4.75, sfx: 'wood_tick', gain: 0.7 },
+    { t: 5.0, sfx: 'wood_knock', gain: 0.9 }, { t: 5.5, sfx: 'wood_knock', gain: 0.8 },
+    { t: 6.0, sfx: 'wood_tick', gain: 0.65 }, { t: 6.25, sfx: 'wood_tick', gain: 0.6 }, { t: 6.5, sfx: 'wood_tick', gain: 0.65 },
+    { t: 6.9, sfx: 'beam_slide', gain: 0.7 }, { t: 8.0, sfx: 'joint_lock', gain: 1.0 },
+  ],
+  async setup() { build(); },
+  render(t) {
+    const cam = camAt(t);
+    const pl = planeAt(t);
+    setPieces(t);
+    const fd = focusAt(t, cam);
+    const tanF = Math.tan(cam.fov * Math.PI / 360);
+    const L = (() => { const v = [-0.70, 0.58, -0.15]; const l = Math.hypot(...v); return v.map((x) => x / l); })();
+    rm.set('uRo', cam.p).set('uTa', cam.a).set('uTanF', tanF).set('uFocusD', fd)
+      .set('uL', L).set('uLc', [5.0, 4.15, 3.2]).set('uPl', [pl.x, 0.10, 0.95, 0]).set('uShv', pl.shv).set('uTm', t).set('uHaze', 1.0);
+    // thin lens: aperture radius in world units -> rm's pixel factor (1216-wide reference frame)
+    const Ra = fd < 1 ? 0.026 : 0.02;
+    rm.set('uAp', Ra);
+    rm.render(t, { focus: fd, aperture: Reel.Q.get('nodof') ? 0 : Ra * 342 / tanF, maxCoc: Reel.Q.get('nodof') ? 0 : 22, expo: 1.25 });
+  },
+});
+</script></body></html>

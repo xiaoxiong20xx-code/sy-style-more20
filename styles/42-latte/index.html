@@ -1,0 +1,556 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>42 咖啡拉花 · Latte Art</title>
+<script src="../../lib/core.js"></script><script src="../../lib/track.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 42 咖啡拉花 · Latte Art (a winged tulip) =====
+   Real world: a white glazed cup of espresso on a saucer, walnut café table, a big window on the left. The crema is
+   tiger-mottled (dark flecks over hazel) and still turning from the extraction. A steel jug pours micro-foam: from
+   high up the milk dives under the crema and only paints it paler; lowered to the surface, the foam stays on top and
+   a white disc swells. Every new stack is poured at the back edge of the last one and pushed forward, so the older
+   foam wraps around it as a crescent with a line of compressed crema between them. The wrist wiggle stacks thin
+   rippled layers; a few small stacks build the top; the jug lifts and the thin stream cuts down through the middle,
+   dragging every layer into a point. The surface flow is an exact inverse map (point-source pushes, a forward jet
+   shear, the cut), so the crema mottling is carried, stretched and compressed into the lines between the layers.
+   Hook 4.0–5.0: the wiggle. 8.0: the cut ends, the jug lifts away. 8.5–10: overhead hold. */
+const { E, clamp, inv, lerp } = Reel;
+const stage = Reel.makeStage('#0c0907');
+Reel.ownJitter = true;
+const C = Reel.cfg({});
+
+/* ---------------- the pour program (pattern space: cup radius ≈ 1.15, +y = far side, toward the jug) ---------------- */
+const DS = 1.15;            // pattern units per surface unit
+const SX = 1.5;             // foam spreads sideways faster than it advances
+const JET = { A: 0.18, W: 0.3, LF: 0.25 };
+const OPS = [];
+function drop(cx, cy, R, t0, dur, jet = true) {
+  if (jet) OPS.push({ k: 1, xc: cx, yp: cy, A: JET.A * R / 0.2, w: JET.W * R / 0.2, t0, dur, LF: JET.LF });
+  OPS.push({ k: 0, cx, cy, R, t0, dur });
+}
+// the inverse map, the same code as the shader (used to place each stack at the back edge of the foam)
+function marble(x, y, T) {
+  for (let i = OPS.length - 1; i >= 0; i--) {
+    const o = OPS[i];
+    if (o.k === 0) {
+      const age = T - o.t0; if (age <= 0) continue;
+      const r = o.R * Math.sqrt(Math.min(age / o.dur, 1));
+      const vx = (x - o.cx) / SX, vy = (y - o.cy) * SX, L2 = vx * vx + vy * vy;
+      if (L2 < r * r) return { foam: 1, i };
+      const s = Math.sqrt(Math.max(1 - r * r / L2, 0));
+      x = o.cx + vx * s * SX; y = o.cy + vy * s / SX;
+    } else if (o.k === 1) {
+      if (T <= o.t0) continue;
+      let u = Math.min((T - o.t0) / o.dur, 1); u = u * u * (3 - 2 * u);
+      const D = o.A * u * Math.exp(-(((x - o.xc) / o.w) ** 2));
+      const g = clamp((o.yp - y) / 0.08) * Math.exp(-Math.max(o.yp - y, 0) / o.LF);
+      y += D * g;
+    } else {
+      if (T <= o.t0) continue;
+      const u = clamp((T - o.t0) / (o.t1 - o.t0)), f = lerp(o.y0, o.y1, u);
+      const z = o.A * o.lam / (Math.abs(x - o.x0) + o.lam), g = clamp((y - f) / 0.15);
+      y += z * g;
+    }
+  }
+  return { foam: 0, x, y };
+}
+function topAt(x, T) {
+  for (let k = 0; k <= 1600; k++) { const y = 1.0 - 2.0 * k / 1600; if (marble(x, y, T).foam) return y; }
+  return -0.6;
+}
+const POURS = [];   // [t0, t1, x, y] pour points (pattern space) for the jug and the flow
+drop(0.0, -0.55, 0.34, 1.0, 0.9, false); POURS.push([1.0, 1.9, 0.0, -0.55]);
+[0.24, 0.22, 0.21, 0.2].forEach((R, k) => { const t0 = 2.0 + 0.5 * k, y = topAt(0, t0 - 1e-3); drop(0, y, R, t0, 0.32); POURS.push([t0, t0 + 0.32, 0, y]); });
+const NW = 6;
+for (let k = 0; k < NW; k++) {
+  const t0 = 4.0 + k / NW, x = 0.06 * (k % 2 ? -1 : 1), y = topAt(x, t0 - 1e-3);
+  drop(x, y, 0.12, t0, 0.9 / NW); POURS.push([t0, t0 + 0.9 / NW, x, y]);
+}
+[0.17, 0.15, 0.13, 0.12].forEach((R, k) => { const t0 = 5.5 + 0.5 * k, y = topAt(0, t0 - 1e-3); drop(0, y, R, t0, 0.3); POURS.push([t0, t0 + 0.3, 0, y]); });
+const YTOP = topAt(0, 7.45);
+const CUT = { k: 2, x0: 0.0, y0: YTOP + 0.12, y1: -0.72, A: 0.12, lam: 0.04, t0: 7.5, t1: 8.0 };
+OPS.push(CUT);
+const NOPS = OPS.length;
+
+/* ---------------- renderer ---------------- */
+const rm = Reel.RM(stage, {
+  bloom: 0.2, th: 1.35, expo: 1.0, vig: 0.26, grain: 0.022, ca: 0.4, contrast: 1.05, sat: 0.96, bands: 4,
+  lift: [0.006, 0.004, 0.002], gain: [1.0, 0.985, 0.95],
+  uniforms: `
+uniform highp sampler2D uOps; uniform int uN;
+uniform vec3 uRo, uTa; uniform float uFL, uT, uLev, uSwirl, uPale;
+uniform vec3 uS0, uS1, uS2; uniform vec4 uStr;      // stream bezier (spout -> control -> impact), radii, flow
+uniform vec3 uPX, uPU, uPZ, uPT; uniform float uPOn; // jug frame
+uniform vec4 uImp;                                 // impact point (world xz), strength, ripple time`,
+  scene: `
+const float DS = ${DS.toFixed(4)}, SXF = ${SX.toFixed(4)};
+const vec3 LDIR = normalize(vec3(-.74,.62,-.26));
+const vec3 LIGHT_COL = vec3(1.);   // key window colour (cup, foam, crema, jug foam, stream, table, its reflection); vec3(1.) = original
+vec4 OP(int i, int r){ return texelFetch(uOps, ivec2(i, r), 0); }
+
+/* ---------- the pour, as an inverse map ---------- */
+vec2 marble(vec2 p, float T, out float foam, out float rr, out float lay){
+  foam = 0.; rr = 0.; lay = 0.;
+  for (int i = 63; i >= 0; i--) {
+    if (i >= uN) continue;
+    vec4 a = OP(i,0), b = OP(i,1);
+    if (b.w < .5) {
+      float age = T - a.w; if (age <= 0.) continue;
+      float r = a.z * sqrt(min(age / b.x, 1.));
+      vec2 v = (p - a.xy) * vec2(1. / SXF, SXF);
+      float L2 = dot(v, v);
+      if (L2 < r*r) { foam = 1.; rr = sqrt(L2) / max(r, 1e-5); lay = float(i); return p; }
+      float s = sqrt(max(1. - r*r / L2, 0.));
+      p = a.xy + v * s * vec2(SXF, 1. / SXF);
+    } else if (b.w < 1.5) {
+      if (T <= b.x) continue;
+      float u = min((T - b.x) / b.y, 1.); u = u*u*(3. - 2.*u);
+      float D = a.z * u * exp(-pow((p.x - a.x) / a.w, 2.));
+      float g = clamp((a.y - p.y) / .08, 0., 1.) * exp(-max(a.y - p.y, 0.) / b.z);
+      p.y += D * g;
+    } else {
+      if (T <= b.y) continue;
+      float u = clamp((T - b.y) / (b.z - b.y), 0., 1.);
+      float f = mix(a.y, a.z, u);
+      float z = a.w * b.x / (abs(p.x - a.x) + b.x);
+      p.y += z * clamp((p.y - f) / .15, 0., 1.);
+    }
+  }
+  return p;
+}
+
+/* ---------- materials ---------- */
+vec3 crema(vec2 p, float rim){
+  // the extraction still turns: differential rotation, faster in the middle
+  float rho = length(p);
+  float ang = uSwirl * (1.25 - .75 * rho * rho);
+  float c = cos(ang), s = sin(ang); p = mat2(c, s, -s, c) * p;
+  vec2 w = p + .16 * vec2(fbm2(p * 2.6 + 3.1), fbm2(p * 2.6 + 8.4)) - .08;
+  float th = atan(w.y, w.x), r = length(w);
+  // hazel body, darker reddish toward the wall, tiger flecks stretched along the swirl
+  float m = fbm2(vec2(r * 5.5, th * 1.6 + r * 4.) + 1.7);
+  vec3 col = mix(vec3(.105,.042,.014), vec3(.36,.17,.06), smoothstep(.3, .75, m));
+  col = mix(col, vec3(.5,.27,.11), .55 * smoothstep(.62, .85, fbm2(w * 7. + 5.)));             // golden patches
+  float fl = vnoise2(vec2(r * 60., th * 9. + r * 30.)) * .6 + vnoise2(w * 90.) * .4;
+  col *= 1. - .55 * smoothstep(.62, .82, fl);                                                // tiger flecks
+  col *= 1. - .22 * smoothstep(.85, 1.15, rho);                                               // thicker, darker at the wall
+  col = mix(col, vec3(.5,.32,.17), uPale * exp(-dot(p, p) / .22) * (.7 + .3 * fbm2(p * 6.)));  // milk under the crema
+  col *= .92 + .16 * vnoise2(w * 220.);                                                     // fine bubbles
+  return col;
+}
+vec3 foamCol(float rr, float lay, vec2 q){
+  vec3 f = mix(vec3(.66,.61,.53), vec3(.72,.69,.62), clamp(lay / 30., 0., 1.)) * (.975 + .025 * sin(lay * 1.7));
+  f *= .965 + .05 * vnoise2(q * 420.);                                   // micro-bubbles
+  // the foam thins toward its edge and the crema glows through it: a soft caramel halo, not a cut-out
+  float th = smoothstep(.74, 1., rr);
+  f = mix(f, vec3(.6,.4,.22), .55 * th * th);
+  f = mix(f, vec3(.36,.2,.09), .45 * smoothstep(.95, 1., rr));
+  return f;
+}
+float surfH(vec2 q, float T, out vec3 alb){
+  float foam, rr, lay;
+  vec2 qq = q * DS;
+  float rho = length(qq);
+  qq *= 1. + .2 * pow(max(rho - .8, 0.) / .35, 2.);    // the wall: everything pushed past it is compressed into a band
+  vec2 p = marble(qq, T, foam, rr, lay);
+  if (foam > .5) { alb = foamCol(rr, lay, q); float dm = max(1. - rr * rr, 0.); return .02 * pow(dm, .7) * (.94 + .06 * vnoise2(q * 160.)); }
+  alb = crema(p, rho); return 0.;
+}
+
+/* ---------- environment: dim café, one big window on the left, warm practicals ---------- */
+/* ---------- a bright café in the daytime, seen past the bar: big windows, the back bar with a steel espresso machine
+   (cups warming on top), a grinder, plants, pendant lamps. 'rough' softens everything (the out-of-focus background
+   and blurry reflections use the same room). ---------- */
+float band(float x, float a, float b, float s){ return smoothstep(a - s, a + s, x) * smoothstep(b + s, b - s, x); }
+vec3 cafeBar(vec3 r, float rough){
+  float ph = atan(r.x, -r.z), el = r.y;
+  float s = .01 + rough * .08;
+  // warm plaster walls and ceiling, daylight bouncing everywhere
+  vec3 c = mix(vec3(.3,.24,.17), vec3(.62,.56,.48), smoothstep(-.3, .6, el));
+  c = mix(c, vec3(.16,.1,.06), smoothstep(-.2, -.32, el));                                   // the back counter's wooden front
+  // two big windows: daylight, a street with trees outside
+  for (int k = 0; k < 2; k++) {
+    float wc = k == 0 ? 2.25 : -.35, ww = k == 0 ? .34 : .26;
+    float win = band(ph, wc - ww, wc + ww, s) * band(el, -.16, .6, s);
+    float bars = mix(1., smoothstep(.006, .014, abs(fract((ph - wc) * 3.) - .5) * .33) * smoothstep(.006, .014, abs(el - .3)), 1. - smoothstep(0., .25, rough));
+    float leaf = smoothstep(.45, .7, fbm2(vec2(ph * 6., el * 6.) + 3.)) * smoothstep(.5, .1, el);
+    vec3 day = mix(vec3(1.,.98,.94) * 4.2, vec3(.45,.6,.35) * 2.2, leaf * .7);
+    c = mix(c, day * (.55 + .45 * bars), win);
+  }
+  // the key window itself (the light on the cup), up-left behind
+  { vec3 wc = LDIR; float cz = dot(r, wc);
+    if (cz > 0.) { vec3 u = normalize(cross(vec3(0.,1.,0.), wc)), v = cross(wc, u); vec2 q = vec2(dot(r, u), dot(r, v)) / cz;
+      vec2 e = smoothstep(vec2(.42, .3) + s * 3., vec2(.42, .3) - s * 3., abs(q)); c = mix(c, LIGHT_COL * vec3(1.,.97,.92) * 6., e.x * e.y); } }
+  // the espresso machine on the back bar: brushed steel, three dark group heads, cups warming on top
+  float mach = band(ph, 1.08, 1.82, s) * band(el, -.24, .02, s);
+  if (mach > 0.) {
+    float v = (el + .24) / .26;
+    vec3 steel = mix(vec3(.35,.36,.38), vec3(.95,.95,.97), smoothstep(.3, .9, v)) * (.8 + .4 * smoothstep(.0, .2, abs(fract(ph * 4.) - .5) - .25));
+    steel += vec3(2.2) * smoothstep(.03 + s, .0, abs(ph - 1.3)) * band(el, -.22, .0, s);   // a window's streak in the steel
+    for (int k = 0; k < 3; k++) { float gx = 1.22 + .22 * float(k); steel = mix(steel, vec3(.04), band(ph, gx - .035, gx + .035, s) * band(el, -.19, -.12, s)); }
+    c = mix(c, steel * .9, mach);
+  }
+  float cups = band(ph, 1.12, 1.78, s) * band(el, .02, .075, s) * (.6 + .4 * smoothstep(.2, .45, abs(fract(ph * 14.) - .5)));
+  c = mix(c, vec3(.95,.93,.9) * 1.3, cups);
+  // the grinder: dark body, an amber hopper of beans on top
+  c = mix(c, vec3(.06,.055,.05), band(ph, .86, 1., s) * band(el, -.24, .06, s));
+  c = mix(c, vec3(.55,.3,.12), band(ph, .865, .995, s) * band(el, .06, .2, s));
+  // plants: leafy greens in pots
+  for (int k = 0; k < 2; k++) {
+    float pc = k == 0 ? 2.05 : .2;
+    vec2 d = vec2((ph - pc) * 1.2, el - .0);
+    float pl = smoothstep(.2 + s, .16 - s, length(d) + .05 * (fbm2(d * 14. + float(k)) - .5));
+    vec3 g = mix(vec3(.08,.16,.05), vec3(.25,.42,.12), fbm2(d * 20. + 5.));
+    c = mix(c, g * (1.2 + .6 * smoothstep(-.1, .2, d.x)), pl);
+    c = mix(c, vec3(.75,.65,.55), band(ph, pc - .07, pc + .07, s) * band(el, -.24, -.14, s));
+  }
+  // two pendants right above the bar (seen only as warm reflections in the counter)
+  c += vec3(1.,.72,.42) * 26. * smoothstep(.9965 - rough * .02, .9985, dot(r, normalize(vec3(.32,1.,-.18))));
+  c += vec3(1.,.72,.42) * 20. * smoothstep(.9965 - rough * .02, .9985, dot(r, normalize(vec3(-.36,1.,.3))));
+  // pendant lamps
+  for (int k = 0; k < 3; k++) { float lx = .25 + .55 * float(k); c += vec3(1.,.75,.45) * 3. * smoothstep(.035 + s, .02, length(vec2((ph - lx) * .8, el - .52))); }
+  return c;
+}
+vec3 env(vec3 r, float rough){ return cafeBar(r, rough); }
+
+/* ---------- geometry ---------- */
+float rin(float y){ float s = clamp((y - .25) / 1.3, 0., 1.); return .42 + .58 * pow(s, .55); }
+const float RIM = 1.55;
+float sdCup(vec3 p){
+  float r = length(p.xz), y = p.y;
+  float s = clamp((y - .25) / 1.3, 0., 1.);
+  float ri = rin(y);
+  float ro = ri + .055 + .07 * (1. - s);
+  ro = mix(.46, ro, smoothstep(.1, .3, y));
+  float solid = max(max(r - ro, y - RIM), .1 - y) * .8;
+  float cav = max(r - ri, .25 - y);
+  float d = max(solid, -cav * .8);
+  float lip = length(vec2(r - (1.0 + .032), y - RIM)) - .034;
+  d = min(d, lip);
+  // handle: a loop on the right
+  vec3 h = p - vec3(1.27, .92, 0.);
+  float tor = length(vec2(length(h.xy * vec2(1., .82)) - .33, h.z)) - .07;
+  tor = max(tor, 1.02 - p.x);
+  return smin(d, tor, .06);
+}
+float saucerY(float r){ return .10 + .07 * smoothstep(.75, 1.95, r) + .015 * smoothstep(1.9, 2.1, r); }
+float sdSaucer(vec3 p){
+  float r = length(p.xz);
+  float d = abs(p.y - saucerY(r) + .03) - .03;
+  d = max(d, r - 2.12);
+  return d * .85;
+}
+float sdJug(vec3 p){
+  if (uPOn < .5) return 1e3;
+  vec3 q = vec3(dot(p - uPT, uPX), dot(p - uPT, uPU), dot(p - uPT, uPZ));
+  float r = length(q.xz), th = atan(q.z, q.x);
+  float sp = pow(max(cos(th), 0.), 18.);
+  float R = .72 - .03 * q.y + .42 * sp * smoothstep(1.25, 2.1, q.y);
+  float Hr = 1.9 + .34 * pow(max(cos(th), 0.), 9.) - .03 * cos(th * 2.);
+  float d = abs(r - R) - .028;
+  d = max(d, q.y - Hr);
+  d = max(d, -q.y);
+  d = min(d, max(r - R, abs(q.y - .02) - .02));
+  return d * .7;
+}
+uniform float uMilk;
+float sdMilk(vec3 p){
+  if (uPOn < .5) return 1e3;
+  vec3 q = vec3(dot(p - uPT, uPX), dot(p - uPT, uPU), dot(p - uPT, uPZ));
+  float r = length(q.xz), th = atan(q.z, q.x);
+  float R = .72 - .03 * q.y + .42 * pow(max(cos(th), 0.), 18.) * smoothstep(1.25, 2.1, q.y) - .03;
+  return max(max(r - R, p.y - uMilk), max(-q.y + .05, q.y - 2.2)) * .7;
+}
+vec3 bez(vec3 a, vec3 b, vec3 c, float u){ float v = 1. - u; return v*v*a + 2.*v*u*b + u*u*c; }
+// a falling stream of milk: thick at the lip, thinning as it accelerates; a slow helical twist and travelling ripples on
+// its skin. gStrS / gStrA carry the arc position and the angle around the axis to the shading.
+float gStrS = 0., gStrA = 0.;
+float sdStream(vec3 p){
+  if (uStr.w < .01) return 1e3;
+  float d = 1e3;
+  vec3 prev = uS0;
+  float sPrev = 0.;
+  for (int i = 1; i <= 12; i++) {
+    float u = float(i) / 12.;
+    vec3 cur = bez(uS0, uS1, uS2, u);
+    vec3 pa = p - prev, ba = cur - prev;
+    float h = clamp(dot(pa, ba) / dot(ba, ba), 0., 1.);
+    float su = mix(sPrev, u, h);
+    vec3 v = pa - ba * h;
+    vec3 tg = normalize(ba), b1 = normalize(cross(tg, vec3(1., 0., 0.))), b2 = cross(tg, b1);
+    float ang = atan(dot(v, b2), dot(v, b1));
+    float rad = mix(uStr.x, uStr.y, sqrt(su));
+    rad *= 1. + .035 * sin(2. * ang + su * 22. - uT * 9.) + .02 * sin(su * 70. - uT * 38.) + .012 * sin(3. * ang - su * 45. + uT * 7.);
+    float dd = length(v) - rad;
+    if (dd < d) { d = dd; gStrS = su; gStrA = ang; }
+    prev = cur; sPrev = u;
+  }
+  return d * .8;
+}
+float map(vec3 p, out int id){
+  float d = sdCup(p); id = 1;
+  float s = sdSaucer(p); if (s < d) { d = s; id = 2; }
+  float j = sdJug(p); if (j < d) { d = j; id = 3; }
+  float st = sdStream(p); if (st < d) { d = st; id = 4; }
+  float mk = sdMilk(p); if (mk < d) { d = mk; id = 5; }
+  return d;
+}
+float mapS(vec3 p){ int i; return map(p, i); }
+vec3 nrm(vec3 p){ vec2 e = vec2(.0012, 0.); return normalize(vec3(mapS(p+e.xyy)-mapS(p-e.xyy), mapS(p+e.yxy)-mapS(p-e.yxy), mapS(p+e.yyx)-mapS(p-e.yyx))); }
+float softShadow(vec3 p, vec3 L, float k){
+  float res = 1., t = .02;
+  for (int i = 0; i < 40; i++) { float h = mapS(p + L * t); res = min(res, k * h / t); t += clamp(h, .02, .25); if (res < .001 || t > 7.) break; }
+  return clamp(res, 0., 1.);
+}
+float ao(vec3 p, vec3 n){ float o = 0., s = 1.; for (int i = 1; i <= 5; i++) { float h = .03 * float(i); o += (h - mapS(p + n * h)) * s; s *= .6; } return clamp(1. - 2.5 * o, 0., 1.); }
+float irr(vec3 p){ return 1.05 - .06 * p.x - .035 * length(p.xz); }
+
+vec3 wood(vec2 q){
+  float g = fbm2(vec2(q.x * .8, q.y * 22.) + fbm2(q * vec2(1., 4.)) * 1.);
+  float rings = .5 + .5 * sin(q.y * 70. + g * 6.);
+  vec3 c = mix(vec3(.33,.22,.13), vec3(.44,.31,.19), smoothstep(.25, .8, g * .8 + rings * .2));   // pale oiled oak
+  c *= .9 + .1 * vnoise2(q * vec2(2., 160.));
+  return c;
+}
+
+vec3 shadeLiquid(vec3 P, vec3 rd, float T){
+  vec2 q = vec2(P.x, -P.z) / rin(uLev);
+  vec3 alb, a2;
+  float h0 = surfH(q, T, alb);
+  float e = .004;
+  float hx = surfH(q + vec2(e, 0.), T, a2), hy = surfH(q + vec2(0., e), T, a2);
+  vec2 g = vec2(hx - h0, hy - h0) / e * (h0 > .0005 ? 1.7 : .9);
+  // impact mound and rings from the stream
+  vec2 di = P.xz - uImp.xy; float dl = length(di) + 1e-4;
+  g += -di / dl * (uImp.z * .9 * (dl / .05) * exp(-dl * dl / .005));
+  { float rd0 = .045; g += di / dl * uImp.z * .55 * (dl / rd0) * exp(-dl * dl / (rd0 * rd0)) * (1. - smoothstep(.0, .12, dl)); }   // the entry dimple
+  float ring = dl - .02 - .5 * uImp.w;
+  g += di / dl * (-sin(ring * 90.) * exp(-ring * ring / .006) * .05 * uImp.z);
+  // meniscus at the wall
+  float rr = length(P.xz) / rin(uLev);
+  vec2 rad = P.xz / max(length(P.xz), 1e-4);
+  vec3 n = normalize(vec3(-g.x, 1., g.y) + vec3(rad.x, 0., rad.y) * .9 * exp(-(1. - rr) * 60.));
+  // the rim's shadow on the surface (the window is up-left): the ray to the light leaves the cup below the rim?
+  float tl = (RIM - P.y) / LDIR.y;
+  vec2 Q = P.xz + LDIR.xz * tl;
+  float sh = smoothstep(1.03, .93, length(Q));
+  sh = min(sh, softShadow(P + vec3(0., .01, 0.), LDIR, 10.));
+  float isFoam = step(.0005, h0);
+  if (isFoam < .5) {
+    vec3 ax; float near = 0.;
+    for (int k = 0; k < 4; k++) { float a = 1.5708 * float(k) + .4; near += step(.0005, surfH(q + vec2(cos(a), sin(a)) * .014, T, ax)); }
+    alb *= 1. - .38 * smoothstep(0., 2., near);                 // compressed crema between the leaves: a deep brown hairline
+  }
+  // micro-foam is a liquid: silky, with a fine bubbly ripple in its surface
+  if (isFoam > .5) n = normalize(n + vec3(vnoise2(q * 260.) - .5, 0., vnoise2(q * 260. + 7.) - .5) * .05);
+  float dif = max(dot(n, LDIR), 0.);
+  vec3 col = alb * (dif * LIGHT_COL * vec3(1.,.95,.88) * 1.25 * sh + vec3(.3,.26,.21) * (.6 + .4 * n.y));
+  col *= 1. - .3 * exp(-(1. - rr) * 30.);                       // the wall shades the edge
+  vec3 r = reflect(rd, n);
+  float F = .025 + .975 * pow(1. - max(dot(n, -rd), 0.), 5.);
+  float rough = mix(.02, .09, isFoam);
+  vec3 spec = env(r, rough) * F * mix(1., 1.15, isFoam) * mix(.35, 1., sh);
+  // the satin sheen of micro-foam: a broad soft lobe plus a tight glint on every ridge
+  vec3 Hh = normalize(LDIR - rd);
+  spec += isFoam * LIGHT_COL * vec3(1.,.95,.88) * (.1 * pow(max(dot(n, Hh), 0.), 12.) + .45 * pow(max(dot(n, Hh), 0.), 90.)) * sh;
+  spec += (1. - isFoam) * LIGHT_COL * vec3(1.,.95,.88) * .5 * pow(max(dot(n, Hh), 0.), 160.) * sh;          // the crema's oily glint
+  return col + spec;
+}
+
+vec3 shade(vec3 P, vec3 rd, int id){
+  vec3 n = nrm(P);
+  float sh = softShadow(P + n * .004, LDIR, 9.);
+  float o = ao(P, n);
+  vec3 r = reflect(rd, n);
+  float F = pow(1. - max(dot(n, -rd), 0.), 5.);
+  if (id == 1 || id == 2) {   // glazed porcelain
+    vec3 alb = vec3(.86,.85,.82);
+    vec3 col = alb * (max(dot(n, LDIR), 0.) * LIGHT_COL * vec3(1.,.95,.88) * 1.15 * sh + vec3(.42,.38,.33) * (.55 + .45 * n.y) * o) * irr(P);
+    return col + env(r, .015) * (.045 + .955 * F) * (.4 + .6 * o);
+  }
+  if (id == 3) {               // brushed steel jug
+    vec3 q = vec3(dot(P - uPT, uPX), dot(P - uPT, uPU), dot(P - uPT, uPZ));
+    float th = atan(q.z, q.x);
+    // circumferential brushing: fine lines around the body; the highlights stretch along the axis
+    float lines = vnoise2(vec2(q.y * 520., th * 3.)) * .6 + vnoise2(vec2(q.y * 1900., th * 9.)) * .4;
+    vec3 ax = uPU - n * dot(uPU, n);
+    vec3 c = vec3(0.);
+    for (int k = -3; k <= 3; k++) c += env(normalize(r + ax * float(k) * .09), .05);
+    c /= 7.;
+    c = mix(c, env(r, .02), .25);                                      // a sharper core under the smear
+    float Fm = .58 + .42 * pow(1. - max(dot(n, -rd), 0.), 5.);
+    c *= vec3(.86,.87,.9) * Fm * (.82 + .3 * lines) * (.7 + .3 * o);
+    // fingerprints / water spots, the rolled rim
+    c *= 1. - .12 * smoothstep(.6, .8, fbm2(vec2(th * 3., q.y * 4.)));
+    return c + vec3(.02,.02,.021) * (.5 + .5 * max(dot(n, LDIR), 0.) * sh);
+  }
+  if (id == 5) {               // micro-foam in the jug
+    vec3 q = vec3(dot(P - uPT, uPX), dot(P - uPT, uPU), dot(P - uPT, uPZ));
+    vec3 col = vec3(.8,.77,.7) * (.36 + .3 * n.y + .5 * LIGHT_COL * max(dot(n, LDIR), 0.) * sh) * (.85 + .15 * fbm2(P.xz * 9.)) * (.75 + .25 * smoothstep(.0, 1.2, q.y));
+    return col + env(r, .06) * (.03 + .97 * F) * .8;
+  }
+  // the milk stream: soft wrapped light on the lit side, a gentle falloff to the shadow side, a satin highlight
+  sdStream(P);
+  float wrap = clamp((dot(n, LDIR) + .35) / 1.35, 0., 1.);
+  vec3 col = vec3(.84,.81,.74) * (wrap * wrap * LIGHT_COL * 1.15 * (.4 + .6 * sh) + .16 + .06 * n.y);
+  col *= .95 + .05 * sin(gStrA * 2. + gStrS * 38. - uT * 14.);
+  vec3 Hh = normalize(LDIR - rd);
+  col += LIGHT_COL * vec3(1.,.97,.92) * .35 * pow(max(dot(n, Hh), 0.), 40.) * sh;
+  return col + env(r, .05) * (.03 + .97 * F) * .55;
+}
+
+vec3 render(vec2 fc){
+  vec2 uv = (2. * fc - uRes) / uRes.y;
+  vec3 w = normalize(uTa - uRo), u = normalize(cross(w, vec3(0., 1., 0.))), v = cross(u, w);
+  vec3 rd = mat3(u, v, w) * normalize(vec3(uv, uFL));
+  vec3 ro = uRo;
+  // liquid plane
+  float tL = 1e9;
+  { float t = (uLev - ro.y) / rd.y; vec3 P = ro + rd * t; if (t > 0. && length(P.xz) < rin(uLev)) tL = t; }
+  // table plane
+  float tT = rd.y < 0. ? -ro.y / rd.y : 1e9;
+  if (tT < 1e8) { vec3 Pq = ro + rd * tT; if (Pq.x > 9.5 || Pq.z < -6.5 || abs(Pq.x) > 14. || Pq.z > 14.) tT = 1e9; }   // the bar's end and back edge; past them, the café          // the bar ends; past it, the café
+  float tmax = min(min(tL, tT), 30.);
+  float t = .1; int id = 0; bool hit = false;
+  for (int i = 0; i < 160; i++) {
+    vec3 p = ro + rd * t;
+    float d = map(p, id);
+    if (d < .0008 * t) { hit = true; break; }
+    t += d;
+    if (t > tmax) break;
+  }
+  if (hit && t < tmax) { gDepth = t; return shade(ro + rd * t, rd, id); }
+  if (tL < 1e8 && tL <= tT) { gDepth = tL; return shadeLiquid(ro + rd * tL, rd, uT); }
+  if (tT < 1e8) {
+    vec3 P = ro + rd * tT; gDepth = tT;
+    vec3 n = vec3(0., 1., 0.);
+    float sh = softShadow(P + n * .002, LDIR, 8.);
+    float o = ao(P, n);
+    vec3 alb = wood(P.xz * .55 + vec2(3.1, .7));
+    float fall = .75 + .25 * exp(-length(P.xz - vec2(-.6, -.2)) * .12);
+    float sunp = smoothstep(.4, -.4, P.x - .45 * P.z - 1.5) * (1. - .8 * smoothstep(.12, .03, abs(fract((P.x + .3 * P.z) * .16) - .5) - .38));
+    vec3 col = alb * (max(dot(n, LDIR), 0.) * LIGHT_COL * vec3(1.,.95,.88) * 1.3 * sh * (.4 + .85 * sunp) + vec3(.36,.32,.27) * o) * fall;
+    col *= 1. - .3 * max(smoothstep(8.9, 9.5, P.x), smoothstep(-5.9, -6.5, P.z));   // the rounded front of the bar top                     // the bar's rounded front edge
+    vec3 r = reflect(rd, normalize(n + vec3(fbm2(P.xz * 3.) - .5, 0., fbm2(P.xz * 3. + 4.) - .5) * .03));
+    float F = .03 + .97 * pow(1. - max(dot(n, -rd), 0.), 5.);
+    return col + env(r, .3) * F * .3 * o * fall;
+  }
+  gDepth = 60.;
+  return cafeBar(rd, .55);
+}`,
+});
+
+/* ops -> float texture */
+const gl = rm.canvas.getContext('webgl2');
+const OPW = 64;
+const opData = new Float32Array(OPW * 2 * 4);
+OPS.forEach((o, i) => {
+  const put = (row, v) => opData.set(v, (row * OPW + i) * 4);
+  if (o.k === 0) { put(0, [o.cx, o.cy, o.R, o.t0]); put(1, [o.dur, 0, 0, 0]); }
+  else if (o.k === 1) { put(0, [o.xc, o.yp, o.A, o.w]); put(1, [o.t0, o.dur, o.LF, 1]); }
+  else { put(0, [o.x0, o.y0, o.y1, o.A]); put(1, [o.lam, o.t0, o.t1, 2]); }
+});
+const opTex = gl.createTexture();
+gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, opTex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, OPW, 2, 0, gl.RGBA, gl.FLOAT, opData);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.activeTexture(gl.TEXTURE0);
+
+/* ---------------- timeline ---------------- */
+const rinJS = (y) => 0.42 + 0.58 * Math.pow(clamp((y - 0.25) / 1.3), 0.55);
+const level = (t) => 1.24 + 0.24 * Track.easeRange(t, 0.0, 8.0);
+// flow: 0..1 (how much milk leaves the spout)
+function flow(t) {
+  if (t < 1.0) return 0.55 * Track.easeRange(t, -0.4, 0.1);
+  let f = 0;
+  for (const [a, b] of POURS) f = Math.max(f, clamp((t - a + 0.04) / 0.06) * clamp((b + 0.03 - t) / 0.08));
+  if (t >= 7.5 && t < 8.02) f = Math.max(f, 0.5 * clamp((8.02 - t) / 0.05));
+  if (t >= 1.0 && t < 7.5) f = Math.max(f, 0.3);          // the stream never quite stops between stacks: it thins
+  return f;
+}
+// where the stream lands (pattern space -> world): follows the pours, the wiggle, and the cut
+// lead time before each pour when the jug starts travelling to it (never longer than half the gap after the previous one)
+const LEAD = POURS.map((p, i) => (i === 0 ? 0.12 : Math.min(0.12, Math.max(0, p[0] - POURS[i - 1][1]) * 0.5)));
+function stackPoint(t) {
+  // continuous: each pour pushes its point forward; between pours the jug travels to the next one
+  let k = 0;
+  for (let i = 0; i < POURS.length; i++) if (t >= POURS[i][0] - LEAD[i]) k = i;
+  const p = POURS[k], nx = POURS[k + 1];
+  let x = p[2], y = p[3] - 0.09 * Track.easeRange(t, p[0], p[1]);      // the wrist pushes each stack forward
+  if (nx && t > p[1]) { const u = Track.easeRange(t, p[1], Math.max(p[1] + 1e-3, nx[0] - LEAD[k + 1])); x = lerp(x, nx[2], u); y = lerp(y, nx[3], u); }
+  return [x, y];
+}
+function pourPoint(t) {
+  const hi = [0.0, -0.35];
+  if (t < 0.9) return hi;
+  if (t < 1.0) { const a = stackPoint(1.0), u = Track.easeRange(t, 0.9, 1.0); return [lerp(hi[0], a[0], u), lerp(hi[1], a[1], u)]; }
+  const cutAt = (u) => [0, lerp(CUT.y0, CUT.y1, u)];
+  if (t >= 7.5) return cutAt(clamp((t - 7.5) / 0.5));
+  if (t > 7.32) { const a = stackPoint(7.32), u = Track.easeRange(t, 7.32, 7.5); return [lerp(a[0], 0, u), lerp(a[1], CUT.y0, u)]; }
+  return stackPoint(t);
+}
+const toWorld = (p, t) => { const r = rinJS(level(t)) / DS; return [p[0] * r, -p[1] * r]; };
+const JUG = Track([
+  // [spout height above the surface, tilt (rad), back offset of the spout]
+  { t: 0.0, v: [2.1, 0.7, 0.3] }, { t: 0.75, v: [2.0, 0.76, 0.3] }, { t: 1.05, v: [0.44, 1.38, 0.12], stop: true }, { t: 4.0, v: [0.42, 1.45, 0.12] },
+  { t: 7.3, v: [0.42, 1.5, 0.12], stop: true }, { t: 7.6, v: [1.0, 1.42, 0.12] }, { t: 8.0, v: [1.7, 1.3, 0.1] }, { t: 8.38, v: [6.0, 0.8, 3.0] },
+]);
+function jug(t) {
+  const [hgt, alpha, back] = JUG(t);
+  const pp = pourPoint(t), [ix, iz] = toWorld(pp, t), lev = level(t);
+  const wig = t > 3.95 && t < 5.0 ? 0 : 0;
+  const S = [ix + wig, lev + hgt, iz - back];                      // spout lip
+  const X = [0, -Math.sin(alpha), Math.cos(alpha)], U = [0, Math.cos(alpha), Math.sin(alpha)], Z = [-1, 0, 0];
+  const tip = [0.72 - 0.03 * 2.21 + 0.42 * Track.ease(inv(1.25, 2.1, 2.21)), 2.21, 0];   // the lip in jug space
+  const T = [0, 1, 2].map((d) => S[d] - (X[d] * tip[0] + U[d] * tip[1] + Z[d] * tip[2]));
+  return { S, X, U, Z, T, I: [ix, lev, iz], on: t < 8.4, milk: S[1] - 0.06 };
+}
+// the camera orbits a quarter turn and cranes up: the jug starts on the left and ends at the top of an overhead frame
+const D2R = Math.PI / 180;
+const CAMS = Track([
+  // [azimuth°, elevation°, distance, target x, y, z, focal]
+  { t: 0.0, v: [168, 21, 7.6, -0.15, 1.55, -0.1, 3.0] },
+  { t: 2.2, v: [152, 29, 7.0, 0.0, 1.45, -0.05, 3.15] },
+  { t: 4.5, v: [132, 41, 5.9, 0.0, 1.38, 0.0, 3.4] },
+  { t: 7.0, v: [112, 43, 6.2, 0.0, 1.38, 0.0, 3.4] },
+  { t: 8.0, v: [100, 45, 6.5, 0.0, 1.4, 0.02, 3.35] },
+  { t: 8.6, v: [91, 80, 5.3, 0.0, 1.45, 0.04, 3.1], stop: true },
+  { t: 10.0, v: [90.5, 80.5, 5.27, 0.0, 1.45, 0.04, 3.1] },
+], { easeIn: false });
+const CAM = (t) => {
+  const [az, el, d, tx, ty, tz, fl] = CAMS(t), a = az * D2R, e = el * D2R;
+  return [tx + d * Math.cos(e) * Math.cos(a), ty + d * Math.sin(e), tz + d * Math.cos(e) * Math.sin(a), tx, ty, tz, fl];
+};
+
+Reel.scene({
+  duration: 10, fps: 30,
+  cues: [
+    { t: 0.0, sfx: 'milk_pour', gain: 0.7 },
+    { t: 1.0, sfx: 'foam_bloom', gain: 0.8 },
+    { t: 2.0, sfx: 'foam_push', gain: 0.75 }, { t: 2.5, sfx: 'foam_push', gain: 0.7 }, { t: 3.0, sfx: 'foam_push', gain: 0.7 }, { t: 3.5, sfx: 'foam_push', gain: 0.7 },
+    { t: 4.0, sfx: 'foam_wiggle', gain: 0.9 },
+    { t: 5.5, sfx: 'foam_push', gain: 0.6 }, { t: 6.0, sfx: 'foam_push', gain: 0.6 }, { t: 6.5, sfx: 'foam_push', gain: 0.55 }, { t: 7.0, sfx: 'foam_push', gain: 0.55 },
+    { t: 7.5, sfx: 'foam_cut', gain: 0.8 }, { t: 8.0, sfx: 'last_drip', gain: 0.6 },
+  ],
+  render(t) {
+    const c = CAM(t);
+    const hk = 1 - Track.easeRange(t, 8.0, 8.6) * 0.9;               // handheld breath, settling on the hold
+    const ro = [c[0] + hk * 0.012 * Math.sin(t * 1.3), c[1] + hk * 0.01 * Math.sin(t * 0.9 + 1), c[2] + hk * 0.012 * Math.sin(t * 1.1 + 2)];
+    const J = jug(t), f = flow(t);
+    // stream: from the lip along the spout direction, bending down onto the impact point
+    const S0 = J.S, S2 = J.I, H = S0[1] - S2[1];
+    const S1 = [S0[0] + J.X[0] * H * 0.25, S0[1] - H * 0.35, S0[2] + J.X[2] * H * 0.25];
+    const high = t < 1.0;
+    const r0 = (high ? 0.06 : 0.085) * Math.sqrt(f), r1 = (high ? 0.026 : 0.045) * Math.sqrt(f);
+    const lev = level(t);
+    rm.set('uOps', { __ints: 1, v: 5 }).set('uN', { __ints: 1, v: NOPS })
+      .set('uRo', ro).set('uTa', c.slice(3, 6)).set('uFL', c[6]).set('uT', t).set('uLev', lev)
+      .set('uSwirl', 1.6 * (1 - Math.exp(-(t + 0.6) * 1.4))).set('uPale', 0.55 * Track.easeRange(t, 0.0, 1.0))
+      .set('uS0', S0).set('uS1', S1).set('uS2', S2).set('uStr', [r0, r1, 0, f > 0.01 ? f : 0])
+      .set('uPX', J.X).set('uPU', J.U).set('uPZ', J.Z).set('uPT', J.T).set('uPOn', J.on ? 1 : 0).set('uMilk', J.milk)
+      .set('uImp', [S2[0], S2[2], high ? 0.25 * f : 0.9 * f, (t * 2.0) % 1.0]);
+    gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, opTex); gl.activeTexture(gl.TEXTURE0);
+    const focus = Math.hypot(ro[0] - c[3], ro[1] - lev, ro[2] - c[5]);
+    rm.render(t, { focus, aperture: 44, maxCoc: 15 });
+  },
+});
+</script></body></html>

@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>49 蓝晒 · Cyanotype</title>
+<script src="../../lib/core.js"></script>
+<script src="../../lib/strokegl.js"></script>
+<script src="../../lib/track.js"></script>
+<script src="../../lib/craftd.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 49 蓝晒 · CYANOTYPE SUN PRINT =====
+   Shot 1 (0–4.0): a sheet of cold-press paper brushed with yellow-green sensitiser on a garden table in sun. A fern
+   frond lands on 0.5, a head of Queen Anne's lace on 1.0, two ginkgo leaves on 1.5; a sheet of glass slides over on 2.0.
+   Time-lapse: the sun swings across, cloud shadows race over, the sun's glint crosses the glass, and the coating
+   bronzes everywhere the plants do not cover (leaf tissue lets a little light through, veins do not).
+   Shot 2 (cut on frame 120 = 4.0): the print goes into a white enamel tray — water floods in from the paper's edges,
+   Prussian blue blooms behind the wet front, the unexposed yellow dissolves into drifting clouds and the plants come
+   up white, vein by vein. The tray is rocked; caustics swim over the print and the blue deepens.
+   8.0: the print is lifted out of the water towards the lens, water sheets off, drops fall from its edge · hold. */
+const stage = Reel.makeStage('#1b1712');
+Reel.ownJitter = true;
+const { clamp, lerp, E } = Reel;
+const gl = CD.init(stage);
+const W = CD.W, H = CD.H;
+const POST = CD.post(gl);
+const QUAD = SG.quad(gl);
+const HD = '#version 300 es\nprecision highp float;\nprecision highp int;\n';
+const PW = 30, PH = 21;                 // paper, cm
+const TW = 2048, TH = Math.round(2048 * PH / PW);
+const F_CUT = 120;                      // 4.0 s: into the tray
+const R = Reel.rng(4949), rr = (a, b) => a + (b - a) * R();
+
+// ---------------- the plants, drawn once into paper-space textures ----------------
+// each plant: R = coverage, G = light it lets through (0..1), B = thickness/height, A = colour class (0.25 fern, 0.5 lace, 0.75 ginkgo)
+const toPx = (x, y) => [(x / PW + 0.5) * TW, (0.5 - y / PH) * TH];
+function plantCanvas(draw) {
+  const cov = document.createElement('canvas'); cov.width = TW; cov.height = TH;
+  const tr = document.createElement('canvas'); tr.width = TW; tr.height = TH;
+  const a = cov.getContext('2d', { willReadFrequently: true }), b = tr.getContext('2d', { willReadFrequently: true });
+  b.fillStyle = '#fff'; b.fillRect(0, 0, TW, TH);
+  draw(a, b);
+  return { a, b };
+}
+function packTex(pc, cls) {
+  const A = pc.a.getImageData(0, 0, TW, TH).data, B = pc.b.getImageData(0, 0, TW, TH).data;
+  // height: blurred coverage
+  const hc = document.createElement('canvas'); hc.width = TW; hc.height = TH; const hx = hc.getContext('2d', { willReadFrequently: true });
+  hx.filter = 'blur(6px)'; hx.drawImage(pc.a.canvas, 0, 0); const Hh = hx.getImageData(0, 0, TW, TH).data;
+  const out = new Uint8Array(TW * TH * 4);
+  for (let i = 0; i < TW * TH; i++) {
+    const c = A[i * 4 + 3];
+    out[i * 4] = c; out[i * 4 + 1] = B[i * 4]; out[i * 4 + 2] = Hh[i * 4 + 3]; out[i * 4 + 3] = c > 0 ? cls : 0;
+  }
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, TW, TH, 0, gl.RGBA, gl.UNSIGNED_BYTE, out);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+const S = TW / PW;    // px per cm
+function quadPt(p0, p1, p2, s) { const u = 1 - s; return [u * u * p0[0] + 2 * u * s * p1[0] + s * s * p2[0], u * u * p0[1] + 2 * u * s * p1[1] + s * s * p2[1]]; }
+// value noise for the tissue maps (deterministic)
+const NG = 97, NGRID = Array.from({ length: NG * NG }, () => R());
+function vnoise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y), fx = x - xi, fy = y - yi;
+  const g = (i, j) => NGRID[(((j % NG) + NG) % NG) * NG + (((i % NG) + NG) % NG)];
+  const sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+  return (g(xi, yi) * (1 - sx) + g(xi + 1, yi) * sx) * (1 - sy) + (g(xi, yi + 1) * (1 - sx) + g(xi + 1, yi + 1) * sx) * sy;
+}
+// tissue: lets 40–60 % of the light through, mottled; veins (drawn after) let almost none through
+function tissue(a, b, base, amp) {
+  const id = b.getImageData(0, 0, TW, TH); const d = id.data, ad = a.getImageData(0, 0, TW, TH).data;
+  for (let y = 0; y < TH; y++) for (let x = 0; x < TW; x++) {
+    const i = y * TW + x, c = ad[i * 4 + 3] / 255;
+    if (c === 0) { d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = 255; d[i * 4 + 3] = 255; continue; }
+    const n = vnoise(x / 38, y / 38) * 0.6 + vnoise(x / 11, y / 11) * 0.4;
+    const v = base + amp * (n - 0.5) * 2;
+    d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = 255 * (1 - c) + v * c; d[i * 4 + 3] = 255;
+  }
+  b.putImageData(id, 0, 0);
+}
+function fern(a, b) {
+  const p0 = [-12.5, -8.6], p1 = [-6, 3.5], p2 = [3.8, 8.6];          // rachis, cm (base lower left → tip upper middle)
+  const tan = (s) => { const q = quadPt(p0, p1, p2, Math.min(1, s + 0.01)), w = quadPt(p0, p1, p2, Math.max(0, s - 0.01)); const l = Math.hypot(q[0] - w[0], q[1] - w[1]); return [(q[0] - w[0]) / l, (q[1] - w[1]) / l]; };
+  const mids = [], lats = [];
+  a.fillStyle = '#000';
+  const NPI = 30;
+  for (let i = 0; i < NPI; i++) {
+    for (const side of [-1, 1]) {
+      const s = 0.06 + 0.92 * (i + (side > 0 ? 0.5 : 0)) / NPI + rr(-0.006, 0.006);
+      if (s > 0.985) continue;
+      const P = quadPt(p0, p1, p2, s), T = tan(s), Nn = [-T[1] * side, T[0] * side];
+      const L = (6.2 * Math.pow(Math.sin(Math.PI * (0.1 + 0.9 * s)), 0.9) * (1 - 0.55 * s) + 0.35) * rr(0.86, 1.08);
+      const ang = 0.95 + 0.25 * s + rr(-0.09, 0.09);
+      const D = [Nn[0] * Math.cos(ang) + T[0] * Math.sin(ang) * 0.55, Nn[1] * Math.cos(ang) + T[1] * Math.sin(ang) * 0.55];
+      const dl = Math.hypot(D[0], D[1]); D[0] /= dl; D[1] /= dl;
+      const curl = rr(0.03, 0.12) * side;
+      const nPin = Math.max(3, Math.round(L * 3.1));
+      let px = P[0], py = P[1];
+      const pts = [];
+      for (let j = 0; j <= nPin; j++) {
+        const cc = Math.cos(curl * j), sn = Math.sin(curl * j);
+        const d2 = [D[0] * cc - D[1] * sn, D[0] * sn + D[1] * cc];
+        pts.push([px, py, d2]);
+        px += d2[0] * L / nPin; py += d2[1] * L / nPin;
+      }
+      mids.push(pts.map((q) => [q[0], q[1]]));
+      // lobes of uneven size, an occasional bitten or curled-under one
+      const lobeAmp = Array.from({ length: nPin + 1 }, () => rr(0.62, 1.0) * (R() < 0.05 ? 0.45 : 1));
+      const left = [], right = [];
+      const nL = nPin * 8;
+      for (let j = 0; j <= nL; j++) {
+        const u = j / nL, k0 = Math.min(nPin, Math.floor(u * nPin)), x0 = pts[k0], x1 = pts[Math.min(nPin, k0 + 1)];
+        const f = u * nPin - k0;
+        const x = x0[0] + (x1[0] - x0[0]) * f, y = x0[1] + (x1[1] - x0[1]) * f, d2 = x0[2];
+        const sh = Math.pow(Math.abs(Math.sin(u * nPin * Math.PI)), 0.55);
+        const base = (0.5 * (1 - u * 0.8) + 0.06) * (0.6 + 0.4 * Math.min(1, s * 3 + 0.3)) * Math.min(1, u * 8 + 0.35);
+        const wl = base * (0.66 + 0.34 * sh * lobeAmp[k0]) * (1 + 0.05 * Math.sin(u * 61)), wr = base * (0.66 + 0.34 * sh * lobeAmp[Math.min(nPin, k0 + 1)]) * (1 + 0.05 * Math.sin(u * 47 + 1));
+        left.push(toPx(x - d2[1] * wl, y + d2[0] * wl)); right.push(toPx(x + d2[1] * wr, y - d2[0] * wr));
+        if (j % 8 === 4) for (const sg of [-1, 1]) { const w2 = (sg < 0 ? wl : wr) * 0.8; lats.push([[x, y], [x + d2[0] * 0.18 - sg * d2[1] * w2, y + d2[1] * 0.18 + sg * d2[0] * w2]]); }
+      }
+      a.beginPath(); left.forEach(([X, Y], j) => (j ? a.lineTo(X, Y) : a.moveTo(X, Y))); right.reverse().forEach(([X, Y]) => a.lineTo(X, Y)); a.closePath(); a.fill();
+    }
+  }
+  a.lineCap = 'round'; a.strokeStyle = '#000';
+  const ra = []; for (let k = 0; k <= 60; k++) ra.push(toPx(...quadPt(p0, p1, p2, k / 60)));
+  a.lineWidth = 0.3 * S; a.beginPath(); ra.forEach(([x, y], k) => (k ? a.lineTo(x, y) : a.moveTo(x, y))); a.stroke();
+  a.lineWidth = 0.36 * S; a.beginPath(); a.moveTo(...toPx(-12.5, -8.6)); a.quadraticCurveTo(...toPx(-14.3, -10.4), ...toPx(-15.8, -11.4)); a.stroke();
+  tissue(a, b, 150, 34);
+  // veins: rachis and pinna midribs block nearly all light, the side veinlets most of it
+  b.lineCap = 'round';
+  b.strokeStyle = 'rgb(46,46,46)'; b.lineWidth = 0.035 * S;
+  lats.forEach(([p, q]) => { b.beginPath(); b.moveTo(...toPx(...p)); b.lineTo(...toPx(...q)); b.stroke(); });
+  b.strokeStyle = 'rgb(14,14,14)';
+  mids.forEach((pl) => { b.lineWidth = 0.075 * S; b.beginPath(); pl.forEach((q, k) => { const [x, y] = toPx(q[0], q[1]); k ? b.lineTo(x, y) : b.moveTo(x, y); }); b.stroke(); });
+  b.filter = 'blur(10px)'; b.strokeStyle = 'rgba(0,0,0,0.35)'; b.lineWidth = 0.9 * S;     // thicker tissue along the rachis
+  b.beginPath(); ra.forEach(([x, y], k) => (k ? b.lineTo(x, y) : b.moveTo(x, y))); b.stroke(); b.filter = 'none';
+  b.strokeStyle = 'rgb(6,6,6)'; b.lineWidth = 0.28 * S; b.beginPath(); ra.forEach(([x, y], k) => (k ? b.lineTo(x, y) : b.moveTo(x, y))); b.stroke();
+  // keep the transmission map only where the leaf is
+  b.globalCompositeOperation = 'destination-in'; b.drawImage(a.canvas, 0, 0); b.globalCompositeOperation = 'destination-over'; b.fillStyle = '#fff'; b.fillRect(0, 0, TW, TH); b.globalCompositeOperation = 'source-over';
+}
+function lace(a, b) {
+  const C = [8.4, 3.2];
+  a.fillStyle = '#000'; a.strokeStyle = '#000'; a.lineCap = 'round';
+  b.lineCap = 'round';
+  // main stem down to the paper edge
+  a.lineWidth = 0.22 * S; a.beginPath(); a.moveTo(...toPx(...C)); a.quadraticCurveTo(...toPx(9.6, -4), ...toPx(11.8, -11.5)); a.stroke();
+  b.strokeStyle = 'rgb(20,20,20)'; b.lineWidth = 0.22 * S; b.beginPath(); b.moveTo(...toPx(...C)); b.quadraticCurveTo(...toPx(9.6, -4), ...toPx(11.8, -11.5)); b.stroke();
+  const NR = 22;
+  for (let i = 0; i < NR; i++) {
+    const ang = i / NR * Math.PI * 2 + rr(-0.12, 0.12), L = rr(3.6, 5.6);
+    const E2 = [C[0] + Math.cos(ang) * L, C[1] + Math.sin(ang) * L * 0.92];
+    a.lineWidth = 0.06 * S; a.beginPath(); a.moveTo(...toPx(...C)); a.lineTo(...toPx(...E2)); a.stroke();
+    b.strokeStyle = 'rgb(60,60,60)'; b.lineWidth = 0.06 * S; b.beginPath(); b.moveTo(...toPx(...C)); b.lineTo(...toPx(...E2)); b.stroke();
+    const nf = 12 + Math.floor(R() * 8);
+    for (let j = 0; j < nf; j++) {
+      const a2 = rr(0, Math.PI * 2), l2 = rr(0.35, 1.25);
+      const F = [E2[0] + Math.cos(a2) * l2, E2[1] + Math.sin(a2) * l2];
+      a.lineWidth = 0.025 * S; a.beginPath(); a.moveTo(...toPx(...E2)); a.lineTo(...toPx(...F)); a.stroke();
+      const fr = rr(0.1, 0.19);
+      for (let k = 0; k < 5; k++) {      // five tiny petals per floret
+        const pa = k / 5 * 6.283 + rr(0, 1), X = F[0] + Math.cos(pa) * fr * 0.7, Y = F[1] + Math.sin(pa) * fr * 0.7;
+        a.beginPath(); a.arc(...toPx(X, Y), fr * 0.62 * S, 0, 7); a.fill();
+        b.fillStyle = 'rgb(105,105,105)'; b.beginPath(); b.arc(...toPx(X, Y), fr * 0.62 * S, 0, 7); b.fill();
+      }
+    }
+  }
+}
+function ginkgo(a, b) {
+  const leaves = [[2.6, -5.6, -0.5, 1.0, 11], [-0.4, -8.2, 0.35, 0.82, 23]];
+  const shapes = leaves.map(([x, y, rot, sc, seed]) => {
+    // irregular fan: wavy rim, a deep central notch, one small tear
+    const pts = [[0, 0]];
+    const c1 = [[-1.2, -0.9], [-3.6, -2.3], [-3.7, -3.9]];
+    for (let k = 1; k <= 12; k++) { const u = k / 12, v = 1 - u; pts.push([3 * v * v * u * c1[0][0] + 3 * v * u * u * c1[1][0] + u * u * u * c1[2][0], 3 * v * v * u * c1[0][1] + 3 * v * u * u * c1[1][1] + u * u * u * c1[2][1]]); }
+    for (let k = 0; k <= 60; k++) {
+      const u = k / 60, ang = Math.PI + 0.34 + u * (Math.PI - 0.68);
+      let rad = 4.2 + 0.18 * Math.sin(u * 37 + seed) + 0.1 * Math.sin(u * 91 + seed * 2) + 0.12 * (vnoise(u * 9 + seed, seed) - 0.5);
+      rad -= Math.abs(u - 0.5) < 0.045 ? 1.3 * (1 - Math.abs(u - 0.5) / 0.045) : 0;
+      rad -= Math.abs(u - (seed % 2 ? 0.22 : 0.78)) < 0.012 ? 0.45 : 0;
+      pts.push([Math.cos(ang) * rad * 0.95, Math.sin(ang) * rad]);
+    }
+    pts.push([3.6, -2.3 * 0.75], [1.2, -0.7]);
+    return { x, y, rot, sc, seed, pts };
+  });
+  const tf = (ctx, sh) => { ctx.save(); ctx.translate(...toPx(sh.x, sh.y)); ctx.rotate(-sh.rot); ctx.scale(sh.sc * S, sh.sc * S); };
+  for (const sh of shapes) {
+    tf(a, sh); a.beginPath(); sh.pts.forEach(([X, Y], k) => (k ? a.lineTo(X, Y) : a.moveTo(X, Y))); a.closePath(); a.fillStyle = '#000'; a.fill(); a.restore();
+    a.save(); a.strokeStyle = '#000'; a.lineWidth = 0.13 * S; a.lineCap = 'round'; a.beginPath(); a.moveTo(...toPx(sh.x, sh.y));
+    a.quadraticCurveTo(...toPx(sh.x + Math.sin(sh.rot) * 1.6 * sh.sc + 0.3, sh.y - Math.cos(sh.rot) * 1.6 * sh.sc), ...toPx(sh.x + Math.sin(sh.rot) * 3.4 * sh.sc, sh.y - Math.cos(sh.rot) * 3.4 * sh.sc)); a.stroke(); a.restore();
+  }
+  tissue(a, b, 156, 34);
+  // fine fan veins, forking as they spread
+  for (const sh of shapes) {
+    tf(b, sh); b.strokeStyle = 'rgb(40,40,40)'; b.lineCap = 'round';
+    for (let k = 0; k < 26; k++) {
+      const a0 = Math.PI + 0.42 + (k + 0.5) / 26 * (Math.PI - 0.84);
+      const mid = [Math.cos(a0) * 1.9 * 0.95, Math.sin(a0) * 1.9];
+      b.lineWidth = 0.04; b.beginPath(); b.moveTo(0, 0); b.lineTo(...mid); b.stroke();
+      for (const sp of [-0.035, 0.035]) { const a1 = a0 + sp; b.lineWidth = 0.032; b.beginPath(); b.moveTo(...mid); b.lineTo(Math.cos(a1) * 4.0 * 0.95, Math.sin(a1) * 4.0); b.stroke(); }
+    }
+    b.restore();
+  }
+  b.globalCompositeOperation = 'destination-in'; b.drawImage(a.canvas, 0, 0); b.globalCompositeOperation = 'destination-over'; b.fillStyle = '#fff'; b.fillRect(0, 0, TW, TH); b.globalCompositeOperation = 'source-over';
+}
+let T_FERN, T_LACE, T_GINK;
+
+// ---------------- shader ----------------
+const FS = HD + `
+out vec4 o;
+${CD.GLSL}
+uniform float uT, uShot;
+uniform sampler2D uP0, uP1, uP2;
+uniform vec4 uPl[3];          // per plant while landing: (offset x, offset y, scale, lift cm)
+uniform vec3 uSun;            // sun direction (shot 1)
+uniform float uGlass;         // glass slide: x offset (cm) of its left edge; 99 = not there
+uniform float uExpo;          // exposure progress 0..1
+uniform float uLift, uRise;   // shot 2: lift angle (rad), rise (cm)
+uniform float uRock;          // tray rocking amount
+uniform vec4 uDrop[6];        // falling drops (x, y, z, r)
+uniform vec4 uRip[6];         // ripples (x, y, t0, amp)
+const vec3 LIGHT_COL = vec3(1.);   // sun colour knob: multiplies sunC (shot 1) and Lc (shot 2)
+const vec2 PS = vec2(${(PW / 2).toFixed(2)}, ${(PH / 2).toFixed(2)});
+vec2 puv(vec2 p){ return vec2(p.x/${PW}. + .5, .5 + p.y/${PH}.); }
+// --- the print's chemistry ---
+float coat(vec2 p){      // brushed sensitiser with dry-brush edges
+  float ex = 13.6 + .55*(vn(vec2(p.y*1.7, 3.)) - .5) + .35*vn(vec2(p.y*9., 1.));
+  float ey = 9.0 + .4*(vn(vec2(p.x*.9, 7.)) - .5);
+  float bristle = vn(vec2(p.x*.35, p.y*16.));
+  float ix = smoothstep(ex + .2, ex - .5 - .7*bristle*smoothstep(ex - 2.5, ex, abs(p.x)), abs(p.x));
+  float iy = smoothstep(ey + .25, ey - .3, abs(p.y));
+  float c = ix*iy;
+  c *= .97 + .03*smoothstep(.2, .7, vn(vec2(p.x*.12, p.y*1.5)));        // uneven brush load
+  return clamp(c, 0., 1.);
+}
+vec4 plantS(sampler2D T, vec2 p, vec4 X, float lod){
+  vec2 q = (p - X.xy)/X.z;
+  vec2 uv = puv(q);
+  if (uv.x < 0. || uv.y < 0. || uv.x > 1. || uv.y > 1.) return vec4(0.);
+  return textureLod(T, vec2(uv.x, 1. - uv.y), lod);
+}
+float transmit(vec2 p, float lod){     // light reaching the paper through the plants (final placement)
+  float tr = 1.;
+  vec4 a = plantS(uP0, p, vec4(0., 0., 1., 0.), lod), b = plantS(uP1, p, vec4(0., 0., 1., 0.), lod), c = plantS(uP2, p, vec4(0., 0., 1., 0.), lod);
+  tr *= mix(1., a.g*.9, a.r); tr *= mix(1., b.g, b.r); tr *= mix(1., c.g, c.r);
+  return tr;
+}
+float exposureAt(vec2 p){ return transmit(p, 1.6); }
+vec3 paperAlb(vec2 p){
+  float f = vn(p*vec2(2.3, 2.1))*.5 + vn(p*7.3)*.3 + vn(p*23.)*.2;
+  return vec3(.80, .785, .74)*(.93 + .1*f);
+}
+float paperTooth(vec2 p){ return vn(p*4.1)*.5 + vn(p*9.7 + 3.)*.3 + vn(p*21.)*.2; }
+// ---- shot 1: printing in the sun ----
+vec3 table(vec2 p){
+  float sl = floor((p.y + 100.)/11.);
+  float g = fbm(vec2(p.x*.02 + sl*7., p.y*.4));
+  vec3 a = mix(vec3(.30, .26, .21), vec3(.42, .37, .30), g);
+  a *= .85 + .3*vn(vec2(p.x*.6, p.y*7.));
+  float gap = smoothstep(5.05, 5.45, abs(fract((p.y + 100.)/11.) - .5)*11.);
+  return a*(1. - .8*gap);
+}
+float cloudSh(vec2 p){ return smoothstep(.45, .75, fbm(p*.012 + vec2(-uT*.55, uT*.12))); }
+vec3 shot1(vec3 ro, vec3 rd, out float depth){
+  vec3 col;
+  vec3 L = normalize(uSun);
+  vec3 sunC = LIGHT_COL*vec3(1., .95, .86)*2.7, sky = vec3(.45, .55, .75)*.75;
+  float t = -ro.z/rd.z; vec3 p = ro + rd*t; depth = t;
+  vec2 q = p.xy;
+  bool onPaper = abs(q.x) < PS.x && abs(q.y) < PS.y;
+  float cs = cloudSh(q);
+  float sunVis = 1. - .62*cs;
+  // shadows cast by the paper's slight lift and the glass edge are tiny; the plants cast soft ones
+  vec2 so = -L.xy/L.z;
+  if (onPaper) {
+    vec3 alb = paperAlb(q);
+    float c = coat(q);
+    float ex = exposureAt(q);
+    float E = uExpo*ex;
+    vec3 sens = vec3(.62, .60, .16)*(.92 + .1*vn(q*3.));
+    vec3 bronze = mix(vec3(.22, .25, .19), vec3(.13, .16, .17), smoothstep(.4, 1., E));
+    vec3 ct = mix(sens, bronze, smoothstep(0., .85, E));
+    alb = mix(alb, ct, c);
+    float th = paperTooth(q);
+    vec3 n = normalize(vec3((paperTooth(q + vec2(.05, 0.)) - th)*-.09/.05, (paperTooth(q + vec2(0., .05)) - th)*-.09/.05, 1.));
+    // plant shadows on the paper (soft, from the plants' small height)
+    float sh = 1.;
+    for (int k = 0; k < 3; k++) {
+      vec4 X = uPl[k];
+      vec4 s = k == 0 ? plantS(uP0, q - so*(.12 + X.w), X, 1.5 + X.w*.6) : k == 1 ? plantS(uP1, q - so*(.12 + X.w), X, 1.5 + X.w*.6) : plantS(uP2, q - so*(.12 + X.w), X, 1.5 + X.w*.6);
+      vec4 s2 = k == 0 ? plantS(uP0, q - so*(.32 + X.w), X, 3. + X.w*.6) : k == 1 ? plantS(uP1, q - so*(.32 + X.w), X, 3. + X.w*.6) : plantS(uP2, q - so*(.32 + X.w), X, 3. + X.w*.6);
+      sh *= 1. - (.55*s.r*(1. - .6*s.g) + .2*s2.r)/(1. + X.w*.08);
+    }
+    col = alb*(sunC*max(dot(n, L), 0.)*sh*sunVis + sky*.55);
+    // the plants themselves (last placed on top)
+    for (int k = 0; k < 3; k++) {
+      vec4 X = uPl[k];
+      vec4 s = k == 0 ? plantS(uP0, q - rd.xy/rd.z*X.w*0., X, .3) : k == 1 ? plantS(uP1, q, X, .3) : plantS(uP2, q, X, .3);
+      if (s.r < .02) continue;
+      float vein = smoothstep(.3, .1, s.g);
+      vec3 pc;
+      if (s.a < .37) {        // fern: deep green, lighter yellow-green veins, a few dry brown speckles
+        pc = mix(vec3(.022, .068, .016), vec3(.05, .11, .02), vn(q*1.2))*(.8 + .4*s.g);
+        pc = mix(pc, vec3(.09, .14, .035), vein*.7);
+        pc = mix(pc, vec3(.12, .07, .02), smoothstep(.78, .9, vn(q*4.3))*.5);
+      } else if (s.a < .62) {  // lace: cream florets, green stalks
+        pc = s.g < .2 ? vec3(.11, .18, .05) : vec3(.74, .72, .62)*(.85 + .2*vn(q*9.));
+      } else {                 // ginkgo: butter yellow, greener along the veins, browning at the rim
+        pc = mix(vec3(.58, .42, .05), vec3(.66, .5, .1), vn(q*1.7));
+        pc = mix(pc, vec3(.26, .30, .05), vein*.75);
+        pc *= .85 + .3*vn(q*6.);
+        pc = mix(pc, vec3(.28, .14, .03), smoothstep(.6, .95, 1. - s.b)*.5*smoothstep(.7, .9, vn(q*2.5 + 4.)));
+      }
+      float hh = s.b;
+      vec4 sx = k == 0 ? plantS(uP0, q + vec2(.06, 0.), X, 1.) : k == 1 ? plantS(uP1, q + vec2(.06, 0.), X, 1.) : plantS(uP2, q + vec2(.06, 0.), X, 1.);
+      vec4 sy = k == 0 ? plantS(uP0, q + vec2(0., .06), X, 1.) : k == 1 ? plantS(uP1, q + vec2(0., .06), X, 1.) : plantS(uP2, q + vec2(0., .06), X, 1.);
+      vec3 pn = normalize(vec3(-(sx.b - hh)*2.2, -(sy.b - hh)*2.2, 1.));
+      float tr = s.g;
+      vec3 pcol = pc*(sunC*(max(dot(pn, L), 0.)*.85 + .15*tr)*sunVis + sky*.5);
+      pcol += pc*pc*sunC*sunVis*tr*1.2;                                   // sunlight glowing through the thin tissue
+      pcol += sunC*sunVis*pow(max(dot(reflect(rd, pn), L), 0.), 40.)*.05*(1. - vein*.5);
+      col = mix(col, pcol, smoothstep(.15, .6, s.r));
+    }
+  } else {
+    vec3 alb = table(q);
+    float sh = 1.;
+    // the paper and the board cast a thin shadow line
+    vec2 qs = q - so*.06;
+    if (abs(qs.x) < PS.x && abs(qs.y) < PS.y) sh = .55;
+    col = alb*(sunC*max(L.z, 0.)*sh*sunVis + sky*.5);
+  }
+  // glass sheet (2 mm) pressed over the paper: reflections, sun glint, green edges
+  float gx0 = uGlass;
+  if (gx0 < 50.) {
+    float tg = (.35 - ro.z)/rd.z; vec3 pg = ro + rd*tg;
+    vec2 g = pg.xy - vec2(gx0, 0.);
+    vec2 gs = vec2(16.5, 11.5);
+    if (abs(g.x - gs.x) < gs.x && abs(g.y) < gs.y) {
+      float fr = .04 + .96*pow(1. - abs(rd.z), 5.);
+      vec3 rr = reflect(rd, vec3(0., 0., 1.));
+      vec3 env = mix(vec3(.5, .6, .8), vec3(.85, .9, 1.), clamp(rr.z, 0., 1.))*(.85 + .3*fbm(pg.xy*.03 + 2.));
+      float glint = pow(max(dot(rr, normalize(uSun)), 0.), 6000.)*20.;
+      col = col*(1. - fr)*vec3(.95, .985, .97) + (env*fr*1.4 + sunC*glint)*(1. - .62*cs);
+      // the 4 mm edge: seen through its thickness the glass is green; one bevel catches the sun, the far one is dark
+      float edge = min(gs.x - abs(g.x - gs.x), gs.y - abs(g.y));
+      vec2 en = abs(g.x - gs.x)/gs.x > abs(g.y)/gs.y ? vec2(sign(g.x - gs.x), 0.) : vec2(0., sign(g.y));
+      float band = smoothstep(.42, .30, edge);
+      vec3 edgeCol = col*vec3(.42, .68, .6) + vec3(.02, .05, .045)*sunC;
+      col = mix(col, edgeCol, band);
+      float bevelLit = max(dot(normalize(vec3(en, .6)), normalize(uSun)), 0.);
+      col += sunC*vec3(.75, .95, .9)*.5*pow(bevelLit, 6.)*smoothstep(.12, .03, abs(edge - .3))*(1. - .62*cs);
+      col *= 1. - .35*smoothstep(.1, .0, edge);
+    } else {
+      // the sheet's edge throws a faint green-tinted shadow line beside it
+      vec2 g2 = g + so*.35;
+      if (abs(g2.x - gs.x) < gs.x && abs(g2.y) < gs.y) col *= vec3(.86, .92, .9);
+    }
+  }
+  return col;
+}
+// ---- shot 2: the wash ----
+const vec3 TRAY = vec3(21., 16., 4.2);       // inner half-size x, y, wall height
+float waterZ(vec2 q){
+  float h = 1.6;
+  h += uRock*.12*sin(q.x*.28 - uT*4.2 + q.y*.05) + uRock*.06*sin(q.y*.35 + uT*3.1);
+  for (int i = 0; i < 6; i++) {
+    vec4 Rp = uRip[i]; float age = uT - Rp.z; if (age <= 0. || Rp.w == 0.) continue;
+    float r = length(q - Rp.xy), x = r - age*16.;
+    h += Rp.w*sin(x*2.2)*exp(-x*x*.8)*exp(-age*1.4)/(1. + r*.3);
+  }
+  // flood: a low wave front that runs in from the tray edges at 4.0
+  float fl = uT - 4.;
+  if (fl > 0. && fl < 1.5) { float d = min(TRAY.x - abs(q.x), TRAY.y - abs(q.y)); float x = d - fl*22.; h += .25*exp(-x*x*.08)*exp(-fl*2.); }
+  return h;
+}
+float caustic(vec2 p, float t){
+  // two drifting cellular layers; light focuses along the cell walls
+  vec2 a = worley(p + vec2(t*.35, t*.12) + .4*vec2(sin(p.y*.7 + t), cos(p.x*.6 - t)));
+  vec2 b = worley(p*1.37 + vec2(-t*.25, t*.3) + 7.);
+  float ca = smoothstep(.22, .0, a.y - a.x), cb = smoothstep(.2, .0, b.y - b.x);
+  return clamp(ca*.7 + cb*.5 + ca*cb*1.2, 0., 2.);
+}
+// paper placement in the tray: hinge on the near edge, lift the far edge towards the lens
+mat3 paperFrame(out vec3 org){
+  float a = uLift;
+  org = vec3(0., -PS.y, .06 + uRise);
+  vec3 ex = vec3(1., 0., 0.), ey = vec3(0., cos(a), sin(a)), ez = cross(ex, ey);
+  return mat3(ex, ey, ez);
+}
+// print colour after washing for 'age' seconds
+vec3 printCol(vec2 p, float wetAge, out float yel){
+  vec3 alb = paperAlb(p);
+  float c = coat(p);
+  float ex = exposureAt(p);
+  float b = smoothstep(0., .45, wetAge);
+  float deep = smoothstep(.3, 4., wetAge);
+  vec3 sens = vec3(.62, .60, .16);
+  vec3 bronze = vec3(.13, .16, .17);
+  vec3 prus = mix(vec3(.03, .10, .30), vec3(.006, .03, .14), deep);
+  vec3 pre = mix(sens, bronze, smoothstep(0., .85, ex));
+  // exposed → Prussian blue; unexposed sensitiser dissolves → white (a whisper of blue in half-tones)
+  vec3 post = mix(alb*vec3(.96, .98, 1.), prus, pow(smoothstep(.1, .78, ex), .8));
+  vec3 cc = mix(pre, post, b);
+  yel = c*(1. - ex)*smoothstep(0., .25, wetAge)*smoothstep(2.2, .3, wetAge);
+  return mix(alb, cc, c);
+}
+float wetAgeAt(vec2 p){
+  float d = min(PS.x - abs(p.x), PS.y - abs(p.y));
+  float tw = 4.0 + pow(max(d, 0.)/PS.y, .8)*.75 + .16*(vn(p*.45) - .5) + .06*(vn(p*2.) - .5);
+  return uT - tw;
+}
+float trayD(vec3 p){
+  vec3 q = abs(p - vec3(0., 0., TRAY.z*.5)) - vec3(TRAY.x, TRAY.y, TRAY.z*.5);
+  float inner = length(max(q, 0.)) + min(max(q.x, max(q.y, q.z)), 0.) - 1.2;
+  vec3 q2 = abs(p - vec3(0., 0., TRAY.z*.5 - .4)) - vec3(TRAY.x + .5, TRAY.y + .5, TRAY.z*.5);
+  float outer = length(max(q2, 0.)) + min(max(q2.x, max(q2.y, q2.z)), 0.) - 1.2;
+  return max(outer, -max(inner, -(p.z - .0)));
+}
+float sceneD(vec3 p, out float id){
+  float d = p.z + .4; id = 0.;                         // table
+  float tr = trayD(p); if (tr < d) { d = tr; id = 1.; }
+  if (uLift > .001 || uRise > .001) {
+    vec3 org; mat3 F = paperFrame(org); vec3 l = transpose(F)*(p - org);
+    float pd = length(max(abs(vec2(l.x, l.y - PS.y)) - PS, 0.)); pd = max(pd, abs(l.z) - .03);
+    if (pd < d) { d = pd; id = 2.; }
+  }
+  for (int i = 0; i < 6; i++) { vec4 D = uDrop[i]; if (D.w <= 0.) continue; vec3 q = p - D.xyz; q.z *= .75; float dd = length(q) - D.w; if (dd < d) { d = dd; id = 3.; } }
+  return d;
+}
+vec3 floorCol(vec2 q, out float isPaper, out vec2 pp){
+  // tray floor (white enamel) with the paper lying on it (when not lifted)
+  isPaper = 0.; pp = q;
+  if (uLift < .001 && uRise < .001 && abs(q.x) < PS.x && abs(q.y) < PS.y) { isPaper = 1.; return vec3(0.); }
+  vec3 e = vec3(.82, .82, .8)*(.95 + .05*vn(q*.8));
+  return e;
+}
+vec3 shot2(vec3 ro, vec3 rd, out float depth){
+  vec3 sunL = normalize(vec3(-.45, .35, .82));
+  vec3 Lc = LIGHT_COL*vec3(1., .96, .9)*2.2, sky = vec3(.5, .6, .8)*.8;
+  float t = 0., id = -1.; bool hit = false;
+  // water surface (inside the tray) — refract into the water
+  vec3 col = vec3(0.);
+  float tw = (1.6 - ro.z)/rd.z; vec3 pw = ro + rd*tw;
+  bool inWater = abs(pw.x) < TRAY.x - .2 && abs(pw.y) < TRAY.y - .2 && uT >= 4.;
+  for (int i = 0; i < 160; i++) { float d = sceneD(ro + rd*t, id); if (d < .002*t) { hit = true; break; } t += d*.9; if (t > 400.) break; }
+  // things above the water hit first
+  if (hit && (!inWater || t < tw)) {
+    vec3 p = ro + rd*t; depth = t;
+    float dd; vec2 e = vec2(.005, 0.);
+    vec3 n = normalize(vec3(sceneD(p + e.xyy, dd) - sceneD(p - e.xyy, dd), sceneD(p + e.yxy, dd) - sceneD(p - e.yxy, dd), sceneD(p + e.yyx, dd) - sceneD(p - e.yyx, dd)));
+    sceneD(p, id);
+    vec3 alb; float spec = .05, rough = .5;
+    if (id == 0.) alb = table(p.xy);
+    else if (id == 1.) { alb = p.z > TRAY.z - .2 ? vec3(.02, .05, .16) : vec3(.84, .84, .82); spec = .5; rough = .15; }
+    else if (id == 2.) {
+      vec3 org; mat3 F = paperFrame(org); vec3 l = transpose(F)*(p - org);
+      vec2 pp = vec2(l.x, l.y - PS.y);
+      float yel; alb = printCol(pp, uT - 4.5, yel);
+      if (l.z < 0.) alb = paperAlb(pp)*vec3(.85, .9, 1.);
+      // water film running down the lifted print
+      float film = smoothstep(.6, .2, (uT - 8.)*.5 + (pp.y + PS.y)/(PS.y*2.)*.0);
+      spec = .6*(.5 + .5*film); rough = .06;
+      vec3 fn = normalize(n + .05*vec3(vn(vec2(pp.x*2., pp.y*.3 + uT*6.)) - .5, 0., 0.));
+      n = fn;
+    } else { alb = vec3(.01, .02, .03); spec = 1.; rough = .02; }
+    float ndl = max(dot(n, sunL), 0.);
+    col = alb*(Lc*ndl + sky*.45*(.6 + .4*n.z));
+    vec3 Hh = normalize(sunL - rd);
+    float fres = .04 + .96*pow(1. - max(dot(n, -rd), 0.), 5.);
+    col += Lc*pow(max(dot(n, Hh), 0.), 2./(rough*rough))*spec*.5 + mix(sky, vec3(1.), .3)*fres*spec*.7;
+    return col;
+  }
+  if (inWater) {
+    depth = tw;
+    vec2 q = pw.xy; float e = .08;
+    float h0 = waterZ(q), hx = waterZ(q + vec2(e, 0.)), hy = waterZ(q + vec2(0., e));
+    vec3 n = normalize(vec3(-(hx - h0)/e, -(hy - h0)/e, 1.));
+    vec3 rd2 = refract(rd, n, 1./1.33);
+    float tb = -pw.z/rd2.z; vec3 pb = pw + rd2*tb;           // the floor / print under the water
+    vec2 qb = pb.xy;
+    vec3 under;
+    float isP; vec2 pp; vec3 fl = floorCol(qb, isP, pp);
+    float yel = 0.;
+    if (isP > .5) under = printCol(qb, wetAgeAt(qb), yel);
+    else under = fl;
+    if (uLift > .001 || uRise > .001) {
+      float t2 = .01, id2; bool h2 = false;
+      for (int i = 0; i < 40; i++) { float d2 = sceneD(pw + rd2*t2, id2); if (d2 < .002) { h2 = true; break; } t2 += d2; if (t2 > tb) break; }
+      if (h2 && id2 == 2.) { vec3 org; mat3 F = paperFrame(org); vec3 l = transpose(F)*(pw + rd2*t2 - org); under = printCol(vec2(l.x, l.y - PS.y), uT - 4.5, yel); if (l.z < 0.) under = paperAlb(l.xy)*.8; tb = t2; qb = (pw + rd2*t2).xy; }
+    }
+    // light: sun through the moving surface → caustics on the bottom
+    float ct = uT < 8.4 ? uT : 8.4 + (uT - 8.4)*.15;                 // the water calms once the print is out
+    float ca = caustic(qb*.32, ct*1.3)*(.25 + uRock*.9);
+    float ndl = max(sunL.z, 0.);
+    vec3 lit = under*(Lc*ndl*(.8 + ca*.7) + sky*.45);
+    // the dissolved sensitiser clouds the water yellow-green, drifting off the print
+    float cl = 0.;
+    if (uT > 4.) {
+      vec2 dq = qb + vec2(sin(uT*.8 + qb.y*.2), cos(uT*.7 + qb.x*.15))*(uT - 4.)*.9;
+      float wa = wetAgeAt(qb);
+      cl = smoothstep(.35, .75, fbm(dq*.22 + 3.))*smoothstep(0., .25, wa)*smoothstep(3.2, .8, wa);
+      float yb; printCol(dq, wetAgeAt(dq), yb);
+      cl *= .3 + 2.*yb;
+    }
+    lit = mix(lit, lit*vec3(1., 1., .45) + vec3(.25, .26, .02)*Lc*.08, clamp(cl*.9, 0., .85));
+    lit *= exp(-tb*vec3(.03, .015, .012));
+    float fres = .02 + .98*pow(1. - max(dot(n, -rd), 0.), 5.);
+    vec3 rr = reflect(rd, n);
+    vec3 env = mix(sky*.9, vec3(1.), smoothstep(.2, .9, rr.z))*.8;
+    float glint = pow(max(dot(rr, sunL), 0.), 400.)*60.;
+    col = lit*(1. - fres) + (env + Lc*glint)*fres;
+    // tray wall shadow inside
+    return col;
+  }
+  depth = 400.;
+  return sky;
+}
+void main(){
+  vec3 ro = uCamP, rd = camRay(gl_FragCoord.xy);
+  float depth;
+  vec3 col = uShot < .5 ? shot1(ro, rd, depth) : shot2(ro, rd, depth);
+  o = vec4(col, cocOf(depth*dot(rd, uCamF)));
+}`;
+const prog = SG.prog(gl, SG.VS_QUAD, FS);
+
+// ---------------- timing ----------------
+const LAND = [0.5, 1.0, 1.5];            // plants land on the beat
+function plantX(t, k) {
+  // each plant drifts in from beyond the edge of frame and settles onto the paper on its beat (the fern is already coming in on frame 0)
+  const t0 = LAND[k] - (k === 0 ? 0.62 : 0.45), u = clamp((t - t0) / (LAND[k] - t0));
+  if (t < t0) return [999, 999, 1, 40];
+  const e = E.inOutSine(u);
+  const lift = (1 - e) * 6 + (t > LAND[k] ? 0.12 * Math.exp(-(t - LAND[k]) * 12) * Math.abs(Math.sin((t - LAND[k]) * 30)) : 0);
+  const from = [[-9, 6], [26, 14], [10, -20]][k];        // the fern is already half in frame on frame 0
+  return [from[0] * (1 - e), from[1] * (1 - e), 1 + 0.08 * (1 - e), lift];
+}
+function sunAt(t) {
+  const u = clamp((t - 2) / 2);
+  const az = lerp(2.3, 0.9, E.inOutSine(u)), el = lerp(0.95, 1.12, Math.sin(Math.PI * u));
+  return [Math.cos(az) * Math.cos(el), Math.sin(az) * Math.cos(el), Math.sin(el)];
+}
+const CAM1 = Track([
+  { t: 0, v: [1.5, -25, 37, 0, 0.5, 0] },
+  { t: 2.0, v: [0.5, -22, 33, -0.5, 0.2, 0] },
+  { t: 4.0, v: [-1.5, -17, 26, -0.8, 0, 0] },
+], { easeOut: false });
+const CAM2 = Track([
+  { t: 4.0, v: [3, -34, 44, 0, 0, 0] },
+  { t: 6.0, v: [0, -31, 41, 0, 1, 0] },
+  { t: 8.0, v: [-1, -30, 38, 0, 3, 3] },
+  { t: 8.6, v: [-1, -32, 35, 0, 4, 7] },
+  { t: 10, v: [-1, -32, 35, 0, 4, 7] },
+], { easeIn: false });
+function dropsAt(t, lift, rise) {
+  const D = new Float32Array(24), Rp = new Float32Array(24);
+  let nd = 0, nr = 0;
+  // paper's near (bottom) edge after lifting: at y = -PH/2, z = 0.06 + rise
+  const ye = -PH / 2, ze = 0.06 + rise;
+  const T0 = [8.45, 8.62, 8.84], X = [-9, 4, -2];        // three drops right after the lift, then the frame holds still
+  T0.forEach((t0, i) => {
+    if (t < t0) return;
+    const s = t - t0, z = ze - 0.5 * 980 * s * s, tHit = Math.sqrt(Math.max(0, 2 * (ze - 1.6) / 980));
+    if (z > 1.6 && nd < 6) { D.set([X[i], ye - 0.1, z, 0.22], nd * 4); nd++; }
+    if (s > tHit && nr < 6) { Rp.set([X[i], ye, t0 + tHit, 0.12], nr * 4); nr++; }
+  });
+  return { D, Rp };
+}
+
+Reel.scene({
+  duration: 10, fps: 30,
+  async setup() {
+    T_FERN = packTex(plantCanvas(fern), 64);
+    T_LACE = packTex(plantCanvas(lace), 128);
+    T_GINK = packTex(plantCanvas(ginkgo), 192);
+  },
+  cues: [
+    { t: 0.5, sfx: 'leaf_land', gain: 0.6 }, { t: 1.0, sfx: 'leaf_land', gain: 0.55 }, { t: 1.5, sfx: 'leaf_land', gain: 0.55 },
+    { t: 1.6, sfx: 'glass_slide', gain: 0.6 }, { t: 2.0, sfx: 'glass_tap', gain: 0.6 },
+    { t: 2.0, sfx: 'sun_swell', gain: 0.5 },
+    { t: 4.0, sfx: 'water_flood', gain: 0.85 },
+    { t: 5.2, sfx: 'slosh', gain: 0.45 }, { t: 6.2, sfx: 'slosh', gain: 0.4 }, { t: 7.2, sfx: 'slosh', gain: 0.4 },
+    { t: 7.8, sfx: 'paper_lift', gain: 0.8 },
+    { t: 8.47, sfx: 'drip', gain: 0.45 }, { t: 8.64, sfx: 'drip', gain: 0.35 }, { t: 8.86, sfx: 'drip', gain: 0.3 },
+  ],
+  render(t) {
+    const frame = Math.round(t * 30);
+    const shot = frame >= F_CUT ? 1 : 0;
+    let cam, focus, aper;
+    if (!shot) {
+      const v = CAM1(t); cam = CD.cam([v[0], v[1], v[2]], [v[3], v[4], v[5]], 34);
+      focus = CD.depthOf(cam, [0, 0, 0]); aper = 7;
+    } else {
+      const v = CAM2(t); cam = CD.cam([v[0], v[1], v[2]], [v[3], v[4], v[5]], 34);
+      focus = CD.depthOf(cam, [0, t > 8 ? 2 : 0, t > 8 ? lerp(0, 7, clamp((t - 8) / 0.6)) : 0]); aper = 7;
+    }
+    // lift: far edge rises towards the lens from 8.0, then the whole print clears the water
+    const lu = clamp((t - 7.75) / 0.55), lift = shot ? E.inOutSine(lu) * 0.95 : 0;
+    const rise = shot ? E.inOutSine(clamp((t - 8.05) / 0.4)) * 2.1 : 0;
+    const rock = shot ? clamp((t - 5) / 0.5) * clamp((7.8 - t) / 0.5) : 0;
+    const { D, Rp } = dropsAt(t, lift, rise);
+    POST.begin();
+    const P = prog.use();
+    CD.camU(P, cam, focus, aper);
+    const pl = new Float32Array(12); for (let k = 0; k < 3; k++) pl.set(plantX(t, k), k * 4);
+    const gl0 = t < 1.6 ? 99 : lerp(30, -16.5, E.outCubic(clamp((t - 1.6) / 0.4)));
+    P.t('uP0', T_FERN).t('uP1', T_LACE).t('uP2', T_GINK).f('uT', t).f('uShot', shot).arr4('uPl', pl).f('uSun', ...sunAt(t))
+      .f('uGlass', shot ? 99 : gl0).f('uExpo', E.inOutSine(clamp((t - 2.0) / 1.9))).f('uLift', lift).f('uRise', rise).f('uRock', rock)
+      .arr4('uDrop', D).arr4('uRip', Rp);
+    QUAD.draw();
+    POST.finish({ exposure: 0.95, vignette: 0.35, grain: 0.025, ca: 0.3, seed: frame % 97, bloom: 0.12, bloomThresh: 1.2,
+      tint: [1.0, 0.99, 0.97], sat: 1.0, contrast: 1.04, dof: 18 });
+  },
+});
+</script></body></html>

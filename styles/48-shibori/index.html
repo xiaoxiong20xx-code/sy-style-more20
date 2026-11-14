@@ -1,0 +1,734 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>48 扎染 · Indigo Shibori</title>
+<script src="../../lib/core.js"></script>
+<script src="../../lib/strokegl.js"></script>
+<script src="../../lib/track.js"></script>
+<script src="../../lib/craftd.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 48 扎染 · INDIGO SHIBORI (one continuous shot) =====
+   Daytime in the courtyard of a Bai dye-house: blue-stone paving, a big glazed earthenware vat standing in the sun,
+   racks of bamboo behind it hung with indigo cloths of every depth (some tie-dyed) stirring in the wind, a white wall
+   and a grey-tiled roof beyond, a tree throwing shade. The liquor is blue-black, and a mound of indigo "flower" floats
+   on it — fine foam with a coppery-violet metallic sheen. A square of cotton has been pinched at
+   its centre, gathered into a rope with random folds and bound with five cords; it hangs by a short twine from a
+   bamboo pole.
+   0.0 the white bundle over the vat · 0.5 lowered, 1.0 the pole comes to rest across the rim and the bundle is under ·
+   2.0 lifted out, streaming, YELLOW-GREEN (leuco indigo) · 4.0 / 4.5 / 5.0 air: on each beat a wave of blue runs down
+   it, green → teal → deep indigo · 6.0–7.5 a cord springs off on each beat, the bundle loosens from the top down ·
+   7.45–8.0 shaken out, the cloth unfurls over the pole and hangs: white rings with feathered capillary edges, cleanest
+   right under where each cord was; the sun shines through the cotton · 8.0 it settles · hold.
+   The cloth is one mesh (u,v) rasterised over a ray-traced vat; bundle, loosened bundle and drape are three placements
+   of the same (u,v), and the dye pattern is computed from the same folds that shaped the bundle. */
+const stage = Reel.makeStage('#9aa6b4');
+Reel.ownJitter = true;
+const { clamp, lerp, E } = Reel;
+const gl = CD.init(stage);
+const W = CD.W, H = CD.H;
+const POST = CD.post(gl, { depth: true });
+const QUAD = SG.quad(gl);
+const HD = '#version 300 es\nprecision highp float;\nprecision highp int;\n';
+const FRAME = (t) => Math.round(t * 30);
+const T_OPEN = 7.35;                                 // the shake-out starts; fully open on 8.0
+const RHO = [0.15, 0.33, 0.51, 0.69, 0.87];          // where the five cords bind (cloth radius, centre = 0)
+const T_REL = [6.0, 6.5, 7.0, 7.5, 7.5];            // cord releases (the last two go together)
+const LB = 27;                                       // bundle length per unit cloth radius (cm)
+const S = 42;                                        // half-size of the opened cloth (cm)
+
+// ---------------- shared GLSL: folds, dye pattern, colour ----------------
+const CLOTH_GLSL = `
+uniform float uT, uOxi0;
+uniform vec4 uBind[5];       // (rho, squeeze 0..1, release age, -)
+float pleat(float rho, float phi){
+  // irregular gathered folds: periodic in phi, random in depth and spacing
+  vec2 c = vec2(cos(phi), sin(phi));
+  float a = vn3(vec3(c*2.3, rho*2.4))*2. - 1., b = vn3(vec3(c*5.6 + 7., rho*4.7))*2. - 1., d = vn3(vec3(c*12. + 3., rho*8.5))*2. - 1.;
+  return (a*.95 + b*.65 + d*.3)*1.05;
+}
+float dyeD(vec2 uv){
+  // the pinch was a little off-centre and the gathers were uneven: rings wobble, swell, thin and break
+  vec2 q = uv - vec2(.035, -.025);
+  float rho = length(q), phi = atan(q.y, q.x);
+  vec2 cph = vec2(cos(phi), sin(phi));
+  rho += .045*(vn3(vec3(cph*1.6, 2.)) - .5) + .02*(vn3(vec3(cph*4., 5.)) - .5);
+  float pl = pleat(rho, phi);
+  // capillary wicking runs along the threads (warp and weft): fine fibrous noise for feathered edges
+  float fe = (vn(uv*vec2(310., 11.)) + vn(uv*vec2(11., 310.)) - 1.)*.6 + (vn(uv*vec2(120., 5.)) + vn(uv*vec2(5., 120.)) - 1.)*.45 + (vn(uv*60.) - .5)*.3;
+  // creases of the folding: thin radial lines, a few degrees apart, wandering a little
+  float ca = phi/TAU*150. + 2.5*(vn(vec2(rho*6., 1.)) - .5) + 1.5*(vn3(vec3(cph*3., rho*2.)) - .5);
+  float crease = smoothstep(.05, .0, abs(fract(ca) - .5) - .465 + .03*fe)*step(.72, hash11(floor(ca) + 3.))*smoothstep(.04, .12, rho)
+               *smoothstep(.2, .5, vn(vec2(ca*.13, rho*9.)));          // short broken runs, not whole spokes
+  float res = 0.;
+  for (int k = 0; k < 5; k++) {
+    float rk = uBind[k].x;
+    float sp = smoothstep(-.7, 1., -pl);
+    float var = vn3(vec3(cph*2.2, float(k)*3.1));                                   // the cord bit deeper on one side
+    float w = (.014 + .04*sp*sp)*(.6 + .85*var) + .005*vn(vec2(phi*9. + float(k)*5., 3.));
+    float x = abs(rho - rk)/w;
+    float core = exp(-x*x*x);
+    float brk = smoothstep(.18, .32, vn3(vec3(cph*3.5, float(k)*7.)) + .25*sp);   // where the cord slipped, the ring breaks
+    core *= brk;
+    float edge = smoothstep(.45, .58, core + .3*fe*(1. - core*.6));
+    res = max(res, max(edge*.9 + core*.1, core*core));
+  }
+  float cen = exp(-pow(rho/(.05 + .03*vn(vec2(phi*4., 2.))), 3.));
+  res = max(res, smoothstep(.3, .65, cen + .3*fe));
+  // creases: dye crept in along them through the white, and they stayed pale through the blue near the rings
+  res = mix(res, res*.5, crease*smoothstep(.2, .8, res));       // dye crept in along the creases, drawing fine blue lines across the white
+  float field = .9 + .1*smoothstep(-1., 1., pl) - .05*vn(uv*7.);
+  float D = clamp((1. - res)*field, 0., 1.);
+  return max(D, .07 + .06*vn(uv*25.));          // even the whites carry a breath of blue
+}
+float oxidation(vec2 uv, float pl){
+  // three beats of air: on each beat a wave of blue runs down the bundle from the twine; outer folds first
+  float n = vn(uv*6.) - .5;
+  float lag = .30*clamp(length(uv), 0., 1.3) + .10*smoothstep(-1., 1., -pl) + .08*n;
+  float o = 0.;
+  o += smoothstep(3.85, 4.0, uT + .15 - lag);
+  o += smoothstep(4.35, 4.5, uT + .15 - lag);
+  o += smoothstep(4.85, 5.0, uT + .15 - lag);
+  o = o/3.*.94 + .06*smoothstep(2.4, 3.9, uT);
+  return clamp(o + uOxi0, 0., 1.);
+}
+vec3 clothAlb(vec2 uv, float pl, float dipped){
+  float D = dyeD(uv);
+  float o = oxidation(uv, pl);
+  vec3 white = vec3(.78, .76, .71);
+  vec3 leuco = vec3(.36, .44, .05), teal = vec3(.03, .15, .13), indigo = vec3(.006, .013, .052);
+  vec3 blue = vec3(.02, .07, .2);
+  vec3 dyed = o < .33 ? mix(leuco, teal, smoothstep(0., .33, o)) : o < .66 ? mix(teal, blue, smoothstep(.33, .66, o)) : mix(blue, indigo, smoothstep(.66, 1., o));
+  dyed *= .94 + .1*vn(uv*25.);
+  // the fringe between white and blue is a pale, slightly greenish blue
+  vec3 c = mix(white, dyed, D*dipped);
+  c = mix(c, mix(white, dyed, .35)*vec3(.92, 1., 1.03), smoothstep(.05, .3, D)*smoothstep(.75, .4, D)*.35*dipped);
+  return c;
+}
+float wetness(){ return uT < .9 ? 0. : clamp(1. - (uT - 2.4)/4., .25, 1.); }
+`;
+
+// ---------------- cloth mesh ----------------
+const N = 240;
+const cloth = (() => {
+  const v = new Float32Array((N + 1) * (N + 1) * 2), idx = new Uint32Array(N * N * 6);
+  let k = 0; for (let j = 0; j <= N; j++) for (let i = 0; i <= N; i++) { v[k++] = -1 + 2 * i / N; v[k++] = -1 + 2 * j / N; }
+  k = 0; for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) { const a = j * (N + 1) + i; idx.set([a, a + 1, a + N + 2, a, a + N + 2, a + N + 1], k); k += 6; }
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, v, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+  return { draw() { gl.bindVertexArray(vao); gl.drawElements(gl.TRIANGLES, idx.length, gl.UNSIGNED_INT, 0); gl.bindVertexArray(null); } };
+})();
+// cord mesh: (s along the helix 0..1, a around the twine, cord index)
+const CS = 260, CA = 8;
+const cords = (() => {
+  const v = [], idx = [];
+  for (let c = 0; c < 5; c++) {
+    const base = v.length / 3;
+    for (let i = 0; i <= CS; i++) for (let j = 0; j <= CA; j++) v.push(i / CS, j / CA, c);
+    for (let i = 0; i < CS; i++) for (let j = 0; j < CA; j++) { const a = base + i * (CA + 1) + j; idx.push(a, a + 1, a + CA + 2, a, a + CA + 2, a + CA + 1); }
+  }
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(v), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint32Array(idx), gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+  return { n: idx.length, draw() { gl.bindVertexArray(vao); gl.drawElements(gl.TRIANGLES, this.n, gl.UNSIGNED_INT, 0); gl.bindVertexArray(null); } };
+})();
+
+const VS_CLOTH = HD + `
+in vec2 p;
+uniform mat4 uVP; uniform float uMirror, uOpen, uWave, uSwayX, uSwayZ, uLoose, uPoleY;
+uniform vec3 uTip;
+out vec2 vUV; out vec3 vPos; out vec3 vN; out float vPl; out float vOpen;
+${CD.GLSL}
+${CLOTH_GLSL}
+vec3 bundleP(vec2 uv){
+  float rho = length(uv), phi = atan(uv.y, uv.x);
+  float pl = pleat(rho, phi);
+  float r0 = mix(.35, 3.2, smoothstep(0., .2, rho))*(1. + .08*sin(rho*7.)) + .9*smoothstep(1., 1.4, rho);
+  float sq = 0.;
+  for (int k = 0; k < 5; k++) { float x = (rho - uBind[k].x)/.06; sq = max(sq, uBind[k].y*exp(-x*x)); }
+  float crease = 1. - abs(pl)*.35;                     // sharp inward creases, soft outward ridges
+  float pls = sign(pl)*pow(abs(pl), .75);
+  vec2 cph = vec2(cos(phi), sin(phi));
+  float r = r0*(1. - .38*sq)*(1. + .19*pls*crease*(1. - .8*sq) + .07*(vn3(vec3(cph*18., rho*40.)) - .5) + .03*(vn3(vec3(cph*40., rho*90.)) - .5));
+  r *= 1. + .16*(vn(vec2(rho*7.5, 3.)) - .5) + .1*(vn(vec2(rho*15., 9.)) - .5);
+  // each section between two cords has its own fullness and its own twist
+  float sb = 0., stw = 0.;
+  for (int k = 0; k < 5; k++) { float st = smoothstep(uBind[k].x - .025, uBind[k].x + .025, rho); sb += st*(hash11(float(k)*7.3 + 1.) - .45); stw += st*(hash11(float(k)*3.7 + 5.) - .5); }
+  r *= 1. + .32*sb;
+  phi += .9*stw;
+  // released cords let the gathers relax and swell
+  float rel = 0.;
+  for (int k = 0; k < 5; k++) { float age = uBind[k].z; if (age > 0.) { float x = (rho - uBind[k].x)/.2; rel = max(rel, smoothstep(0., .35, age)*exp(-x*x)); } }
+  rel = max(rel, uLoose*smoothstep(.0, .3, rho));
+  r *= 1. + .55*rel*(1. + .3*pls);
+  float sk = max(rho - 1.07, 0.);
+  r += sk*2.2*(1. + .45*pl);
+  float y = uTip.y - rho*${LB}. + sk*${LB}.*.15;
+  float tw = .35*rho + .08*sin(rho*9.);
+  vec3 q = vec3(r*cos(phi + tw), y, r*sin(phi + tw));
+  q.x += .9*sin(rho*2.6 + .5); q.z += .6*sin(rho*3.3);
+  float hang = uTip.y - y;                       // pendulum sway grows down the bundle
+  q.x += uSwayX*hang; q.z += uSwayZ*hang;
+  return q + vec3(uTip.x, 0., uTip.z);
+}
+// draped over the pole: the centre line (v = 0) runs along the top of the pole, the front half (v > 0) hangs towards the lens
+vec3 drapeP(vec2 uv, out float fold){
+  float sv = uv.y >= 0. ? 1. : -1.;
+  float d = abs(uv.y)*${S}.;
+  float x = uv.x*${S}.;
+  const float RW = 2.15;
+  float y, zf;
+  if (d < RW*1.5708) { float th = d/RW; y = uPoleY + RW*cos(th); zf = RW*sin(th); }
+  else { y = uPoleY - (d - RW*1.5708); zf = RW; }
+  float hang = smoothstep(2., ${S}., d);
+  // a few big vertical folds, deepening towards the hem
+  float f = .75*sin(x*.155 + .6 + .25*sin(d*.05)) + .45*sin(x*.33 + 2.3 + d*.015) + .45*(vn(vec2(x*.07, d*.02)) - .5)*2.;
+  float A = 1.5 + 11.*hang;
+  fold = f;
+  float z = sv*(zf + A*(f*.55 + .7));
+  // the fullness of the folds takes up width: the sides draw in towards the hem
+  x = x*(1. - .16*hang) - A*.32*cos(x*.155 + .6);
+  // an uneven hem: the corners drop, the folds lift it in places
+  float hem = smoothstep(${S - 16}., ${S}., d);
+  y -= hem*(2.2*(vn(vec2(x*.06, 3.)) - .5)*2. + 1.4*uv.x*uv.x*${S}./20. - 1.2*f);
+  // the shake: a wave runs down the cloth and dies away by 8.3
+  float age = uT - ${T_OPEN.toFixed(2)};
+  z += sv*uWave*6.*sin(d*.12 - age*16.)*exp(-max(age, 0.)*5.)*smoothstep(0., .1, age)*smoothstep(2., 10., d);
+  return vec3(x, y, z);
+}
+float openAt(vec2 uv){ return smoothstep(0., 1., (uT - ${T_OPEN.toFixed(2)} - .3*length(uv))/.32); }   // opens from the pole outwards, like a cloth unrolling as it is shaken
+vec3 P(vec2 uv, out float fold, out float m){
+  m = uOpen > .5 ? openAt(uv) : 0.;
+  vec3 b = bundleP(uv);
+  fold = 0.;
+  if (m <= 0.) return b;
+  float fo; vec3 dr = drapeP(uv, fo);
+  fold = fo*m;
+  vec3 q = mix(b, dr, m);
+  float fly = sin(3.1416*m);
+  q.z += (uv.y >= 0. ? 1. : -1.)*fly*7.*smoothstep(.0, .4, length(uv));             // flung outwards on the way
+  q += fly*vec3(2.2*sin(uv.x*6. + uT*20.), 1.6*sin(uv.y*5. - uT*17.), 3.*sin(uv.x*4. + uv.y*5. - uT*22.))*smoothstep(.2, .9, length(uv));   // flutter while airborne
+  return q;
+}
+void main(){
+  vUV = p;
+  float fo, m, f1, m1;
+  vec3 q = P(p, fo, m);
+  float e = 1./${N}.;
+  vec3 qx = P(p + vec2(e, 0.), f1, m1), qy = P(p + vec2(0., e), f1, m1);
+  vN = normalize(cross(qx - q, qy - q));
+  vPl = mix(pleat(length(p), atan(p.y, p.x)), fo*1.4, m);
+  vOpen = m;
+  vPos = q;
+  if (uMirror > .5) q.y = -q.y;
+  gl_Position = uVP*vec4(q, 1.);
+}`;
+const LIGHT_GLSL = `
+const vec3 SUN = normalize(vec3(-.68, .58, -.45));     // late-morning sun, from the left and a little behind
+const vec3 LIGHT_COL = vec3(1.);   // sun colour knob (shared by cloth, cord and courtyard shaders)
+const vec3 SUNC = LIGHT_COL*vec3(1., .94, .84)*3.;
+const vec3 SKYC = vec3(.42, .5, .64);
+vec3 keyDir(vec3 p){ return SUN; }
+vec3 rimDir(vec3 p){ return SUN; }
+vec3 envCol(vec3 rd){
+  // sky above the courtyard, white walls and paving towards the horizon, the sun
+  float h = rd.y;
+  vec3 c = h > 0. ? mix(vec3(.82, .86, .9), vec3(.36, .52, .82), smoothstep(.05, .75, h))*1.5 : mix(vec3(.30, .30, .29), vec3(.62, .62, .6), smoothstep(-.35, 0., h));
+  c += LIGHT_COL*vec3(1., .95, .85)*(80.*smoothstep(.99955, .9999, dot(rd, SUN)) + 1.2*pow(max(dot(rd, SUN), 0.), 60.));
+  return c;
+}
+`;
+const FS_CLOTH = HD + `
+in vec2 vUV; in vec3 vPos; in vec3 vN; in float vPl; in float vOpen;
+out vec4 o;
+uniform float uMirror, uOpen, uDipped;
+${CD.GLSL}
+${CLOTH_GLSL}
+${LIGHT_GLSL}
+void main(){
+  if (uMirror > .5 && vPos.y < 0.) discard;
+  if (uMirror < .5 && uOpen < .5 && vPos.y < -.2 && uT > .5 && uT < 2.7) discard;     // under the liquor
+  vec3 n = normalize(vN);
+  vec3 V = normalize(uCamP - vPos);
+  if (uMirror > .5) V = normalize(vec3(uCamP.x, -uCamP.y, uCamP.z) - vPos);
+  bool back = dot(n, V) < 0.;
+  if (back) n = -n;
+  vec3 alb = clothAlb(vUV, vPl, uDipped);
+  float wet = wetness()*uDipped*(1. - .7*vOpen);
+  // cotton weave: fine crossing threads
+  vec2 w = vUV*${S}.*5.2;
+  float weave = .5 + .5*sin(w.x*6.283)*sin(w.y*6.283);
+  alb *= .88 + .16*weave + .08*(vn(vUV*300.) - .5);
+  n = normalize(n + .18*vec3(cos(w.x*6.283)*sin(w.y*6.283), 0., sin(w.x*6.283)*cos(w.y*6.283)));
+  alb *= mix(1., .62, wet);
+  vec3 L = keyDir(vPos);
+  float ndl = dot(n, L);
+  // fold occlusion: valleys of the pleats are dark
+  float ao = mix(mix(.35, 1., smoothstep(-1.1, .8, vPl)), mix(.45, 1., smoothstep(-1.4, .6, vPl)), vOpen);
+  vec3 Lc = SUNC;
+  vec3 col = alb*Lc*max(ndl*.9 + .1, 0.)*ao;
+  col += alb*SKYC*(.55 + .45*n.y)*ao;                     // open sky
+  col += alb*LIGHT_COL*vec3(.95, .93, .88)*.9*pow(max(dot(n, normalize(vec3(.9, .2, .4))), 0.), 2.)*ao*vOpen;   // light bounced off the white wall opposite
+  col += alb*LIGHT_COL*vec3(.3, .29, .27)*.35*(.5 - .5*n.y)*ao;     // light bounced off the paving
+  // wet sheen
+  vec3 Hh = normalize(L + V);
+  float sp = pow(max(dot(n, Hh), 0.), mix(12., 50., wet))*mix(.02, .22, wet);
+  float fr = .04 + .96*pow(1. - max(dot(n, V), 0.), 5.);
+  col += Lc*sp*ao + envCol(reflect(-V, n))*fr*wet*.35;
+  if (vOpen > .01) {
+    // light from the back window comes through the cotton: warm white where resisted, a deep blue glow through the dye
+    float D = dyeD(vUV);
+    vec3 Lb = rimDir(vPos);
+    float through = max(-dot(n, Lb), 0.);
+    vec3 trans = mix(vec3(1., .93, .82), vec3(.02, .05, .17), D)*(1. - .82*D);
+    col += trans*SUNC*.55*through*(.7 + .3*weave)*vOpen;
+  }
+  float depth = dot(vPos - uCamP, uCamF);
+  o = vec4(col, uMirror > .5 ? 0. : cocOf(depth));
+}`;
+const VS_CORD = HD + `
+in vec3 p;
+uniform mat4 uVP; uniform float uMirror, uSwayX, uSwayZ;
+uniform vec3 uTip;
+out vec3 vPos; out vec3 vN; out vec2 vS;
+${CD.GLSL}
+${CLOTH_GLSL}
+vec3 C(float s, float a, int k){
+  float rk = uBind[k].x;
+  float rr = mix(.35, 3.2, smoothstep(0., .2, rk))*(1. + .08*sin(rk*7.)) + .9*smoothstep(1., 1.4, rk);
+  float R = rr*(1. - .38)*(1. + .1) + .15 + .05*sin(s*13.);
+  float age = uBind[k].z;                       // >0: released, springs open and falls
+  float turns = 7.;
+  float ang = s*turns*6.2832 + float(k)*1.9;
+  float y = uTip.y - rk*${LB}. + (s - .5)*2.1 + .08*sin(s*31. + float(k));
+  float ag = max(age, 0.);
+  R += ag*9.*(1. + .6*sin(s*5. + float(k)));
+  y += (s - .5)*ag*26.;                       // the coil unwinds into a loose loop of string
+  y -= ag*ag*620. - ag*30.;
+  ang += ag*3.*(s - .5);
+  vec3 c = vec3(R*cos(ang), y, R*sin(ang)) + vec3(.9*sin(rk*2.6 + .5), 0., .6*sin(rk*3.3));
+  R *= 1. + .13*sin(rk*13. + 1.3);
+  vec3 tg = normalize(vec3(-sin(ang), .27/R*.0 + 1.7/(turns*6.2832*R), cos(ang)));
+  vec3 nr = normalize(vec3(cos(ang), 0., sin(ang)));
+  vec3 bn = cross(tg, nr);
+  float tw = a*6.2832;
+  vec3 pos = c + (nr*cos(tw) + bn*sin(tw))*.15*(1. + .12*sin(s*90. + tw*3.));
+  float hang = uTip.y - y;
+  pos.x += uSwayX*hang; pos.z += uSwayZ*hang;
+  return pos + vec3(uTip.x, 0., uTip.z);
+}
+void main(){
+  int k = int(p.z + .5);
+  vec3 q = C(p.x, p.y, k);
+  vec3 qa = C(p.x, p.y + .01, k), qs = C(p.x + .002, p.y, k);
+  vN = normalize(cross(qs - q, qa - q));
+  vPos = q; vS = vec2(p.x*${CS}., p.y);
+  if (uBind[k].z > .45) q = vec3(0., -1e4, 0.);
+  if (uMirror > .5) q.y = -q.y;
+  gl_Position = uVP*vec4(q, 1.);
+}`;
+const FS_CORD = HD + `
+in vec3 vPos; in vec3 vN; in vec2 vS;
+out vec4 o;
+uniform float uMirror, uDipped;
+${CD.GLSL}
+${CLOTH_GLSL}
+${LIGHT_GLSL}
+void main(){
+  if (uMirror > .5 && vPos.y < 0.) discard;
+  if (uMirror < .5 && vPos.y < -.2 && uT > .5 && uT < 2.7) discard;
+  vec3 n = normalize(vN); vec3 V = normalize(uCamP - vPos);
+  if (dot(n, V) < 0.) n = -n;
+  float o2 = oxidation(vPos.xz*.05, 1.);
+  vec3 white = vec3(.8, .78, .72), leuco = vec3(.22, .27, .04), teal = vec3(.03, .12, .10), indigo = vec3(.015, .035, .11);
+  vec3 dyed = o2 < .5 ? mix(leuco, teal, o2*2.) : mix(teal, indigo, o2*2. - 1.);
+  vec3 alb = mix(white, dyed, uDipped*.7);
+  float tw = fract(vS.x*2.2 + vS.y*3.);        // twisted twine
+  alb *= (.7 + .4*smoothstep(0., .5, tw)*smoothstep(1., .5, tw))*(.8 + .35*vn(vS*vec2(3., 9.)));
+  alb *= mix(1., .55, wetness()*uDipped);
+  vec3 L = keyDir(vPos);
+  vec3 Lc = SUNC;
+  vec3 col = alb*Lc*max(dot(n, L)*.85 + .15, 0.) + alb*SKYC*(.55 + .45*n.y);
+  vec3 Hh = normalize(L + V);
+  col += Lc*pow(max(dot(n, Hh), 0.), 60.)*.4*wetness()*uDipped;
+  float depth = dot(vPos - uCamP, uCamF);
+  o = vec4(col, uMirror > .5 ? 0. : cocOf(depth));
+}`;
+// ---------------- ray-traced dye house: floor, vat, liquor, drips, twine ----------------
+const ND = 10;
+const FS_ENV = HD + `
+in vec2 uv; out vec4 o;
+${CD.GLSL}
+${CD.GLSL_DEPTH}
+${LIGHT_GLSL}
+uniform float uT, uOpen;
+uniform sampler2D uRefl;
+uniform vec4 uRip[8];        // ripple sources: (x, z, start time, amplitude)
+uniform vec4 uDrip[${ND}];    // falling drops: (x, y, z, radius)
+uniform vec3 uTip; uniform float uTwine, uPoleY;
+const float RV = 30.;         // vat inner radius
+const float GY = -68.;        // the courtyard paving (the vat's rim stands 73 cm above it)
+const float RACK = 164.;      // height of the drying poles
+float gCl; vec4 gClD;         // which background cloth was hit: index, centre x, top y, z
+float potR(float y){ float u = clamp((5. - y)/73., 0., 1.); return 32.6 + 7.5*pow(max(sin(3.1416*min(u*1.12, 1.)), 0.), .8) - 6.*smoothstep(.72, 1., u); }
+float clothD(vec3 p){
+  // two racks of drying cloth behind the vat, stirring in the wind
+  float best = 1e3;
+  for (int k = 0; k < 2; k++) {
+    float zr = -175. - float(k)*85.;
+    if (abs(p.z - zr) > 30.) { best = min(best, abs(p.z - zr) - 16.); continue; }
+    for (int i = 0; i < 8; i++) {
+      float fi = float(i) + float(k)*8.;
+      float w = 78. + 18.*hash11(fi*3.7), L = 160. + 60.*hash11(fi*5.1);
+      float xc = -380. + float(i)*98. + float(k)*46. + 10.*(hash11(fi*7.3) - .5);
+      float top = GY + RACK - 2.;
+      float dn = clamp((top - p.y)/L, 0., 1.);
+      float fl = (5. + 4.*hash11(fi))*sin(p.x*.045 + uT*(1.4 + .4*hash11(fi*2.)) + fi*1.7)*dn + 2.*sin(p.y*.05 + uT*2.1 + fi);
+      vec3 q = p - vec3(xc, top - L*.5, zr + fl);
+      float d = sdBox(q, vec3(w*.5, L*.5, 1.))*.5;
+      if (d < best) { best = d; gCl = fi; gClD = vec4(xc, top, w, L); }
+    }
+  }
+  return best;
+}
+float rippleH(vec2 q){
+  float h = 0.;
+  for (int i = 0; i < 8; i++) {
+    vec4 R = uRip[i]; float age = uT - R.z; if (age <= 0. || R.w == 0.) continue;
+    float r = length(q - R.xy); float front = age*28.;
+    float x = r - front;
+    h += R.w*sin(x*1.15)*exp(-x*x/(18. + age*30.))*exp(-age*1.1)*smoothstep(0., .1, age)/(1. + r*.05);
+  }
+  // slow swell of the liquor
+  h += .05*sin(q.x*.21 + uT*1.3) + .04*sin(q.y*.17 - uT*1.1);
+  return h;
+}
+float sdScene(vec3 p, out float id){
+  float r = length(p.xz);
+  // the blue-stone paving
+  float d = p.y - GY; id = 0.;
+  // the vat: a big glazed earthenware pot standing on the stones
+  float outer = max(max((r - potR(p.y))*.8, p.y - 5.), GY - p.y);
+  float inner = max(r - 30.6, -p.y - 60.);
+  float pot = max(outer, -inner);
+  if (pot < d) { d = pot; id = 1.; }
+  float rim = length(vec2(r - 31.8, p.y - 5.2)) - 1.9; if (rim < d) { d = rim; id = 1.; }
+  {
+    float pole = sdCapsule(p, vec3(-75., uPoleY, 0.), vec3(75., uPoleY, 0.), 1.6); if (pole < d) { d = pole; id = 5.; }
+  }
+  if (uTwine > .5) {
+    vec3 a = uTip, b = vec3(uTip.x*.3, uPoleY, uTip.z*.3);
+    float tw = sdCapsule(p, a, b, .16); if (tw < d) { d = tw; id = 3.; }
+  }
+  for (int i = 0; i < ${ND}; i++) {
+    vec4 D = uDrip[i]; if (D.w <= 0.) continue;
+    vec3 q = p - D.xyz; q.y *= .8;
+    float dd = length(q) - D.w; if (dd < d) { d = dd; id = 4.; }
+  }
+  if (p.z < -120.) {
+    // drying racks: bamboo poles on posts, cloths hanging from them
+    for (int k = 0; k < 2; k++) {
+      float zr = -175. - float(k)*85.;
+      float pl = sdCapsule(p, vec3(-500., GY + RACK, zr), vec3(500., GY + RACK, zr), 3.); if (pl < d) { d = pl; id = 6.; }
+      float px = mod(p.x + 190., 380.) - 190.;
+      float post = sdCapsule(vec3(px, p.y, p.z), vec3(0., GY, zr), vec3(0., GY + RACK + 6., zr), 4.); if (post < d) { d = post; id = 6.; }
+    }
+    float cl = clothD(p); if (cl < d) { d = cl; id = 7.; }
+    // the white wall with its grey-tiled roof, and a tree
+    float wall = max(p.z + 430., p.y - (GY + 240.)); if (wall < d) { d = wall; id = 8.; }
+    float tree = length((p - vec3(300., GY + 250., -395.))*vec3(1., 1.25, 1.)) - 110. + 30.*fbm(p.xy*.02);
+    if (tree < d) { d = tree*.7; id = 9.; }
+  } else d = min(d, max(p.z + 118., 1.));      // never step past the start of the background in one go
+  return d;
+}
+vec3 paving(vec2 q){
+  // rectangular blue-stone slabs in staggered rows, worn, with indigo stains near the vat
+  float row = floor(q.y/42.);
+  float off = mod(row, 2.)*31. + 13.*hash11(row);
+  vec2 cell = vec2(floor((q.x + off)/62.), row);
+  vec2 f = vec2(fract((q.x + off)/62.)*62., fract(q.y/42.)*42.);
+  float gap = 1. - smoothstep(.0, 1.6, min(min(f.x, 62. - f.x), min(f.y, 42. - f.y)));
+  vec3 a = mix(vec3(.22, .24, .26), vec3(.30, .31, .32), hash12(cell))*(.85 + .3*fbm(q*.05 + cell*3.))*(.92 + .1*vn(q*.9));
+  a = mix(a, vec3(.08, .1, .16), .55*smoothstep(.55, .8, fbm(q*.03 + 7.))*smoothstep(150., 50., length(q)));
+  a = mix(a, vec3(.05, .05, .055), gap*.8);
+  return a;
+}
+vec3 boards(vec2 q){
+  float pl = floor(q.x/16.);
+  float off = hash11(pl)*90.;
+  float seg = floor((q.y + off)/95.);
+  float g = fbm(vec2(q.x*.15 + pl*3.3, (q.y + off)*.02));
+  vec3 a = mix(vec3(.045, .032, .024), vec3(.085, .06, .042), .5 + .5*sin((q.y + off)*.04 + g*7. + q.x*.3));
+  a *= .8 + .4*hash11(pl*7. + seg);
+  a = mix(a, vec3(.015, .03, .065), .6*smoothstep(.45, .85, fbm(q*.025 + 4.)));     // indigo stains
+  float gap = smoothstep(.25, .0, abs(fract(q.x/16.) - .5)*16. - 7.75);
+  a *= 1. - .45*clamp(gap, 0., 1.);
+  return a;
+}
+void main(){
+  vec3 ro = uCamP, rd = camRay(gl_FragCoord.xy);
+  vec3 col; float t = 0., id = -1.; bool hit = false;
+  for (int i = 0; i < 140; i++) {
+    float d = sdScene(ro + rd*t, id);
+    if (d < .002*t) { hit = true; break; }
+    t += d*.9; if (t > 900.) break;
+  }
+  float tl = rd.y < 0. ? (0. - ro.y)/rd.y : 1e9;
+  vec3 pl = ro + rd*tl;
+  bool liq = tl > 0. && length(pl.xz) < RV && (!hit || tl < t);
+  float depth;
+  vec3 Lc = SUNC;
+  if (liq) {
+    depth = tl;
+    vec2 q = pl.xz; float e = .2;
+    float h0 = rippleH(q), hx = rippleH(q + vec2(e, 0.)), hz = rippleH(q + vec2(0., e));
+    vec3 n = normalize(vec3(-(hx - h0)/e, 1., -(hz - h0)/e));
+    // indigo flower: a clot of coppery foam off to one side
+    vec2 fq = q - vec2(-13., 9.) - vec2(sin(uT*.7), cos(uT*.6))*.6 - (uT > .9 ? vec2(1.5, -1.)*smoothstep(.9, 2., uT) : vec2(0.));
+    float fr = length(fq*vec2(1., 1.25));
+    float fm = smoothstep(11.5, 6., fr + 3.5*(fbm(fq*.22) - .5));
+    // bubbles: nearest cell centre → a domed cap with its own normal
+    vec2 bc = fq*1.35; vec2 bi = floor(bc), bf = fract(bc); float bd = 9.; vec2 bv = vec2(0.); float brad = .5;
+    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) { vec2 g = vec2(x, y); vec2 o2 = hash22(bi + g)*.8 + .1; vec2 dv = g + o2 - bf; float rr0 = .35 + .3*hash12(bi + g + 7.);
+      float dd = length(dv)/rr0; if (dd < bd) { bd = dd; bv = dv; brad = rr0; } }
+    vec2 wb = worley(fq*1.3); vec2 wb2 = worley(fq*3.1 + 5.);
+    float bub = (1. - smoothstep(.0, .25, wb.y - wb.x))*fm;
+    float bub2 = (1. - smoothstep(.0, .2, wb2.y - wb2.x))*smoothstep(13., 6., fr);
+    vec3 V = -rd;
+    vec3 rr = reflect(rd, n);
+    float fres = .03 + .97*pow(1. - max(dot(n, V), 0.), 5.);
+    // planar reflection of the cloth, wobbled by the ripples
+    vec2 suv = gl_FragCoord.xy/uRes + n.xz*vec2(.06, -.06);
+    vec4 rf = texture(uRefl, suv);
+    // what the liquor really reflects at this grazing angle: the courtyard (walls, racks of blue cloth) and a dimmed sky,
+    // never a white sheet; ripples and slow swell break it up
+    vec3 env = mix(vec3(.10, .12, .16), vec3(.34, .42, .56), smoothstep(.0, .6, rr.y))*(.75 + .5*fbm(rr.xz*6. + q*.05));
+    env = mix(env, vec3(.05, .08, .2), .45*smoothstep(.15, .0, abs(rr.y - .12))*(.5 + .5*sin(rr.x*40.)));   // the hanging cloths
+    env = mix(env, rf.rgb, rf.a*(1. - uOpen));
+    // blue-black liquor; drifting patches of coppery metallic scum
+    float th = fbm(q*.05 + vec2(uT*.04, -uT*.03) + 1.5*vec2(h0));
+    float scum = smoothstep(.52, .72, th)*(.6 + .4*fbm(q*.4));
+    vec3 base = vec3(.004, .008, .02);
+    vec3 tint = mix(vec3(.75, .82, 1.), vec3(1., .6, .4), scum);
+    col = base + env*mix(fres, .25, scum*.6)*tint;
+    col += vec3(.06, .03, .02)*Lc*.02*scum;
+    // foam: domed bubbles with thin-film colour and a dark violet body
+    if (fm > .02 && bd < 1.) {
+      vec3 bn3 = normalize(vec3(-bv.x/brad, sqrt(max(1. - bd*bd, 0.))*1.2, -bv.y/brad));
+      vec3 V2 = -rd; vec3 Lk = keyDir(pl);
+      float fr2 = .05 + .95*pow(1. - max(dot(bn3, V2), 0.), 4.);
+      // copper-violet metallic sheen (no rainbow): bronze on the caps, violet-indigo in the bodies
+      vec3 metal = mix(vec3(.95, .58, .38), vec3(.55, .35, .65), smoothstep(.2, .9, bd));
+      vec3 bc3 = vec3(.008, .006, .022)*(1. + fbm(fq*2.)) + min(envCol(reflect(rd, bn3)), vec3(1.2))*fr2*metal*.5;
+      bc3 += Lc*.25*pow(max(dot(reflect(rd, bn3), Lk), 0.), 45.)*vec3(1., .72, .5);
+      bc3 += Lc*.25*pow(max(dot(reflect(rd, bn3), rimDir(pl)), 0.), 30.)*vec3(1., .7, .55);
+      float gap = smoothstep(.9, 1., bd);
+      col = mix(col, mix(bc3, vec3(.004, .004, .01), gap*.7), fm);
+    }
+    if (false) {
+      vec3 foam = vec3(.012, .008, .025) + vec3(.09, .05, .03)*fbm(fq*.8);
+      float cell = 1. - wb.x*1.6;
+      vec3 bn = normalize(n + vec3(fq.x, 0., fq.y)*0. + vec3(hash22(floor(fq*1.3)) - .5, 0.).xzy*0. );
+      vec3 irid = .5 + .5*cos(6.2831*(wb.x*2.2 + th + vec3(.0, .3, .6)));
+      float rimB = smoothstep(.02, .0, wb.y - wb.x - .05) + smoothstep(.55, .9, wb.x);
+      vec3 fcol = foam + irid*vec3(.5, .3, .2)*.35*rimB + Lc*.12*pow(max(cell, 0.), 10.);
+      col = mix(col, fcol, clamp(fm*(1. - bub*.6) + bub2*.15, 0., 1.)*.9);
+      col += Lc*.35*bub*pow(max(dot(reflect(rd, normalize(n + vec3(0., 0., 0.))), keyDir(pl)), 0.), 30.);
+    }
+  } else if (hit) {
+    vec3 p = ro + rd*t; depth = t;
+    float dd; vec2 e = vec2(.01, 0.);
+    vec3 n = normalize(vec3(sdScene(p + e.xyy, dd) - sdScene(p - e.xyy, dd), sdScene(p + e.yxy, dd) - sdScene(p - e.yxy, dd), sdScene(p + e.yyx, dd) - sdScene(p - e.yyx, dd)) + vec3(0., 1e-6, 0.));
+    sdScene(p, id);
+    vec3 V = -rd, L = keyDir(p);
+    vec3 alb; float spec = .0, rough = .5;
+    float through = 0.; vec3 transC = vec3(0.);
+    if (id == 0.) { alb = paving(p.xz); spec = .08; rough = .45; }
+    else if (id == 1.) {
+      // brown-black glaze with runs; a band of rope-pattern stamped round the shoulder
+      alb = vec3(.04, .03, .024)*(.85 + .3*fbm(vec2(atan(p.z, p.x)*4., p.y*.02)))*(.92 + .16*step(.96, hash12(floor(p.xz*3.))));
+      alb = mix(alb, vec3(.03, .05, .1), .5*smoothstep(-2., 5., p.y)*smoothstep(.4, .7, fbm(p.xz*.3)));   // indigo crust at the lip
+      spec = .7; rough = .12;
+    }
+    else if (id == 6.) { alb = vec3(.36, .3, .18)*(.8 + .25*vn(vec2(p.x*.2, p.y*.2))); spec = .2; rough = .3; }
+    else if (id == 7.) {
+      // indigo cloths: solid shades and tie-dye patterns, lit from behind by the sun
+      vec2 cu = vec2((p.x - gClD.x)/gClD.z + .5, (gClD.y - p.y)/gClD.w);
+      float hq = hash11(gCl*9.1);
+      float ty = hq < .45 ? 0. : hq < .7 ? 1. : hq < .8 ? 2. : hq < .9 ? 4. : 5.;     // mostly plain indigo; no rings behind (they would echo the hero cloth)
+      if (abs(gClD.x) < 160.) ty = min(ty, 1.);                                        // keep the patterns away from the subject
+      float D = .9;
+      if (ty == 3.) { vec2 c = (cu - vec2(.5, .45))*vec2(gClD.z, gClD.w); float rr = length(c); D = 1. - smoothstep(.5, .0, abs(fract(rr/14.) - .5)*14. - 4.)*.9; }
+      else if (ty == 4.) { vec2 g = fract(cu*vec2(4., 9.)); D = 1. - .6*smoothstep(.2, .05, min(min(g.x, 1. - g.x), min(g.y, 1. - g.y))); }
+      else if (ty == 5.) { vec2 g = fract(cu*vec2(7., 15.)) - .5; D = 1. - .6*smoothstep(.22, .12, length(g)); }
+      float sh = ty == 0. ? 1. : ty == 1. ? .7 : ty == 2. ? .42 : .95;
+      vec3 ind = mix(vec3(.6, .66, .72), vec3(.01, .025, .085), sh);
+      alb = mix(vec3(.78, .77, .72), ind, D);
+      through = 1.; transC = mix(vec3(1., .95, .85), mix(vec3(.05, .16, .55), vec3(.3, .5, .8), 1. - sh), D)*mix(1., .45, D*sh);
+      spec = .02;
+    }
+    else if (id == 8.) {
+      float hy = p.y - GY;
+      if (hy < 192.) {
+        alb = vec3(.8, .79, .74)*(.9 + .12*fbm(p.xy*.02));
+        alb = mix(alb, vec3(.42, .42, .4), smoothstep(42., 38., hy));                         // stone footing
+        alb = mix(alb, vec3(.55, .6, .66), smoothstep(190., 178., hy)*smoothstep(168., 178., hy)*.8);   // painted band under the eaves
+      } else {
+        alb = vec3(.1, .11, .12)*(.75 + .5*smoothstep(.2, .8, abs(fract(p.x/9.) - .5)*2.));     // rows of grey tiles
+      }
+      spec = .02;
+    }
+    else if (id == 9.) { alb = vec3(.06, .1, .04)*(.6 + .8*fbm(p.xy*.05)); spec = .0; }
+    else if (id == 5.) { float nd = smoothstep(.5, 0., abs(fract(p.x/34. + .3) - .5)*34.); alb = mix(vec3(.30, .22, .10), vec3(.15, .10, .045), nd)*(.8 + .25*vn(vec2(p.x*.5, atan(p.y - uPoleY, p.z)*3.))); alb = mix(alb, vec3(.02, .04, .09), .5*smoothstep(.5, .8, fbm(p.xy*.08))); spec = .35; rough = .25; }
+    else if (id == 3.) { alb = vec3(.45, .38, .28)*(.8 + .3*sin(dot(p, vec3(4., 9., 4.)))); spec = .05; }
+    else { alb = vec3(.004, .008, .02); spec = 1.; rough = .03; }
+    // sun: soft shadows (the vat on the paving, the tree on the wall, cloths on the ground)
+    float sh = 1.;
+    if (id == 0. || id == 1. || id == 8.) {
+      float tt = .8; float dd2;
+      for (int i = 0; i < 28; i++) { float h = sdScene(p + n*.3 + SUN*tt, dd2); sh = min(sh, 6.*h/tt); tt += clamp(h, 1., 40.); if (sh < .01 || tt > 700.) break; }
+      sh = clamp(sh, 0., 1.);
+    }
+    if (id == 8.) sh *= 1. - .55*smoothstep(.45, .62, fbm(p.xy*.011 + vec2(uT*.03, 0.)))*smoothstep(-200., 250., p.x);   // leaf shade
+    float ndl = max(dot(n, L), 0.);
+    col = alb*SUNC*ndl*sh + alb*SKYC*(.55 + .45*n.y) + alb*LIGHT_COL*vec3(.3, .29, .27)*.3*(.5 - .5*n.y);
+    if (through > .5) col += transC*SUNC*.55*max(-dot(n, L), 0.);
+    vec3 Hh = normalize(L + V);
+    float fres = .04 + .96*pow(1. - max(dot(n, V), 0.), 5.);
+    col += SUNC*pow(max(dot(n, Hh), 0.), 2./(rough*rough))*spec*.4*sh + min(envCol(reflect(rd, n)), vec3(2.5))*fres*spec*.6;   // no sun-disk hot pixels (the lens blur would spread them into white discs)
+    // a little haze on the far courtyard
+    col = mix(col, vec3(.62, .68, .76), 1. - exp(-max(t - 260., 0.)*.0006));
+  } else { col = envCol(rd); depth = 900.; }
+  gl_FragDepth = rayDepth(rd, depth);
+  if (any(isnan(col))) col = vec3(0.);
+  col = min(col, vec3(6.));
+  o = vec4(col, cocOf(depth*dot(rd, uCamF)));
+}`;
+const pEnv = SG.prog(gl, SG.VS_QUAD, FS_ENV);
+const pCloth = SG.prog(gl, VS_CLOTH, FS_CLOTH);
+const pCord = SG.prog(gl, VS_CORD, FS_CORD);
+const tRefl = SG.tex(gl, W, H, { ifmt: gl.RGBA16F, type: gl.HALF_FLOAT }), fRefl = SG.fbo(gl, [tRefl]);
+{ const rb = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, rb); gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, W, H);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fRefl.fb); gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rb); }
+
+// ---------------- motion ----------------
+// the bundle hangs 5 cm under the pole; the pole is lowered until it rests across the vat rim, then lifted
+const TIP = Track([
+  { t: 0.0, v: [50] }, { t: 0.5, v: [49] }, { t: 1.05, v: [3.6], stop: true }, { t: 2.0, v: [3.6] }, { t: 2.6, v: [47], stop: true }, { t: 10, v: [47] },
+], {});
+function sway(t) {
+  // pendulum: a nudge when lowered, a big swing when lifted, smaller ones when cords snap
+  let x = 0.0, z = 0.0;
+  const add = (t0, ax, az, w, dmp) => { if (t > t0) { const s = t - t0; x += ax * Math.sin(s * w) * Math.exp(-s * dmp); z += az * Math.sin(s * w * 0.9 + 0.7) * Math.exp(-s * dmp); } };
+  x += 0.012 * Math.sin(t * 1.9); z += 0.008 * Math.sin(t * 1.6 + 1);
+  add(2.45, 0.06, 0.03, 4.2, 0.9);
+  T_REL.forEach((tr, k) => add(tr, 0.02 * (k % 2 ? -1 : 1), 0.015, 5.5, 1.4));
+  return [x, z];
+}
+function bindState(t) {
+  const out = new Float32Array(20);
+  RHO.forEach((r, k) => {
+    const age = t - T_REL[k];
+    let sq = 1;
+    if (age > 0) sq = Math.max(0, Math.exp(-age * 9) * Math.cos(age * 22));     // the waist springs back with a wobble
+    out.set([r, sq, age > 0 ? age : -1, 0], k * 4);
+  });
+  return out;
+}
+// ripple sources: entry (0.75–1.05), exit (2.0–2.4), drips
+const RIP0 = [[0, 0, 0.78, 1.4], [0, 0, 1.0, 1.0], [0, 0, 2.05, 1.1], [0, 0, 2.35, 0.7]];
+const DRIPS = [];
+{ const R = Reel.rng(4848); let tt = 2.7; for (let i = 0; i < 9; i++) { const a = R() * 6.283, r = 1 + R() * 3; DRIPS.push([tt, Math.cos(a) * r, Math.sin(a) * r, 0.28 + R() * 0.12]); tt += 0.2 + R() * 0.15; } }   // dripping stops before the cords come off
+function dripState(t, tipY) {
+  const D = new Float32Array(ND * 4), Rp = new Float32Array(32);
+  RIP0.forEach((r, i) => Rp.set(r, i * 4));
+  let nd = 0, nr = 4;
+  const y0 = tipY - 1.25 * LB;     // the dripping tails at the bottom of the bundle
+  for (const [t0, x, z, rad] of DRIPS) {
+    if (t < t0) continue;
+    const s = t - t0, y = y0 - 0.5 * 980 * s * s;
+    const tHit = Math.sqrt(2 * y0 / 980);
+    if (y > 0 && nd < ND) { D.set([x, y, z, rad], nd * 4); nd++; }
+    if (s > tHit && nr < 8) { Rp.set([x, z, t0 + tHit, 0.22], nr * 4); nr++; }
+  }
+  return { D, Rp };
+}
+// camera: one continuous move, pulling back as the cloth opens
+const CAMB = Track([
+  { t: 0.0, v: [21, 56, 60, 0, 32, 0] },
+  { t: 1.0, v: [26, 50, 70, 0, 12, 0] },
+  { t: 2.2, v: [26, 46, 64, 0, 26, 0] },
+  { t: 3.5, v: [17, 42, 44, 0, 32, 0] },
+  { t: 4.6, v: [9, 37, 25, 0, 31, 0] },
+  { t: 6.0, v: [16, 42, 46, 0, 31, 0] },
+  { t: 7.3, v: [18, 42, 60, 0, 33, 0] },
+  { t: 8.15, v: [4, 37, 112, 0, 32, 0] },
+  { t: 10, v: [4, 37, 112, 0, 32, 0] },          // locked from 8.15
+], {});
+function camAt(t) { const v = CAMB(t); return CD.cam([v[0], v[1], v[2]], [v[3], v[4], v[5]], 32, 0, [0, 1, 0]); }
+
+Reel.scene({
+  duration: 10, fps: 30,
+  async setup() {},
+  cues: [
+    { t: 0.0, sfx: 'courtyard', gain: 0.4 },
+    { t: 0.78, sfx: 'plunge', gain: 0.85 }, { t: 1.0, sfx: 'glug', gain: 0.5 },
+    { t: 2.0, sfx: 'lift_water', gain: 0.8 },
+    { t: 2.7, sfx: 'drip', gain: 0.35 }, { t: 3.0, sfx: 'drip', gain: 0.3 }, { t: 3.4, sfx: 'drip', gain: 0.3 },
+    { t: 4.0, sfx: 'air_bloom1', gain: 0.55 }, { t: 4.5, sfx: 'air_bloom2', gain: 0.6 }, { t: 5.0, sfx: 'air_bloom3', gain: 0.65 },
+    { t: 6.0, sfx: 'cord_snap', gain: 0.6 }, { t: 6.5, sfx: 'cord_snap', gain: 0.6 }, { t: 7.0, sfx: 'cord_snap', gain: 0.6 }, { t: 7.5, sfx: 'cord_snap', gain: 0.7 },
+    { t: 7.5, sfx: 'whoosh', gain: 0.45 },
+    { t: 8.0, sfx: 'cloth_flap', gain: 0.9 },
+  ],
+  render(t) {
+    const frame = FRAME(t);
+    const open = t >= T_OPEN ? 1 : 0;
+    const cam = camAt(t);
+    const VP = CD.viewProj(cam, 1, 1500);
+    const tipY = TIP(t)[0];
+    const [sx, sz] = sway(t);
+    const tip = [0, tipY, 0];
+    const bind = bindState(t);
+    const dipped = t > 0.95 ? 1 : 0;
+    const { D, Rp } = dripState(t, tipY);
+    const poleY = tipY + 5;
+    const ou = clamp((t - T_OPEN) / 0.55);
+    const focusP = [0, lerp(tipY - 14, poleY - 20, ou), lerp(0, 2, ou)];
+    const focus = CD.depthOf(cam, focusP);
+    const aper = lerp(lerp(42, 46, clamp((t - 3.2) / 1.2)), 34, ou);
+    const loose = clamp((t - 7.4) / 0.25);
+    const setCloth = (P, mirror) => {
+      P.f('uT', t).f('uOxi0', 0).arr4('uBind', bind).f('uMirror', mirror).f('uOpen', open).f('uWave', open ? 1 : 0).f('uLoose', loose).f('uPoleY', poleY)
+        .f('uSwayX', sx).f('uSwayZ', sz).f('uTip', ...tip).f('uDipped', dipped);
+      gl.uniformMatrix4fv(P.loc('uVP'), false, VP);
+      CD.camU(P, cam, focus, aper);
+    };
+    gl.disable(gl.CULL_FACE);
+    // 1. planar reflection of the bundle in the liquor
+    SG.bind(gl, fRefl); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    if (t < T_OPEN) {          // once the cloth is up on the pole, it is out of the mirror's view from this low camera
+      gl.enable(gl.DEPTH_TEST);
+      let P = pCloth.use(); setCloth(P, 1); cloth.draw();
+      if (t < 7.5) { P = pCord.use(); setCloth(P, 1); cords.draw(); }
+      gl.disable(gl.DEPTH_TEST);
+    }
+    // 2. the dye house (writes depth), 3. cloth + cords on top
+    POST.begin(); gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL);
+    const PE = pEnv.use();
+    CD.camU(PE, cam, focus, aper);
+    // the courtyard settles too: the wind drops after 8.2
+    PE.f('uNear', 1).f('uFar', 1500).f('uT', t < 8.2 ? t : 8.2 + (t - 8.2) * 0.06).f('uOpen', open).t('uRefl', tRefl).arr4('uRip', Rp).arr4('uDrip', D)
+      .f('uTip', ...tip).f('uTwine', t < T_OPEN + 0.3 ? 1 : 0).f('uPoleY', poleY);
+    QUAD.draw();
+    let P = pCloth.use(); setCloth(P, 0); cloth.draw();
+    if (t < 7.5) { P = pCord.use(); setCloth(P, 0); cords.draw(); }     // the last cords come away as the cloth is shaken out
+    gl.disable(gl.DEPTH_TEST);
+    POST.finish({ exposure: 0.85, vignette: 0.32, grain: 0.025, ca: 0.3, seed: frame % 97, bloom: 0.12, bloomThresh: 1.6,
+      tint: [1.0, 0.995, 0.98], sat: 1.02, contrast: 1.04, dof: 40 });
+  },
+});
+</script></body></html>

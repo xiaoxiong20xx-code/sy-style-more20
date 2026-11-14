@@ -1,0 +1,491 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>50 刮画 · Scratchboard</title>
+<script src="../../lib/core.js"></script>
+<script src="../../lib/strokegl.js"></script>
+<script src="../../lib/track.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 50 刮画 · RAINBOW SCRATCHBOARD PEACOCK, ENGRAVED =====
+   A sheet of rainbow scratch paper under a low desk lamp from the left: matte black wax coating over a printed layer of
+   fixed colour bands (red, orange, yellow, green, teal, blue, violet, magenta, laid diagonally across the sheet). What
+   colour a cut shows depends only on WHERE on the sheet it is — a long line crossing two bands changes colour where
+   the bands meet. A bamboo stylus cuts the coating: the cut edges are chipped along the paper fibres, light strokes
+   leave specks of black in the groove, the paper tooth shows through, the colour layer has a soft satin sheen, and
+   black wax crumbs pile up beside the lines and at the end of every stroke.
+   The peacock is engraved like a copperplate: scale-feathers in rows up the neck, contour hatching swelling and thinning
+   round the breast, coverts and primaries on the wing; the train is 44 feathers, each a shaft with barbs and an
+   eye-spot of fringe, rings and a dark heart.
+   0.0 the stylus is already cutting the neck · head, crest, breast, legs on the beats · 2.0–3.75 neck feathers, breast
+   hatching, wing · 4.0 / 4.25 / 4.5 / 4.75 four fans of train feathers burst out, barbs racing along each shaft ·
+   5.0–6.4 eye-spots ring in · 6.4–7.4 fringes · 8.0 a breath blows the crumbs off the sheet · hold. */
+const { E, clamp, lerp } = Reel;
+const stage = Reel.makeStage('#0c0b0a');
+const RS = Reel.RS, W = Math.round(1920 * RS), H = Math.round(1080 * RS);
+Reel.ownJitter = true;
+const R = Reel.rng(5050), rr = (a, b) => a + (b - a) * R();
+const PAPER = { x0: 70, y0: 40, x1: 1850, y1: 1040 };
+
+// ================= strokes =================
+const ST = new SG.Strokes(), FL = new SG.Strokes();
+const SEGS = [];               // [t0, t1, pts] for the stylus
+const FLAKES = [];             // [birth, x, y, ang, len, w, seed]
+let sid = 1, nFlake = 0;
+const taper = (a = 0.35, seed = 0) => (u) => (a + (1 - a) * Math.pow(Math.sin(Math.PI * clamp(u * 0.96 + 0.02)), 0.55)) * (1 + 0.1 * Math.sin(u * 11 + seed));
+function cut(pts, t0, t1, w, o = {}) {
+  w *= 1.5;                                  // engraving lines, but readable at full frame
+  if (o.tool) SEGS.push([t0, t1, pts]);
+  const seed = (sid++ * 7.31) % 97;
+  const press = o.press ?? rr(0.75, 1);
+  const L = ST.add(pts, { w, t0, t1, kind: 0, seed, p1: press, ds: 1.6, pad: 0.7, lin: !!o.lin, wf: o.wf || taper(o.tp ?? 0.35, seed) });
+  // crumbs thrown beside heavier cuts, a curl pushed ahead at the end
+  if (w >= 1.5 && nFlake < 3200) {
+    const S = SG.crSample(pts.length > 1 ? pts : [pts[0], [pts[0][0] + 1, pts[0][1]]], 3);
+    let acc = 0; const every = o.flakeEvery ?? (w > 2.4 ? 11 : 17);
+    for (let i = 1; i < S.length; i++) {
+      const dx = S[i][0] - S[i - 1][0], dy = S[i][1] - S[i - 1][1], l = Math.hypot(dx, dy) || 1; acc += l;
+      if (acc < every) continue; acc = 0;
+      const u = i / (S.length - 1), nx = -dy / l, ny = dx / l, side = R() < 0.5 ? -1 : 1, off = w * 0.5 + rr(1, 6);
+      FLAKES.push([t0 + (t1 - t0) * u, S[i][0] + nx * off * side, S[i][1] + ny * off * side, rr(0, 6.28), rr(2, 6.5), rr(1.3, 3.2), R()]); nFlake++;
+    }
+    const e = S[S.length - 1], e0 = S[Math.max(0, S.length - 3)], ex = e[0] - e0[0], ey = e[1] - e0[1], el = Math.hypot(ex, ey) || 1;
+    for (let k = 0; k < (w > 2.4 ? 4 : 2); k++) { FLAKES.push([t1, e[0] + ex / el * rr(1.5, 6) + rr(-2, 2), e[1] + ey / el * rr(1.5, 6) + rr(-2, 2), rr(0, 6.28), rr(3, 8), rr(2, 4), R()]); nFlake++; }
+  } else if (R() < 0.08 && nFlake < 3200) {
+    const e = pts[pts.length - 1]; FLAKES.push([t1, e[0] + rr(-3, 3), e[1] + rr(-3, 3), rr(0, 6.28), rr(2, 5), rr(1.2, 2.4), R()]); nFlake++;
+  }
+  return L;
+}
+const ell = (cx, cy, rx, ry, a0 = 0, a1 = 6.2832, n = 28, rot = 0) => Array.from({ length: n + 1 }, (_, i) => {
+  const a = lerp(a0, a1, i / n), x = Math.cos(a) * rx, y = Math.sin(a) * ry;
+  return [cx + x * Math.cos(rot) - y * Math.sin(rot), cy + x * Math.sin(rot) + y * Math.cos(rot)];
+});
+const rot2 = (x, y, a) => [x * Math.cos(a) - y * Math.sin(a), x * Math.sin(a) + y * Math.cos(a)];
+
+// ---------- the peacock ----------
+const FAN = [1006, 680];
+const BODY = { cx: 968, cy: 698, rx: 80, ry: 96, rot: -0.28 };
+const NECK = [[930, 622], [936, 562], [902, 507], [866, 459], [850, 432]];
+const NS = SG.crSample(NECK, 2);
+const neckAt = (u) => NS[Math.min(NS.length - 1, Math.max(0, Math.round(u * (NS.length - 1))))];
+const neckDir = (u) => { const a = neckAt(Math.max(0, u - 0.02)), b = neckAt(Math.min(1, u + 0.02)); const dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy) || 1; return [dx / l, dy / l]; };
+const neckW = (u) => lerp(27, 13, u);
+const inBody = (x, y) => { const c = Math.cos(-BODY.rot), sn = Math.sin(-BODY.rot), dx = x - BODY.cx, dy = y - BODY.cy; const X = dx * c - dy * sn, Y = dx * sn + dy * c; return (X / BODY.rx) ** 2 + (Y / BODY.ry) ** 2; };
+const nearNeck = (x, y) => { let d = 1e9; for (let u = 0; u <= 1; u += 0.05) { const p = neckAt(u); d = Math.min(d, Math.hypot(x - p[0], y - p[1]) - neckW(u)); } return d; };
+(function bird() {
+  // 0.0–0.5: the front of the neck, one long cut
+  cut(NS.map(([x, y], i) => { const u = i / (NS.length - 1), d = neckDir(u); return [x + d[1] * neckW(u), y - d[0] * neckW(u)]; }), -0.12, 0.5, 3.9, { tool: true, tp: 0.5 });
+  // 0.5–1.0: head, eye, face stripes, beak, crest
+  cut(ell(838, 412, 19, 17, -0.7, 5.5, 26), 0.52, 0.64, 3.2, { tool: true });
+  cut(ell(831, 406, 5.2, 4.6, 0, 6.3, 14), 0.64, 0.68, 1.4, { tool: true });
+  for (let k = 0; k < 3; k++) cut([[852, 396 + k * 2.4], [838, 398 + k * 2.2], [823, 401 + k * 1.6]], 0.68 + k * 0.01, 0.69 + k * 0.01, 0.9);
+  for (let k = 0; k < 3; k++) cut([[852, 414 + k * 2.4], [838, 416 + k * 2.2], [824, 417 + k * 1.6]], 0.71 + k * 0.01, 0.72 + k * 0.01, 0.9);
+  cut([[820, 404], [803, 407], [789, 414]], 0.74, 0.77, 2, { tool: true }); cut([[820, 416], [805, 417], [791, 415]], 0.77, 0.8, 1.8);
+  cut([[816, 408], [800, 411]], 0.8, 0.81, 0.9);
+  for (let k = 0; k < 8; k++) {
+    const a = -2.35 + k * 0.12, L = 48 + 10 * Math.sin(k * 1.3), base = [840 + k * 1.2, 394];
+    const tip = [base[0] + Math.cos(a) * L, base[1] + Math.sin(a) * L];
+    const t0 = 0.82 + k * 0.022;
+    cut([base, [lerp(base[0], tip[0], 0.5) + 2, lerp(base[1], tip[1], 0.5)], tip], t0, t0 + 0.02, 1, { tool: k === 7 });
+    for (let j = -3; j <= 3; j++) { const b2 = a + j * 0.22; cut([tip, [tip[0] + Math.cos(b2) * 10, tip[1] + Math.sin(b2) * 10]], t0 + 0.02, t0 + 0.022, 0.9); }
+  }
+  // 1.0–1.5: back of the neck and the breast contour; the back line
+  cut(NS.map(([x, y], i) => { const u = i / (NS.length - 1), d = neckDir(u); return [x - d[1] * neckW(u), y + d[0] * neckW(u)]; }).reverse(), 1.0, 1.16, 3.7, { tool: true });
+  cut(ell(BODY.cx, BODY.cy, BODY.rx, BODY.ry, -2.4, 2.25, 40, BODY.rot), 1.17, 1.5, 4.1, { tool: true, tp: 0.5 });
+  // 1.5–2.0: legs with scales, toes and claws, a tuft of ground
+  [[944, 782], [990, 776]].forEach(([x, y], k) => {
+    const t0 = 1.52 + k * 0.12;
+    cut([[x - 4, y], [x - 6, y + 42], [x - 7, y + 84]], t0, t0 + 0.04, 2.6, { tool: true });
+    cut([[x + 4, y], [x + 3, y + 42], [x + 2, y + 84]], t0 + 0.04, t0 + 0.07, 2.6);
+    for (let j = 0; j < 9; j++) cut([[x - 5, y + 8 + j * 8.5], [x + 3, y + 11 + j * 8.5]], t0 + 0.07 + j * 0.002, t0 + 0.072 + j * 0.002, 0.9);
+    [[-26, 8], [-6, 13], [15, 9]].forEach(([dx, dy], j) => {
+      const s0 = [x - 2, y + 84], s1 = [x - 2 + dx, y + 84 + dy];
+      cut([s0, s1], t0 + 0.09 + j * 0.006, t0 + 0.094 + j * 0.006, 1.8);
+      cut([s1, [s1[0] + dx * 0.25, s1[1] + 5]], t0 + 0.095 + j * 0.006, t0 + 0.097 + j * 0.006, 1.2);
+    });
+  });
+  for (let k = 0; k < 46; k++) { const x = 740 + k * 11 + rr(-4, 4), h = rr(8, 26); cut([[x, 880], [x + rr(-5, 5), 880 - h * 0.5], [x + rr(-8, 8), 880 - h]], 1.82 + k * 0.004, 1.825 + k * 0.004, 1.1, { tp: 0.1 }); }
+  for (let k = 0; k < 7; k++) cut([[760 + k * 8, 888 + k * 3], [1220 - k * 12, 888 + k * 3]], 1.95 + k * 0.006, 1.955 + k * 0.006, 0.9);
+  // 2.0–3.0: neck feathers — rows of little cups, each with two fine lines inside, row by row up the neck
+  let t = 2.0;
+  for (let i = 0; i < 30; i++) {
+    const u = 0.03 + i * 0.032, c = neckAt(u), d = neckDir(u), w = neckW(u), n = [-d[1], d[0]];
+    const nf = w > 20 ? 4 : 3;
+    for (let j = 0; j < nf; j++) {
+      const v = -0.78 + 1.56 * (j + (i % 2) * 0.5) / (nf - 0.5);
+      if (Math.abs(v) > 0.9) continue;
+      const fc = [c[0] + n[0] * v * w, c[1] + n[1] * v * w], r = w * 0.36;
+      const up = Math.atan2(d[1], d[0]);   // towards the head
+      const cup = ell(fc[0], fc[1], r, r * 0.9, up + Math.PI * 0.55, up + Math.PI * 1.45, 9);
+      cut(cup, t, t + 0.012, 1.3);
+      for (const o2 of [-0.3, 0.3]) cut([[fc[0] + n[0] * o2 * r - d[0] * r * 0.6, fc[1] + n[1] * o2 * r - d[1] * r * 0.6], [fc[0] + n[0] * o2 * r + d[0] * r * 0.3, fc[1] + n[1] * o2 * r + d[1] * r * 0.3]], t + 0.012, t + 0.016, 0.9);
+    }
+    SEGS.push([t, t + 0.03, [c, [c[0] + n[0] * w, c[1] + n[1] * w]]]);
+    t += 0.0333;
+  }
+  // 3.0–3.5: the breast in contour hatching — lines swell on the lamp side and thin towards the back
+  t = 3.0;
+  for (let k = 0; k < 28; k++) {
+    const sc = 0.96 - k * 0.026, a0 = lerp(0.7, 1.6, k / 27), a1 = lerp(5.5, 4.3, k / 27);
+    cut(ell(BODY.cx - k * 1.6, BODY.cy + k * 1.1, BODY.rx * sc, BODY.ry * sc, a0, a1, 30, BODY.rot), t, t + 0.022, 1.6,
+      { tool: k % 3 === 0, wf: (u) => (0.25 + 0.75 * Math.pow(Math.sin(Math.PI * Math.min(1, u * 1.15)), 0.6)) * (1.15 - 0.6 * u) });
+    t += 0.0178;
+  }
+  for (let k = 0; k < 12; k++) {       // sparse cross-hatching in the shadow on the back of the body
+    const y0 = BODY.cy - 60 + k * 11, x0 = BODY.cx + 10 + k * 2;
+    cut([[x0, y0], [x0 + 48 - k * 2, y0 + 30]], 3.42 + k * 0.006, 3.425 + k * 0.006, 1.0, { tp: 0.1 });
+  }
+  // a few rows of cups continue from the neck onto the upper breast
+  for (let row = 0; row < 4; row++) for (let j = 0; j < 4 - (row > 1 ? 1 : 0); j++) {
+    const x = 912 + j * 17 + row * 6 + (row % 2) * 8, y = 614 + row * 15;
+    if (inBody(x, y) > 0.85) continue;
+    cut(ell(x, y, 7, 6, -2.4 + Math.PI * 0.55, -2.4 + Math.PI * 1.45, 8), 3.3 + row * 0.03 + j * 0.006, 3.31 + row * 0.03 + j * 0.006, 1.2);
+  }
+  // 3.5–3.8: wing — coverts (rounded feathers, barbed) and primaries
+  for (let row = 0; row < 3; row++) for (let j = 0; j < 4; j++) {
+    const x = 975 + j * 19 + row * 9, y = 628 + row * 22 + j * 10;
+    const t0 = 3.5 + (row * 4 + j) * 0.012;
+    cut(ell(x, y, 12, 10, 0.3 - 0.35, Math.PI - 0.3 - 0.35, 10), t0, t0 + 0.01, 1.4, { tool: j === 0 });
+    for (let b = 0; b < 4; b++) cut([[x - 7 + b * 4.5, y - 2], [x - 5 + b * 4.5, y + 7]], t0 + 0.01, t0 + 0.012, 0.85);
+  }
+  for (let k = 0; k < 6; k++) {
+    const a = 0.62 + k * 0.07, x0 = 1000 + k * 4, y0 = 690 + k * 6, L = 105 - k * 6;
+    const tip = [x0 + Math.cos(a) * L, y0 + Math.sin(a) * L];
+    const t0 = 3.66 + k * 0.016;
+    cut([[x0, y0], tip], t0, t0 + 0.012, 1.5, { tool: k === 5 });
+    for (let b = 1; b < 12; b++) { const f = b / 12, p = [lerp(x0, tip[0], f), lerp(y0, tip[1], f)]; cut([p, [p[0] + Math.cos(a + 0.6) * 9, p[1] + Math.sin(a + 0.6) * 9]], t0 + 0.012, t0 + 0.014, 0.85); }
+  }
+})();
+// ---------- the train: four fans of feathers (the hook), then eye-spots and fringes ----------
+const FEATH = [];
+(function train() {
+  const NF = 44;
+  for (let i = 0; i < NF; i++) {
+    const a = lerp(-3.04, -0.1, i / (NF - 1)) + rr(-0.012, 0.012);
+    const L = 480 + 100 * Math.sin(Math.PI * i / (NF - 1)) + rr(-22, 22);
+    const bend = 0.1 * Math.sign(a + 1.57) * (1 - Math.abs(a + 1.57) / 1.57) + rr(-0.03, 0.03);
+    let r0 = 40; while (r0 < 360 && (inBody(FAN[0] + Math.cos(a) * r0, FAN[1] + Math.sin(a) * r0) < 1.18 || nearNeck(FAN[0] + Math.cos(a) * r0, FAN[1] + Math.sin(a) * r0) < 8)) r0 += 3;
+    FEATH.push({ i, a, L, bend, r0: r0 + 6 });
+  }
+  const pt = (f, r) => { const u = (r - f.r0) / (f.L - f.r0), aa = f.a + f.bend * u * u; return [FAN[0] + Math.cos(aa) * r, FAN[1] + Math.sin(aa) * r, aa]; };
+  const fans = [[], [], [], []];
+  FEATH.forEach((f) => fans[f.i % 4].push(f));
+  fans.forEach((fan, k) => {
+    fan.sort((p, q) => Math.abs(p.i - NF / 2) - Math.abs(q.i - NF / 2));
+    fan.forEach((f, j) => {
+      const t0 = 4.0 + k * 0.25 + j * 0.014, dur = 0.08, rEnd = f.L - 62;
+      const sh = []; for (let s = 0; s <= 8; s++) { const p = pt(f, lerp(f.r0, rEnd, s / 8)); sh.push([p[0], p[1]]); }
+      cut(sh, t0, t0 + dur, 2.6, { tool: j === fan.length - 1, tp: 0.6 });
+      // barbs race out with the shaft, longer towards the eye
+      for (let r = f.r0 + 10; r < rEnd; r += 11) {
+        const u = (r - f.r0) / (rEnd - f.r0), p = pt(f, r), bl = lerp(7, 27, Math.pow(u, 0.8));
+        const tb = t0 + dur * u;
+        for (const sd of [-1, 1]) {
+          const ba = p[2] + sd * lerp(0.75, 0.42, u);
+          const q1 = [p[0] + Math.cos(ba) * bl * 0.55 + Math.cos(p[2]) * 2, p[1] + Math.sin(ba) * bl * 0.55 + Math.sin(p[2]) * 2];
+          const q2 = [p[0] + Math.cos(ba + sd * -0.12) * bl + Math.cos(p[2]) * 5, p[1] + Math.sin(ba + sd * -0.12) * bl + Math.sin(p[2]) * 5];
+          cut([[p[0], p[1]], q1, q2], tb, tb + 0.012, 0.95, { tp: 0.15 });
+        }
+      }
+      f.eye = pt(f, f.L - 34);
+    });
+  });
+  // eye-spots, swept across the fan (5.0–6.4): fringe ring, two bronze rings, the heart outline
+  FEATH.slice().sort((p, q) => p.i - q.i).forEach((f, k) => {
+    const [cx, cy, aa] = f.eye, t0 = 5.0 + (k / NF) * 1.35;
+    cut(ell(cx, cy, 26, 20, 0, 6.35, 34, aa), t0, t0 + 0.05, 2.4, { tool: k % 4 === 0 });
+    cut(ell(cx - Math.cos(aa) * 2, cy - Math.sin(aa) * 2, 21, 16, 0, 6.35, 30, aa), t0 + 0.04, t0 + 0.07, 1.15);
+    cut(ell(cx - Math.cos(aa) * 3, cy - Math.sin(aa) * 3, 17.5, 13.2, 0, 6.35, 28, aa), t0 + 0.06, t0 + 0.085, 1.05);
+    // heart: the dark centre is left black, only its edge is cut
+    const hx = cx - Math.cos(aa) * 5, hy = cy - Math.sin(aa) * 5;
+    cut(ell(hx, hy, 11, 8.5, 0, 6.35, 24, aa), t0 + 0.08, t0 + 0.1, 1.25);
+    cut([[hx + Math.cos(aa + 1.2) * 4, hy + Math.sin(aa + 1.2) * 4], [hx + Math.cos(aa + 0.6) * 6, hy + Math.sin(aa + 0.6) * 6]], t0 + 0.1, t0 + 0.103, 0.9);
+    f.t5 = t0;
+  });
+  // fringes round each eye (6.4–7.4): fine lashes radiating out past the outer ring
+  FEATH.slice().sort((p, q) => p.i - q.i).forEach((f, k) => {
+    const [cx, cy, aa] = f.eye, t0 = 6.4 + (k / NF) * 0.95;
+    for (let j = 0; j < 22; j++) {
+      const b = j / 22 * 6.2832, ex = Math.cos(b) * 27, ey = Math.sin(b) * 21;
+      const [ox, oy] = rot2(ex, ey, aa), [dx, dy] = rot2(Math.cos(b) * 10, Math.sin(b) * 9, aa);
+      cut([[cx + ox, cy + oy], [cx + ox + dx, cy + oy + dy]], t0 + j * 0.0015, t0 + j * 0.0015 + 0.004, 0.85, { tp: 0.1 });
+    }
+  });
+})();
+
+// ================= GL =================
+const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+cv.style.cssText = 'position:absolute;left:0;top:0;width:1920px;height:1080px'; stage.appendChild(cv);
+const gl = cv.getContext('webgl2', { preserveDrawingBuffer: true, antialias: false, alpha: false, premultipliedAlpha: false });
+gl.getExtension('EXT_color_buffer_float');
+const HD = '#version 300 es\nprecision highp float;\n';
+const MSC = 2.0;                                   // mask texels per design px
+const VQ = [PAPER.x0, PAPER.y0, PAPER.x1 - PAPER.x0, PAPER.y1 - PAPER.y0];
+const MW = Math.round(VQ[2] * MSC), MH = Math.round(VQ[3] * MSC);
+const pMask = SG.prog(gl, SG.VS_STROKE, HD + `
+in vec4 v0; flat in vec4 v1; flat in vec4 v2; flat in vec4 v3; flat in vec4 v4;
+uniform float T; out vec4 o;
+${SG.GLSL_NOISE}
+void main(){
+  float s = v0.z, v = v0.w, L = v1.x, w = v1.y, t0 = v1.z, t1 = v1.w;
+  float kind = v3.w, seed = v4.x, press = v4.y;
+  if (T < t0) discard;
+  vec2 P = v0.xy;                                    // paper position (design px)
+  if (kind < .5) {
+    float head = L*clamp((T - t0)/max(t1 - t0, 1e-3), 0., 1.);
+    float hw = max(w*.5, .45);
+    float ds = s < 0. ? -s : (s > head ? s - head : 0.);
+    // the coating chips along the paper fibres: rough edges fixed to the sheet, not to the stroke
+    float rag = .30*(vn(P*1.15) - .5) + .18*(vn(P*3.3 + 7.) - .5) + .12*(vn(vec2(P.x*6.1, P.y*.9)) - .5);
+    float r = length(vec2(ds/hw, v));
+    float cov = smoothstep(1. + rag, .8 + rag, r);
+    // a light stroke leaves specks of black in the groove
+    float speck = smoothstep(.62, .78, vn(P*2.4 + seed) + (1. - press)*.5 + .25*r);
+    cov *= 1. - speck*.85;
+    if (cov < .01) discard;
+    o = vec4(cov, 0., 0., cov);
+  } else {
+    float r = length(vec2((s - L*.5)/(L*.5 + .5), v*1.05));
+    float n = vn(vec2(s*.9, v*2. + seed*13.));
+    float cov = smoothstep(1., .72, r + .38*(n - .5));
+    if (cov < .01) discard;
+    o = vec4(0., cov, clamp(1. - r*r, 0., 1.)*cov, cov);
+  }
+}`);
+const pShade = SG.prog(gl, SG.VS_QUAD, HD + `
+in vec2 uv; out vec4 o;
+uniform sampler2D M; uniform vec2 res, jit; uniform vec3 cam; uniform float camRot; uniform vec4 VIEWQ; uniform float frame, T;
+uniform vec4 TL0; uniform vec4 TL1;     // stylus: back (x, y) → tip (x, y) · (lift, visible, -, -)
+${SG.GLSL_NOISE}
+vec3 lin(vec3 c){ return pow(c, vec3(2.2)); }
+const vec3 L = normalize(vec3(-.86, -.22, .46));      // desk lamp low from the left
+const vec3 LIGHT_COL = vec3(1.);                      // lamp colour knob: multiplies Lc (paper, cut walls, sheen, desk, stylus)
+vec4 mk(vec2 p){ return texture(M, vec2((p.x - VIEWQ.x)/VIEWQ.z, 1. - (p.y - VIEWQ.y)/VIEWQ.w)); }
+// the printed colour layer: fixed diagonal bands, slightly wavy, soft-edged where the inks meet
+vec3 bandCol(float i){
+  i = mod(i, 8.);
+  return i < 1. ? vec3(.80, .17, .17) : i < 2. ? vec3(.92, .47, .13) : i < 3. ? vec3(.93, .80, .22) : i < 4. ? vec3(.30, .64, .28)
+       : i < 5. ? vec3(.12, .56, .58) : i < 6. ? vec3(.17, .36, .74) : i < 7. ? vec3(.44, .25, .64) : vec3(.78, .24, .50);
+}
+vec3 rainbow(vec2 p){
+  float s = dot(p, normalize(vec2(.82, -.57)))/96. + .18*sin(p.x*.0042 + p.y*.003) + .06*(vn(p*.006) - .5);
+  float i = floor(s), f = fract(s);
+  vec3 c = mix(bandCol(i), bandCol(i + 1.), smoothstep(.93, 1., f));
+  c *= .95 + .07*vn(p*.05);
+  return lin(c)*1.22;
+}
+float tooth(vec2 p){ return vn(p*.55)*.5 + vn(p*1.4 + 3.)*.3 + vn(p*3.3)*.2; }
+float toolHit(vec2 p, out vec3 n, out vec3 alb){
+  if (TL1.y < .5) return 0.;
+  vec2 a = TL0.xy, b = TL0.zw, ab = b - a; float l = length(ab); vec2 t = ab/l, nn = vec2(-t.y, t.x);
+  float u = dot(p - a, t)/l, d = dot(p - a, nn);
+  float rad = 9.;
+  float tipL = 70./l;
+  float tu = clamp((u - (1. - tipL))/tipL, 0., 1.);
+  float rr = rad*(1. - .93*tu*tu*(3. - 2.*tu));
+  if (u < 0. || u > 1. || abs(d) > rr) return 0.;
+  n = normalize(vec3(nn*(d/rr)*.9, sqrt(max(1. - d*d/(rr*rr), 0.))));
+  if (tu > 0.) n = normalize(n + vec3(t*.5, 0.));
+  float node = smoothstep(.006, .0, abs(fract(u*3.1 + .2) - .5) - .49);
+  float g = vn(vec2(u*90., d*.6));
+  alb = lin(mix(vec3(.80, .64, .38), vec3(.62, .46, .24), g))*(1. - .45*node);
+  if (tu > .7) alb = lin(vec3(.45, .34, .2));
+  return 1.;
+}
+void main(){
+  vec2 fc = gl_FragCoord.xy + jit;
+  vec2 sc = vec2(fc.x, res.y - fc.y)/res*vec2(1920., 1080.);
+  vec2 q = (sc - vec2(960., 540.))/cam.z;
+  float cr = cos(camRot), sr = sin(camRot);
+  vec2 p = vec2(q.x*cr - q.y*sr, q.x*sr + q.y*cr) + cam.xy;
+  vec3 col; vec3 n = vec3(0., 0., 1.), alb;
+  bool onPaper = p.x > ${PAPER.x0}. && p.y > ${PAPER.y0}. && p.x < ${PAPER.x1}. && p.y < ${PAPER.y1}.;
+  vec3 Lc = LIGHT_COL*vec3(1., .9, .76)*2.3, Amb = vec3(.20, .22, .27)*.3;
+  float fall = 1.15 - .55*smoothstep(-200., 2300., p.x + p.y*.4);
+  if (onPaper) {
+    float e = 1./${MSC.toFixed(1)};
+    vec4 m = mk(p);
+    vec2 Ld = L.xy/length(L.xy);
+    vec4 mF = mk(p + Ld*1.4);
+    float gx = mk(p + vec2(e, 0.)).r - mk(p - vec2(e, 0.)).r, gy = mk(p + vec2(0., e)).r - mk(p - vec2(0., e)).r;
+    float th = tooth(p);
+    vec3 nT = normalize(vec3(-(tooth(p + vec2(.6, 0.)) - th)*.35, -(tooth(p + vec2(0., .6)) - th)*.35, 1.));
+    float cut = m.r;
+    // matte black wax coating
+    vec3 black = lin(vec3(.03, .028, .027))*(.85 + .3*vn(p*.05));
+    // scratched: the colour layer, with the paper tooth showing through (rougher, darker in the pits)
+    vec3 under = rainbow(p)*(.78 + .3*th)*(.9 + .12*vn(p*.9));
+    vec3 nG = normalize(vec3(-(tooth(p + vec2(.6, 0.)) - th)*.9, -(tooth(p + vec2(0., .6)) - th)*.9, 1.));
+    alb = mix(black, under, cut);
+    n = normalize(mix(nT, nG, cut));
+    // cut walls: the one facing the lamp catches a hairline of light, the far one shades the colour
+    float wall = clamp(length(vec2(gx, gy))*.9, 0., 1.);
+    vec3 wn = normalize(vec3(gx, gy, 0.) + 1e-4);
+    float litW = max(dot(-wn.xy, Ld), 0.);
+    float sh = 1. - .5*cut*(1. - mF.r);
+    float gloss = mix(.05, .32, cut);
+    // wax crumbs: black, curled, glinting on their tops
+    float fl = m.g;
+    vec4 mS = mk(p + L.xy/L.z*1.4);
+    sh *= 1. - .6*mS.g*(1. - fl);
+    if (fl > .02) {
+      float fx = mk(p + vec2(e, 0.)).b - mk(p - vec2(e, 0.)).b, fy = mk(p + vec2(0., e)).b - mk(p - vec2(0., e)).b;
+      vec3 fn = normalize(vec3(-fx*2.5, -fy*2.5, .6));
+      alb = mix(alb, lin(vec3(.04, .036, .034)), fl);
+      n = normalize(mix(n, fn, fl));
+      gloss = mix(gloss, .55, fl);
+    }
+    float ndl = max(dot(n, L), 0.);
+    col = alb*(Lc*fall*ndl*sh + Amb);
+    col += Lc*fall*lin(vec3(.8, .75, .7))*wall*litW*.22*(1. - cut*.6);
+    vec3 V = vec3(0., 0., 1.), Hh = normalize(L + V);
+    float spec = pow(max(dot(n, Hh), 0.), mix(14., 40., fl))*gloss;
+    col += Lc*fall*spec*sh*mix(vec3(1.), under*2.2 + .1, cut*.6);    // satin sheen on the colour, a glint on crumbs
+    col += Lc*fall*.02*pow(1. - abs(dot(n, normalize(vec3(.2, .1, 1.)))), 2.)*(1. - cut);   // waxy grazing sheen
+    float ed = min(min(p.x - ${PAPER.x0}., ${PAPER.x1}. - p.x), min(p.y - ${PAPER.y0}., ${PAPER.y1}. - p.y));
+    col *= mix(.6, 1., smoothstep(0., 4., ed));
+  } else {
+    // dark walnut desk
+    float g = fbm(vec2(p.x*.004, p.y*.05));
+    alb = lin(mix(vec3(.11, .07, .045), vec3(.17, .11, .07), .5 + .5*sin(p.y*.08 + g*9.)));
+    vec2 sp = p + L.xy/L.z*5.;
+    float inside = step(${PAPER.x0}., sp.x)*step(sp.x, ${PAPER.x1}.)*step(${PAPER.y0}., sp.y)*step(sp.y, ${PAPER.y1}.);
+    col = alb*(Lc*fall*L.z*(1. - .65*inside) + Amb);
+  }
+  // the stylus and its shadow
+  vec3 tn, ta;
+  float th2 = toolHit(p, tn, ta);
+  if (th2 > 0.) {
+    float ndl = max(dot(tn, L), 0.);
+    vec3 Hh = normalize(L + vec3(0., 0., 1.));
+    col = ta*(Lc*ndl + Amb*1.5) + Lc*pow(max(dot(tn, Hh), 0.), 40.)*.25;
+  } else if (TL1.y > .5) {
+    vec2 a = TL0.xy, b = TL0.zw;
+    float lift = TL1.x;
+    vec2 offA = -L.xy/L.z*(9.*1.3 + 260.*.35), offB = -L.xy/L.z*(9.*1.1 + lift*40.);
+    vec2 ab = b - a; float l = length(ab);
+    float u = clamp(dot(p - a - offA, ab)/(l*l), 0., 1.);
+    vec2 qq = a + ab*u + mix(offA, offB, u);
+    float d = length(p - qq);
+    float soft = 6. + (1. - u)*30.;
+    col *= mix(.5 + .3*(1. - u), 1., smoothstep(8., 8. + soft, d));
+  }
+  o = vec4(col, 1.);
+}`);
+const pComp = SG.prog(gl, SG.VS_QUAD, HD + `in vec2 uv; out vec4 o; uniform sampler2D S; uniform vec2 res; uniform float seed;
+${SG.GLSL_NOISE}
+vec3 aces(vec3 x){ return clamp((x*(2.51*x + .03))/(x*(2.43*x + .59) + .14), 0., 1.); }
+void main(){ vec2 d = uv - .5;
+  vec3 c; c.r = texture(S, uv - d*.0018).r; c.g = texture(S, uv).g; c.b = texture(S, uv + d*.0018).b;
+  c = aces(c*.95); c = pow(c, vec3(1./2.2));
+  c *= 1. - .34*smoothstep(.3, 1.1, length(d*vec2(1.3, 1.)));
+  c += (hash12(uv*res + seed*31.7) - .5)*.03; o = vec4(clamp(c, 0., 1.), 1.); }`);
+const tM = SG.tex(gl, MW, MH, {}), fM = SG.fbo(gl, [tM]);
+const tSC = SG.tex(gl, W, H, { ifmt: gl.RGBA16F, type: gl.HALF_FLOAT }), fSC = SG.fbo(gl, [tSC]);
+const QUAD = SG.quad(gl);
+ST.upload(gl);
+
+// crumbs: lie where they fell until the breath at 8.0, then blown off the sheet towards the upper right
+function buildFlakes(t) {
+  FL.reset();
+  for (const [b, x, y, ang, len, w, seed] of FLAKES) {
+    if (t < b) continue;
+    let X = x, Y = y, A = ang;
+    if (t > 8.0) {
+      const delay = Math.max(0, ((x - 200) * 0.6 + (1040 - y) * 0.4) / 2600) * 0.18 + seed * 0.04;
+      const s = Math.max(0, t - 8.0 - delay);
+      const v = 4500 + seed * 4000;     // all gone by ~8.6
+      X += s * s * v * 1.6 + s * 60; Y -= s * s * v * 0.55 + Math.sin(seed * 20 + s * 9) * s * 30;
+      A += s * (seed - 0.5) * 30;
+    }
+    if (X > PAPER.x1 + 40 || Y < PAPER.y0 - 40) continue;
+    const dx = Math.cos(A) * len * 0.5, dy = Math.sin(A) * len * 0.5;
+    FL.add([[X - dx, Y - dy], [X + dx, Y + dy]], { w, t0: -10, t1: -9.9, kind: 1, seed: seed * 50, ds: 2, pad: 0.3, lin: true });
+  }
+  FL.uploadDynamic(gl);
+}
+// the stylus follows the cuts it is drawn on; between cuts it hops (lifting); leaves before the breath
+SEGS.sort((p, q) => p[0] - q[0]);
+function toolAt(t) {
+  if (t > 7.5) return null;
+  const kp = (S, u) => { const x = clamp(u) * (S.length - 1), i = Math.min(S.length - 2, Math.floor(x)), f = x - i; return [lerp(S[i][0], S[i + 1][0], f), lerp(S[i][1], S[i + 1][1], f)]; };
+  const segs = SEGS;
+  if (t < segs[0][0]) return { x: segs[0][2][0][0], y: segs[0][2][0][1], lift: 0 };
+  for (let i = 0; i < segs.length; i++) {
+    const [a, b, pl] = segs[i], nx = segs[i + 1];
+    if (t >= a && t <= b) { const p = kp(pl, (t - a) / Math.max(b - a, 1e-3)); return { x: p[0], y: p[1], lift: 0 }; }
+    if (t > b && (!nx || t < nx[0])) {
+      const end = pl[pl.length - 1];
+      if (!nx) { const u = clamp((t - b) / 0.3); return { x: end[0] + u * 300, y: end[1] - u * 500, lift: u }; }
+      const s = nx[2][0], u = (t - b) / (nx[0] - b);
+      return { x: lerp(end[0], s[0], E.inOutSine(u)), y: lerp(end[1], s[1], E.inOutSine(u)), lift: Math.sin(Math.PI * u) * Math.min(1, (nx[0] - b) * 5) };
+    }
+  }
+  return null;
+}
+// the hand can't teleport: a speed-limited follower of the cut being made (precomputed at 240 Hz, deterministic).
+// Its top speed is about 38 screen px per frame at the current zoom; when it trails the cut it lifts off the paper.
+let _fol = null;
+const FOLLOW = (t) => (_fol || (_fol = buildFollow()))(t);
+function buildFollow() {
+  const dt = 1 / 240, n = Math.round(10 / dt) + 1, out = new Float32Array(n * 3);
+  let p = null;
+  for (let i = 0; i < n; i++) {
+    const t = i * dt, tg = toolAt(t) || { x: 1760, y: -260, lift: 1 };
+    if (!p) p = [tg.x, tg.y];
+    const vmax = 1150 / camAt(t)[2] * dt;
+    const dx = tg.x - p[0], dy = tg.y - p[1], d = Math.hypot(dx, dy);
+    if (d > vmax) { p[0] += dx / d * vmax; p[1] += dy / d * vmax; } else { p[0] = tg.x; p[1] = tg.y; }
+    out.set([p[0], p[1], Math.max(tg.lift, clamp((Math.hypot(tg.x - p[0], tg.y - p[1]) - 4) / 50))], i * 3);
+  }
+  return (t) => { const x = clamp(t / 10) * (n - 1), i = Math.min(n - 2, Math.floor(x)), f = x - i, a = i * 3, b = a + 3;
+    return { x: lerp(out[a], out[b], f), y: lerp(out[a + 1], out[b + 1], f), lift: lerp(out[a + 2], out[b + 2], f) }; };
+}
+function toolU(t) {
+  const tl = t > 8.3 ? null : FOLLOW(t);
+  if (!tl) return { a: [0, 0, 0, 0], b: [0, 0, 0, 0] };
+  const back = [tl.x + 150 + tl.lift * 20, tl.y - 300 - tl.lift * 30];
+  return { a: [back[0], back[1], tl.x, tl.y], b: [tl.lift, 1, 0, 0] };
+}
+// camera: close on the cut early, out wide for the burst, settle on the whole sheet
+const CAMK = Track([
+  { t: 0, v: [880, 520, 2.2, -0.04] },
+  { t: 1.0, v: [858, 470, 2.0, -0.03] },
+  { t: 2.0, v: [905, 600, 1.75, -0.02] },
+  { t: 3.6, v: [950, 640, 1.5, -0.01] },
+  { t: 4.6, v: [985, 470, 1.04, 0.0] },
+  { t: 6.5, v: [968, 515, 1.0, 0.004] },
+  { t: 8.2, v: [960, 520, 1.03, 0.0] },
+], {});
+function camAt(t) { const v = CAMK(t); return [v[0], v[1], v[2], v[3]]; }        // locked from 8.2
+
+Reel.scene({
+  duration: 10, fps: 30,
+  async setup() {},
+  cues: [
+    { t: 0.0, sfx: 'scratch_long', gain: 0.6 },
+    { t: 0.52, sfx: 'scratch_s', gain: 0.5 }, { t: 0.82, sfx: 'scratch_taps', gain: 0.5 },
+    { t: 1.0, sfx: 'scratch_long', gain: 0.55 }, { t: 1.17, sfx: 'scratch_long', gain: 0.5 }, { t: 1.52, sfx: 'scratch_taps', gain: 0.5 },
+    { t: 2.0, sfx: 'scratch_hatch', gain: 0.5 }, { t: 3.0, sfx: 'scratch_hatch', gain: 0.45 }, { t: 3.5, sfx: 'scratch_s', gain: 0.45 },
+    { t: 4.0, sfx: 'scratch_burst', gain: 0.7 }, { t: 4.25, sfx: 'scratch_burst', gain: 0.65 }, { t: 4.5, sfx: 'scratch_burst', gain: 0.7 }, { t: 4.75, sfx: 'scratch_burst', gain: 0.65 },
+    { t: 5.0, sfx: 'scratch_taps', gain: 0.45 }, { t: 5.5, sfx: 'scratch_taps', gain: 0.45 }, { t: 6.0, sfx: 'scratch_taps', gain: 0.4 }, { t: 6.5, sfx: 'scratch_hatch', gain: 0.4 },
+    { t: 8.0, sfx: 'breath', gain: 0.85 },
+  ],
+  render(t) {
+    const frame = Math.round(t * 30);
+    const jit = Reel.jit || [0, 0];
+    SG.bind(gl, fM); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.BLEND); gl.blendEquation(gl.MAX); gl.blendFunc(gl.ONE, gl.ONE);
+    pMask.use().f('T', t).f('PS', MW, MH).f('VIEW', VQ[0], VQ[1], MSC); ST.draw();
+    buildFlakes(t); pMask.use().f('T', t); FL.draw();
+    gl.blendEquation(gl.FUNC_ADD); gl.disable(gl.BLEND);
+    const cam = camAt(t);
+    const tu = toolU(t);
+    SG.bind(gl, fSC);
+    pShade.use().t('M', tM).f('res', W, H).f('jit', jit[0], -jit[1]).f('cam', cam[0], cam[1], cam[2]).f('camRot', cam[3])
+      .f('VIEWQ', VQ[0], VQ[1], VQ[2], VQ[3]).f('frame', frame).f('T', t).f('TL0', ...tu.a).f('TL1', ...tu.b);
+    QUAD.draw();
+    SG.bind(gl, null); gl.viewport(0, 0, W, H);
+    pComp.use().t('S', tSC).f('res', W, H).f('seed', frame % 41); QUAD.draw();
+    gl.finish();
+  },
+});
+</script></body></html>

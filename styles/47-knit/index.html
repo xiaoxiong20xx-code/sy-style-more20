@@ -1,0 +1,546 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>47 毛线编织 · Knitting</title>
+<script src="../../lib/core.js"></script>
+<script src="../../lib/strokegl.js"></script>
+<script src="../../lib/track.js"></script>
+<script src="../../lib/craftd.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 47 毛线编织 · FAIR-ISLE KNITTING ON BIRCH NEEDLES =====
+   A chunky wool swatch (cranberry, oatmeal, navy; stockinette) lying on an oak table, the needles working its top row.
+   Every stitch is two twisted 3-ply legs forming a V; the legs of each row tuck under the V-bottoms of the row above,
+   live loops wrap the needles, a fibre halo fuzzes every edge. Ray-marched height-field slab + analytic needles.
+   0.0 macro: the needle tip works one stitch per beat · 2.0 it speeds up, camera rises · 4.0–7.75 time-lapse, one row
+   per half-beat while the camera pulls back and the Selbu star knits itself up · 7.75 bind-off chain zips across ·
+   8.0 the last loop closes, needles leave, the swatch drops flat onto the table · hold. */
+const stage = Reel.makeStage('#2a2019');
+Reel.ownJitter = true;
+const { clamp, lerp, E } = Reel;
+const gl = CD.init(stage);
+const W = CD.W, H = CD.H;
+const NC = 41, NR = 29, RH = 0.8, X0 = -20;
+
+// ---------------- chart (row 0 = cast-on edge at the bottom) ----------------
+const RED = 0, CRM = 1, NAV = 2;
+const chart = Array.from({ length: NR }, () => new Array(NC).fill(RED));
+function star(cx, cy) {      // eight-point Selbu star, 17 x 17
+  for (let b = -8; b <= 8; b++) for (let a = -8; a <= 8; a++) {
+    const A = Math.abs(a), B = Math.abs(b);
+    const v = A >= 1 && A <= 4 && B >= A + 1 && B <= A + 4, h = B >= 1 && B <= 4 && A >= B + 1 && A <= B + 4;
+    const ctr = (A === 0 && B === 0) || (A + B === 1 && false);
+    if (v || h || ctr) chart[cy + b][cx + a] = CRM;
+  }
+}
+function flake(cx, cy) {     // 7 x 7 snow crystal
+  const P = ['#..#..#', '.#.#.#.', '..###..', '#######', '..###..', '.#.#.#.', '#..#..#'];
+  P.forEach((row, j) => [...row].forEach((ch, i) => { if (ch === '#') chart[cy + 3 - j][cx - 3 + i] = CRM; }));
+}
+function band(r0) {          // navy peerie band, 3 rows: small crosses
+  for (let c = 0; c < NC; c++) {
+    const m = (c + 2) % 4;
+    chart[r0][c] = m === 0 ? CRM : NAV; chart[r0 + 2][c] = m === 0 ? CRM : NAV; chart[r0 + 1][c] = m === 2 ? NAV : CRM;
+  }
+}
+band(2); band(24);
+star(20, 14); flake(5, 14); flake(35, 14);
+[[5, 8], [35, 8], [5, 20], [35, 20], [12, 23], [28, 23], [12, 5], [28, 5]].forEach(([c, r]) => { chart[r][c] = CRM; });
+
+// ---------------- knitting schedule: birth (completion) time of every stitch ----------------
+const ORDER = [];
+for (let r = 0; r < NR; r++) for (let i = 0; i < NC; i++) ORDER.push([r, r % 2 === 0 ? NC - 1 - i : i]);
+const BIRTH = new Float32Array(NC * NR);
+const K0 = 10 * NC + 14;                       // row 10, column 26 is the first stitch we see made
+const KH = 14 * NC;                            // row 14 starts the half-beat-per-row time-lapse at 4.0
+const RAMP_P = 324 / (KH - K0 - 4) - 1;        // rate ramp 2 → 164 st/s over 2.0–4.0 so that row 13 ends exactly on 4.0
+function Nramp(t) { const u = clamp((t - 2) / 2); return 2 * (t - 2) + 162 * 2 * Math.pow(u, RAMP_P + 1) / (RAMP_P + 1); }
+function invRamp(j) { let a = 2, b = 4; for (let k = 0; k < 50; k++) { const m = (a + b) / 2; if (Nramp(m) < j) a = m; else b = m; } return (a + b) / 2; }
+const TB = new Float64Array(ORDER.length);
+ORDER.forEach(([r, c], k) => {
+  let t;
+  if (k < K0) t = -1 - (K0 - k) * 0.001;
+  else if (k < K0 + 4) t = 0.5 * (k - K0 + 1);
+  else if (k < KH) t = invRamp(k - (K0 + 4) + 1);
+  else { const rr = Math.floor(k / NC), i = k % NC; t = 4.0 + (rr - 14) * 0.25 + (i + 1) / NC * 0.25; }
+  TB[k] = t; BIRTH[r * NC + c] = t;
+});
+const T_ROWS_DONE = 7.75, T_BIND = 8.0;
+// fractional knitting progress at time t: K = index of the next stitch + phase in [0,1)
+function progress(t) {
+  let lo = 0, hi = ORDER.length;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (TB[m] <= t) lo = m + 1; else hi = m; }
+  const k = lo;                                              // first stitch not yet complete
+  if (k >= ORDER.length) return { k, ph: 0 };
+  const tPrev = k > 0 ? TB[k - 1] : TB[k] - 0.5;
+  return { k, ph: clamp((t - tPrev) / Math.max(1e-4, TB[k] - tPrev)) };
+}
+const colX = (c) => c + X0, rowY = (r) => r * RH;
+
+const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+{
+  const D = new Float32Array(NC * NR * 4);
+  for (let r = 0; r < NR; r++) for (let c = 0; c < NC; c++) {
+    const i = (r * NC + c) * 4; D[i] = BIRTH[r * NC + c]; D[i + 1] = chart[r][c]; D[i + 2] = Reel.hash(r * 61.7 + c * 3.1) * 10; D[i + 3] = 0;
+  }
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, NC, NR, 0, gl.RGBA, gl.FLOAT, D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+}
+
+// ---------------- shaders ----------------
+const HD = '#version 300 es\nprecision highp float;\nprecision highp int;\n';
+const FS = HD + `
+out vec4 o;
+${CD.GLSL}
+uniform sampler2D uSt;
+uniform float uT, uFd, uRow, uBindX, uLiftA, uYTop;
+uniform vec4 uNL, uNR;          // needles: tip x, axis y, axis z, visible   (left needle extends to -x, right to +x)
+uniform vec3 uY0, uY1, uY2;     // working yarn path (two strands)
+uniform float uYarnOn, uYarnCol, uRingAll;
+uniform vec3 uL;                 // key light direction
+const float RH = ${RH.toFixed(2)};
+const float X0 = ${X0.toFixed(1)};
+const int NC = ${NC}, NR = ${NR};
+const float RN = .40;            // needle radius (8 mm needles for chunky wool)
+const vec3 LIGHT_COL = vec3(1.); // window key light colour knob: multiplies Lc (wool, needles, table, specular, fibre halo)
+vec4 st(int c, int r){ if (c < 0 || c >= NC || r < 0 || r >= NR) return vec4(1e5, 0., 0., 0.); return texelFetch(uSt, ivec2(c, r), 0); }
+bool vis(vec4 S){ return uT >= S.x - uFd; }
+float liftZ(vec2 p){
+  float u = smoothstep(uYTop - 12., uYTop + .4, p.y);
+  return uLiftA*u*u*1.9 + .30*smoothstep(1.2, -.5, p.y)*(1. - .4*smoothstep(15., 20.5, abs(p.x))) + .16*(fbm3(p.xy*.09 + 3.) - .5);
+}
+vec3 woolCol(float i){ return i < .5 ? vec3(.205, .016, .024) : i < 1.5 ? vec3(.62, .52, .37) : vec3(.016, .024, .058); }
+vec4 gInfo; vec3 gRingCol;
+
+// stitch legs height field. info = (along (world units), across (-1..1), colour, seed)
+float knitH(vec2 p, out vec4 info){
+  float best = -1.; info = vec4(0., 0., 0., 0.);
+  int c0 = int(floor(p.x - X0 + .5)); int r0 = int(floor(p.y/RH + .5));
+  bool any = false;
+  for (int dr = -1; dr <= 1; dr++) {
+    int r = r0 + dr;
+    for (int dc = -1; dc <= 1; dc++) {
+      int c = c0 + dc;
+      if (c < 0 || c >= NC) continue;
+      vec2 ctr = vec2(float(c) + X0, float(r)*RH);
+      vec2 jh = hash22(vec2(float(c)*1.37, float(r)*2.11)) - .5;
+      ctr += jh*vec2(.06, .05) + vec2(0., .045*sin(float(c)*.71 + float(r)*1.3));
+      if (r == NR) {                                      // bind-off chain lying along the top edge
+        if (ctr.x > uBindX) continue;
+        vec4 S = st(c, NR - 1);
+        for (int sd = 0; sd < 2; sd++) {
+          float sy = sd == 0 ? -1. : 1.;
+          vec2 A = ctr + vec2(-.52, .13*sy - .22), B = ctr + vec2(.46, .02*sy - .26);
+          vec2 ba = B - A; float L = length(ba); vec2 t = ba/L; vec2 n = vec2(-t.y, t.x)*sy;
+          vec2 q = p - A; float s = clamp(dot(q, t)/L, 0., 1.);
+          vec2 cp = A + ba*s + n*(.05*sin(PI*s)); vec2 dv = p - cp; float d = length(dv);
+          float w = .19*(.8 + .2*sin(PI*s)); if (d >= w) continue;
+          float h = .26 + .14*sin(PI*s) + .15*sqrt(1. - d*d/(w*w));
+          if (h > best) { best = h; info = vec4(s*L, dot(dv, n)/w, S.y, S.z + sy*.71 + 3.); }
+        }
+        continue;
+      }
+      if (r < 0 || r >= NR) continue;
+      vec4 S = st(c, r);
+      if (!vis(S)) continue;
+      any = any || (dr == 0 && dc == 0);
+      float f = clamp((uT - (S.x - uFd))/max(uFd, 1e-4), 0., 1.);
+      f = f*f*(3. - 2.*f);
+      bool live = (r == NR - 1 || !vis(st(c, r + 1))) && ctr.x > uBindX;
+      float ny = 0., zTop = .09;
+      if (live) {                        // which needle holds this column's loop
+        bool done = vis(st(c, int(uRow)));
+        bool onLeft = (int(uRow) % 2 == 0) ? !done : done;
+        if (int(uRow) >= NR) onLeft = false;
+        ny = onLeft ? uNL.y : uNR.y;
+        zTop = (onLeft ? uNL.z : uNR.z) - liftZ(vec2(ctr.x, ny)) - .02;
+      }
+      for (int sd = 0; sd < 2; sd++) {
+        float sx = sd == 0 ? -1. : 1.;
+        vec2 A = ctr + vec2((.39 + .05*jh.x*sx)*sx, .50), B = ctr + vec2((.06 + .03*jh.y)*sx, -.47);
+        if (live) A = vec2(ctr.x + .25*sx, ny - .12);
+        B.y += (1. - f)*.38;
+        vec2 ba = B - A; float L = length(ba); vec2 t = ba/L; vec2 n = vec2(-t.y, t.x)*sx;
+        if (dot(n, vec2(sx, 0.)) < 0.) n = -n;
+        vec2 q = p - A; float s = clamp(dot(q, t)/L, 0., 1.);
+        vec2 cp = A + ba*s + n*(.075*sin(PI*s));
+        vec2 dv = p - cp; float d = length(dv);
+        float w = .232*(.84 + .16*sin(PI*min(s*1.08, 1.)))*(.6 + .4*f)*(.95 + .1*hash12(vec2(float(c)*3.1 + sx, float(r)*1.7)));
+        if (d >= w) continue;
+        float za = mix(zTop, .31, smoothstep(0., .72, s)) - .05*smoothstep(.86, 1., s) - (1. - f)*.14;
+        float h = za + .17*pow(1. - d*d/(w*w), .5);
+        if (h > best) { best = h; info = vec4(s*L + float(r)*.37, dot(dv, n)/w, S.y, S.z + sx*.37); }
+      }
+    }
+  }
+  if (best < 0. && any) { best = .04; info = vec4(0., 0., st(c0, r0).y, -1.); }
+  return best;
+}
+// ply structure: three plies twisted Z, fibres twisted S inside each ply
+float plyBump(vec4 info){
+  if (info.w < 0.) return 0.;
+  float cr = clamp(info.y, -1., 1.);
+  float q = info.x*2.6 + asin(cr)/PI*1.5 + info.w;
+  float g = abs(fract(q) - .5)*2.;
+  return .05*sqrt(max(1. - g*g, 0.)) + .007*vn(vec2(q*11. - info.x*9., cr*4.));
+}
+float fabD(vec3 p, out vec4 info){
+  float h = knitH(p.xy, info); gInfo = info;
+  vec2 bq = abs(p.xy - vec2(0., uYTop*.5 + .2)) - vec2(20.75, uYTop*.5 + 1.);
+  float box = length(max(bq, 0.));
+  if (h < 0.) return max(max(box, .1), p.z - 3.);
+  float lz = liftZ(p.xy);
+  return max(p.z - (lz + h), (lz - .16) - p.z)*.5;
+}
+float needleD(vec3 p, vec4 N, float dir){
+  if (N.w < .5) return 1e3;
+  vec2 yz = p.yz - N.yz; float rho = length(yz);
+  float a = (p.x - N.x)*dir;
+  float rr = max(RN*clamp(a/2.3, 0., 1.), .045);
+  float d = rho - rr;
+  if (a < 0.) d = length(vec2(rho, a)) - .045;
+  return d*.8;
+}
+float ringD(vec3 p, vec4 N, bool left){
+  if (N.w < .5) return 1e3;
+  float fc = floor(p.x - X0 + .5); int c = int(fc); float xc = fc + X0;
+  if (c < 0 || c >= NC || xc < uBindX) return 1e3;
+  int R = int(uRow);
+  bool done = R < NR && vis(st(c, R));
+  bool onLeft = (R % 2 == 0) ? !done : done;
+  if (R >= NR) onLeft = false;
+  if (onLeft != left) return 1e3;
+  gRingCol = woolCol(st(c, done ? R : R - 1).y);
+  if (uRingAll < .5 && left && xc > N.x + .3) return 1e3;
+  if (uRingAll < .5 && !left && xc < N.x - .3) return 1e3;
+  vec2 yz = p.yz - N.yz; float rho = length(yz);
+  float ang = atan(yz.y, yz.x);
+  float dx = p.x - xc - .13*sin(ang + .6);
+  return (length(vec2((rho - (RN + .1))/.13, dx/.2)) - 1.)*.13;
+}
+float bez(vec3 p, vec3 a, vec3 b, vec3 c, out float tt){   // distance to a quadratic curve (sampled)
+  float best = 1e3; tt = 0.;
+  vec3 prev = a;
+  for (int i = 1; i <= 10; i++) {
+    float u = float(i)/10.; vec3 cur = mix(mix(a, b, u), mix(b, c, u), u);
+    vec3 pa = p - prev, ba = cur - prev; float h = clamp(dot(pa, ba)/dot(ba, ba), 0., 1.);
+    float d = length(pa - ba*h); if (d < best) { best = d; tt = (float(i) - 1. + h)/10.; }
+    prev = cur;
+  }
+  return best;
+}
+float yarnD(vec3 p, out float which){
+  which = 0.;
+  if (uYarnOn < .5) return 1e3;
+  float t1, t2;
+  return bez(p, uY0, uY1, uY2, t1) - .15;
+}
+// id: 0 table, 1 fabric, 2 needle L, 3 needle R, 4 ring, 5 yarn
+float map(vec3 p, out float id){
+  vec4 info; float which;
+  float d = p.z; id = 0.;
+  float f = fabD(p, info); if (f < d) { d = f; id = 1.; }
+  float n1 = needleD(p, uNL, -1.); if (n1 < d) { d = n1; id = 2.; }
+  float n2 = needleD(p, uNR, 1.); if (n2 < d) { d = n2; id = 3.; }
+  float r1 = min(ringD(p, uNL, true), ringD(p, uNR, false)); if (r1 < d) { d = r1; id = 4.; }
+  float y = yarnD(p, which); if (y < d) { d = y; id = 5.; }
+  return d;
+}
+float mapD(vec3 p){ float id; return map(p, id); }
+vec3 nrm(vec3 p, float e){
+  vec2 k = vec2(1., -1.);
+  return normalize(k.xyy*mapD(p + k.xyy*e) + k.yyx*mapD(p + k.yyx*e) + k.yxy*mapD(p + k.yxy*e) + k.xxx*mapD(p + k.xxx*e));
+}
+float fabTotal(vec2 xy){ vec4 info; float h = knitH(xy, info); return h < 0. ? -1. : liftZ(xy) + h + plyBump(info); }
+float softSh(vec3 ro, vec3 rd, float k){
+  float res = 1., t = .03;
+  for (int i = 0; i < 40; i++) {
+    float h = mapD(ro + rd*t);
+    res = min(res, k*h/t);
+    t += clamp(h, .04, .6);
+    if (res < .002 || t > 14.) break;
+  }
+  return clamp(res, 0., 1.);
+}
+float aoF(vec3 p, vec3 n){
+  float a = 0., w = 1.;
+  for (int i = 1; i <= 5; i++) { float h = .05*float(i)*float(i)*.6; a += w*max(h - mapD(p + n*h), 0.); w *= .7; }
+  return clamp(1. - a*2.4, 0., 1.);
+}
+vec3 woodAlb(vec2 p){
+  float plank = floor(p.y/13.);
+  vec2 q = vec2(p.x + plank*37.1, p.y);
+  float g = fbm(vec2(q.x*.035, q.y*.9 + plank*3.));
+  float ring = .5 + .5*sin(q.y*2.2 + g*14. + q.x*.01);
+  vec3 a = mix(vec3(.075, .04, .02), vec3(.15, .085, .04), ring*.55 + .45*vn(vec2(q.x*.02, q.y*3.)));
+  a *= .9 + .2*vn(vec2(q.x*.4, q.y*12.));
+  float seam = smoothstep(.06, .0, abs(fract(p.y/13.) - .0) )+ smoothstep(.06, .0, abs(fract(p.y/13.) - 1.));
+  a *= 1. - .55*seam;
+  return a;
+}
+vec3 bgCol(vec3 rd){
+  float u = clamp(rd.z*.5 + .5, 0., 1.);
+  return mix(vec3(.10, .075, .055), vec3(.30, .26, .22), u)*1.2;
+}
+void main(){
+  vec3 ro = uCamP, rd = camRay(gl_FragCoord.xy);
+  float t = .05, id = -1.; bool hit = false; float tPrev = .05;
+  float fuzz = 0.; vec3 fuzzC = vec3(0.);
+  for (int i = 0; i < 220; i++) {
+    vec3 p = ro + rd*t;
+    float d = map(p, id);
+    // wool halo: thin wandering fibres in a shell just above the yarn surface
+    if ((id == 1. || id == 4. || id == 5.) && d < .09 && d > .002 && (id != 1. || p.z - liftZ(p.xy) > .2)) {
+      vec3 q = p*vec3(26.);
+      float f1 = smoothstep(.07, 0., abs(vn3(q) - .5)), f2 = smoothstep(.10, 0., abs(vn3(q*.83 + 7.1) - .5));
+      float dens = f1*f2*(1. - d/.09);
+      fuzz += dens*min(d, .03)*26.;
+      fuzzC += dens*min(d, .03)*26.*(id == 1. ? woolCol(gInfo.z) : id == 4. ? gRingCol : woolCol(uYarnCol));
+    }
+    if (d < .0006*t + .0015) { hit = true; break; }
+    tPrev = t;
+    t += d*(d < .09 ? .7 : 1.);
+    if (t > 260.) break;
+  }
+  vec3 col; float depth = t;
+  vec3 L = normalize(uL);
+  vec3 Lc = LIGHT_COL*vec3(1., .91, .80)*3.4, Sky = vec3(.42, .47, .56)*.75, Bnc = vec3(.40, .26, .16)*.35;
+  vec3 woolTint = vec3(.6, .5, .4);
+  if (hit) {   // refine the hit: bisect between the last point outside and the first one inside
+    float a = tPrev, b = t;
+    for (int i = 0; i < 7; i++) { float m = .5*(a + b); float dm = map(ro + rd*m, id); if (dm > .0004) a = m; else b = m; }
+    t = b; map(ro + rd*t, id); depth = t;
+  }
+  if (!hit) { col = bgCol(rd); depth = 300.; }
+  else {
+    vec3 p = ro + rd*t;
+    vec3 n = nrm(p, max(.0015, .0008*t));
+    vec3 V = -rd;
+    float sh = softSh(p + n*.02, L, 9.);
+    float ao = aoF(p, n);
+    vec3 alb; float spec = 0., rough = .5, sheen = 0., wool = 0.;
+    if (id == 1.) {
+      vec4 info; float hh = knitH(p.xy, info);
+      // bump the normal with ply / fibre detail
+      float e = .006;
+      float b0 = plyBump(info);
+      vec4 i1, i2; float hx = knitH(p.xy + vec2(e, 0.), i1), hy = knitH(p.xy + vec2(0., e), i2);
+      float lz0 = liftZ(p.xy), lzx = liftZ(p.xy + vec2(e, 0.)), lzy = liftZ(p.xy + vec2(0., e));
+      if (hx >= 0. && hy >= 0. && p.z > lz0 + .02) {
+        float H0 = lz0 + hh + b0, Hx = lzx + hx + plyBump(i1), Hy = lzy + hy + plyBump(i2);
+        n = normalize(vec3(-(Hx - H0)/e, -(Hy - H0)/e, 1.));
+      }
+      alb = woolCol(info.z);
+      float cr = clamp(info.y, -1., 1.);
+      float q = info.x*2.6 + asin(cr)/PI*1.5 + info.w;
+      float groove = abs(fract(q) - .5)*2.;
+      float fib = vn(vec2(q*16. - info.x*10., cr*6. + info.w));
+      alb *= (.78 + .36*fib)*(1. - .55*pow(groove, 4.))*(.82 + .36*vn(vec2(q*60., info.x*30.)));
+      ao *= 1. - .35*pow(groove, 6.);
+      alb *= .9 + .2*hash12(vec2(floor(q*3.), info.w*13.));                       // heathered fibres
+      if (info.w < 0.) { alb = vec3(.035, .012, .01); ao *= .45; }                                    // the back of the fabric, deep in the gaps
+      float cav = clamp((hh - .1)/.3, 0., 1.);
+      ao *= .45 + .55*cav;
+      wool = 1.; sheen = .55; rough = .9;
+    } else if (id == 4. || id == 5.) {
+      if (id == 4.) {
+        float fc = floor(p.x - X0 + .5); int c = int(fc); int R = int(uRow);
+        bool done = R < NR && vis(st(c, R));
+        vec4 S = st(c, done ? R : R - 1);
+        alb = woolCol(S.y);
+        vec2 yz = p.yz - (p.x < uNL.x + .5 && abs(p.y - uNL.y) < 1.2 ? uNL.yz : uNR.yz);
+        float ang = atan(yz.y, yz.x);
+        float q = ang*.5*2.6 + asin(clamp((p.x - fc - X0 - .13*sin(ang + .6))/.2, -1., 1.))/PI*1.5 + S.z;
+        float groove = abs(fract(q) - .5)*2.;
+        alb *= (.78 + .36*vn(vec2(q*16. - ang*5., ang*3.)))*(1. - .55*pow(groove, 4.));
+        ao *= 1. - .35*pow(groove, 6.);
+      } else {
+        float which; yarnD(p, which);
+        alb = woolCol(which > .5 ? 1. : uYarnCol);
+        float tt; float dd = bez(p, uY0, uY1, uY2, tt);
+        vec3 tg = normalize(mix(uY1 - uY0, uY2 - uY1, tt));
+        vec3 cp = mix(mix(uY0, uY1, tt), mix(uY1, uY2, tt), tt);
+        vec3 rv = p - cp; vec3 bx = normalize(cross(tg, vec3(0., 0., 1.))); vec3 by = cross(bx, tg);
+        float ang = atan(dot(rv, by), dot(rv, bx));
+        float along = tt*length(uY1 - uY0)*1.6;
+        float q = along*2.6/.75 + ang/TAU*3.;
+        float groove = abs(fract(q) - .5)*2.;
+        alb *= (.78 + .36*vn(vec2(q*16., along*9.)))*(1. - .55*pow(groove, 4.));
+        ao *= 1. - .3*pow(groove, 6.);
+      }
+      wool = 1.; sheen = .55; rough = .9;
+    } else if (id == 2. || id == 3.) {
+      vec4 N = id == 2. ? uNL : uNR;
+      vec2 yz = p.yz - N.yz; float ang = atan(yz.y, yz.x);
+      float a = p.x;
+      float g = fbm(vec2(a*.25, ang*2.2 + id*5.));
+      alb = mix(vec3(.62, .43, .24), vec3(.74, .55, .32), .5 + .5*sin(a*1.3 + g*9. + ang*1.2));
+      alb *= .9 + .12*vn(vec2(a*3., ang*20.));
+      spec = .55; rough = .16;
+    } else {
+      alb = woodAlb(p.xy);
+      spec = .18; rough = .35;
+    }
+    float ndl = dot(n, L);
+    vec3 diff;
+    if (wool > .5) {
+      float wrap = max((ndl + .5)/1.5, 0.);
+      float s2 = mix(sh, 1., .25);
+      diff = alb*Lc*wrap*s2;
+      // light scattered through the fibres shows its own colour at the terminator
+      diff += alb*alb*Lc*1.6*smoothstep(.35, -.1, ndl)*smoothstep(-.5, .1, ndl)*s2;
+      float fr = pow(1. - max(dot(n, V), 0.), 3.);
+      diff += (alb*.6 + .04)*Lc*fr*sheen*s2*.6;
+    } else {
+      diff = alb*Lc*max(ndl, 0.)*sh;
+    }
+    vec3 amb = alb*(Sky*(.5 + .5*n.z) + Bnc*(.5 - .5*n.z))*ao;
+    vec3 H = normalize(L + V);
+    float sp = pow(max(dot(n, H), 0.), 2./(rough*rough + .001))*spec*sh;
+    float fres = .04 + .96*pow(1. - max(dot(n, V), 0.), 5.);
+    col = diff*mix(1., ao, .35) + amb + Lc*sp*(.3 + fres) ;
+    if (id == 0.) {   // window light falloff on the table
+      col *= .75 + .4*smoothstep(80., -30., p.x - p.y*.6);
+    }
+    col += bgCol(reflect(rd, n))*fres*spec*.5;
+    // a little atmospheric depth
+    col = mix(col, bgCol(rd), 1. - exp(-max(t - 60., 0.)*.006));
+  }
+  // fibre halo, lit from the window (forward scatter is brightest)
+  float fz = 1. - exp(-fuzz*.9);
+  vec3 hc = fuzzC/max(fuzz, 1e-4)*.7 + .05;
+  vec3 halo = hc*(Lc*(.35 + 1.2*pow(max(dot(rd, normalize(uL)), 0.), 2.)) + Sky*.6)*.55;
+  col = col + halo*fz*.5;
+  o = vec4(col, cocOf(depth));
+}`;
+const prog = SG.prog(gl, SG.VS_QUAD, FS);
+const QUAD = SG.quad(gl);
+const POST = CD.post(gl);
+
+// ---------------- needles, yarn, camera ----------------
+const sstep = (a, b, x) => { const u = clamp((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+const liftJS = (y, yTop, A) => { const u = sstep(yTop - 12, yTop + 0.4, y); return A * u * u * 1.9; };
+function needlesRaw(t) {
+  const { k, ph } = progress(Math.min(t, T_ROWS_DONE - 1e-4));
+  const A = liftAt(t);
+  const out = { L: [0, 0, 0, 1], R: [0, 0, 0, 1], row: 0, yarn: null, yarnCol: 0, bindX: -99, lift: 1 };
+  const kk = Math.min(k, ORDER.length - 1);
+  const [r, c] = ORDER[kk];
+  out.row = r;
+  const dir = r % 2 === 0 ? -1 : 1;                // direction the work travels along x
+  const xn = colX(c);                               // the stitch being made
+  const xPrev = xn - dir;                           // last finished one
+  // stitch cycle: insert (0–.35), wrap (.35–.55), pull through (.55–.9)
+  const ins = ph < 0.35 ? E.inOutSine(ph / 0.35) : ph < 0.55 ? 1 : ph < 0.9 ? 1 - E.inOutSine((ph - 0.55) / 0.35) : 0;
+  // at the end of each stitch both needles slide on by one stitch, so they arrive exactly where the next stitch starts
+  const slide = E.inOutSine(clamp((ph - 0.85) / 0.15));
+  const finTip = xPrev + dir * (0.45 + 0.95 * ins + slide);
+  const unTip = xn - dir * (0.55 - slide);
+  const zBase = 0.36 + 0.40;
+  const yFin = rowY(r) + 0.66, yUn = rowY(r - 1) + 0.66;
+  const fin = [finTip, yFin, 0, 1], un = [unTip, yUn, 0, 1];
+  const yT = rowY(r) + 0.5;
+  fin[2] = zBase + liftJS(yFin, yT, A) - 0.16 * Math.sin(Math.PI * ins) * (ph < 0.6 ? 1 : 0.4);
+  un[2] = zBase + liftJS(yUn, yT, A);
+  if (dir < 0) { out.R = fin; out.L = un; } else { out.L = fin; out.R = un; }
+  out.yarnCol = chart[r][c];
+  out.yarn = [[finTip + dir * 0.3, yFin + 0.45, fin[2] - 0.15], [finTip - dir * 0.9, yFin + 3.0, fin[2] + 0.4], [finTip - dir * 3.5, yFin + 34, 0.25]];
+  // after the last row: bind-off sweeps left → right, then the needles leave
+  if (t >= T_ROWS_DONE) {
+    const u = clamp((t - T_ROWS_DONE) / (T_BIND - T_ROWS_DONE));
+    out.row = NR; out.bindX = lerp(-20.6, 20.6, u);
+    const yTop = rowY(NR - 1) + 0.66, zB = zBase + liftJS(yTop, rowY(NR - 1) + 0.5, A);
+    out.R = [out.bindX + 0.5, yTop, zB, 1];
+    out.L = [out.bindX - 0.35, yTop + 0.25, zB + 0.15, 1];
+    out.yarn = [[out.bindX - 0.2, yTop + 0.35, zB + 0.3], [out.bindX - 1.0, yTop + 3.0, zB + 0.4], [out.bindX - 3.5, yTop + 34, 0.25]];
+    out.yarnCol = RED;
+    if (t >= T_BIND) {
+      const w = (t - T_BIND) / 0.3, a = w * w;
+      // both needles slide out along their own length (nothing but the tips moves across the frame)
+      out.R = [20.6 + 0.5 + a * 60, yTop, 0.76 + 1.9, w < 1.2 ? 1 : 0];
+      out.L = [20.6 - 0.35 - a * 60, yTop + 0.25, 0.76 + 1.9 + 0.15, w < 1.2 ? 1 : 0];
+      out.yarn = null; out.bindX = 20.6;
+    }
+  }
+  return out;
+}
+// what we see: once the knitting speeds up, the needles and the yarn are a time-average of the hands (a real time-lapse
+// blurs them the same way), so they hover near the working area instead of whipping from end to end of each row
+function needles(t) {
+  const raw = needlesRaw(t);
+  const w = 0.5 * Reel.clamp((t - 2.4) / 1.4) * (1 - Reel.clamp((t - 7.45) / 0.25));
+  raw.ringAll = w > 0.05 ? 1 : 0;
+  if (w > 0.01 && t < T_ROWS_DONE) {
+    const N = 15, acc = { L: [0, 0, 0], R: [0, 0, 0], Y: [[0, 0, 0], [0, 0, 0], [0, 0, 0]] };
+    for (let i = 0; i < N; i++) {
+      const q = needlesRaw(Math.min(t + (i / (N - 1) - 0.5) * w, T_ROWS_DONE - 1e-4));
+      for (let d = 0; d < 3; d++) { acc.L[d] += q.L[d] / N; acc.R[d] += q.R[d] / N; for (let j = 0; j < 3; j++) acc.Y[j][d] += (q.yarn ? q.yarn[j][d] : 0) / N; }
+    }
+    raw.L = [...acc.L, 1]; raw.R = [...acc.R, 1]; raw.yarn = acc.Y;
+  }
+  // the working yarn is drawn away before the bind-off
+  if (raw.yarn && t > 7.3) {
+    const f = Reel.clamp((t - 7.3) / 0.3), far = raw.yarn[2];
+    if (f >= 1) raw.yarn = null; else raw.yarn = raw.yarn.map((pt) => pt.map((x, d) => lerp(x, far[d] + (d === 1 ? 6 : 0), f * f)));
+  }
+  if (t >= 7.6) raw.yarn = null;
+  return raw;
+}
+function liftAt(t) {
+  if (t < T_BIND) return 1;
+  const s = t - T_BIND;             // released: drops, one soft rebound, settles
+  return Math.max(0, Math.exp(-s * 7.5) * Math.cos(s * 15)) * (s < 0.6 ? 1 : 0) + 0;
+}
+// camera: one continuous path. macro low from the right → rises & swings front-on → pulls out wide → settles
+const CAM = Track([
+  { t: 0.0, v: [8.4, 2.4, 9.0, 5.0, 8.3, 2.3] },
+  { t: 2.0, v: [5.9, 1.9, 10.6, 2.4, 8.6, 2.2] },
+  { t: 4.0, v: [3.0, -4.0, 15.0, 1.6, 10.0, 1.5] },
+  { t: 5.2, v: [1.0, -11.0, 36.0, 0.5, 11.0, 0.6] },
+  { t: 8.0, v: [0.0, -9.5, 58.0, 0.0, 11.6, 0.0] },
+], {});
+function camAt(t) {
+  const v = CAM(Math.min(t, 8));
+  const pos = [v[0], v[1], v[2]];          // locked from 8.0
+  const tgt = [v[3], v[4], v[5]];
+  const fov = lerp(30, 27, clamp((t - 3) / 4));
+  return CD.cam(pos, tgt, fov, lerp(-0.05, 0, clamp(t / 4.5)));
+}
+
+Reel.scene({
+  duration: 10, fps: 30,
+  async setup() {},
+  cues: [
+    { t: 0.5, sfx: 'knit_click', gain: 0.7 }, { t: 1.0, sfx: 'knit_click', gain: 0.7 }, { t: 1.5, sfx: 'knit_click', gain: 0.7 }, { t: 2.0, sfx: 'knit_click', gain: 0.75 },
+    { t: 0.3, sfx: 'yarn_slide', gain: 0.4 }, { t: 0.8, sfx: 'yarn_slide', gain: 0.4 }, { t: 1.3, sfx: 'yarn_slide', gain: 0.4 }, { t: 1.8, sfx: 'yarn_slide', gain: 0.4 },
+    { t: 2.0, sfx: 'knit_roll', gain: 0.6 },
+    { t: 4.0, sfx: 'knit_timelapse', gain: 0.5 }, { t: 4.0, sfx: 'whoosh', gain: 0.35 },
+    { t: 7.75, sfx: 'yarn_zip', gain: 0.6 },
+    { t: 8.0, sfx: 'cloth_drop', gain: 0.8 },
+  ],
+  render(tRaw) {
+    const t = tRaw;
+    const frame = Math.round(tRaw * 30);
+    const nd = needles(t);
+    const cam = camAt(t);
+    const yTop = rowY(Math.min(NR - 1, nd.row)) + 0.5;
+    // focus: the needle tips early, the swatch later
+    const tip = nd.row < NR ? (nd.row % 2 === 0 ? nd.R : nd.L) : nd.R;
+    const fP = [tip[0], tip[1], tip[2]];
+    const fC = [0, 10.5, 0.4];
+    const fk = clamp((t - 2.2) / 2.5);
+    const focus = lerp(CD.depthOf(cam, fP), CD.depthOf(cam, fC), E.inOutSine(fk));
+    const aper = lerp(22, 3, E.inOutSine(clamp((t - 1.6) / 3.2)));
+    POST.begin();
+    const P = prog.use();
+    CD.camU(P, cam, focus, aper);
+    P.t('uSt', { tex }).f('uT', t).f('uFd', t < 2.2 ? 0.22 : t < 4 ? lerp(0.22, 0.02, (t - 2.2) / 1.8) : 0.015)
+      .f('uRow', nd.row).f('uBindX', nd.bindX).f('uLiftA', liftAt(t)).f('uYTop', yTop)
+      .f('uNL', ...nd.L).f('uNR', ...nd.R)
+      .f('uYarnOn', nd.yarn ? 1 : 0).f('uYarnCol', 1).f('uRingAll', nd.ringAll || 0)
+      .f('uL', -0.62, 0.42, 0.66);
+    if (nd.yarn) P.f('uY0', ...nd.yarn[0]).f('uY1', ...nd.yarn[1]).f('uY2', ...nd.yarn[2]);
+    QUAD.draw();
+    POST.finish({ exposure: 0.95, vignette: 0.38, grain: 0.028, ca: 0.22, seed: frame % 97, bloom: 0.08, bloomThresh: 1.6,
+      tint: [1.02, 1.0, 0.97], sat: 1.04, contrast: 1.04, dof: 22 });
+  },
+});
+</script></body></html>

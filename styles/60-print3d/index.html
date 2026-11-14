@@ -1,0 +1,576 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>60 3D 打印 · 3D Printing</title>
+<script src="../../lib/core.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script><script src="../../lib/track.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 60 3D 打印 · FDM PRINTING, SHOT LIKE A MACRO TIME-LAPSE =====
+   A desktop FDM printer in a dark room. A gold textured PEI sheet on the heated bed, a skirt and a purge line already
+   down, a brass nozzle under a black part-cooling shroud, a cool LED bar standing beside the bed.
+   0-1.5 s in real time the nozzle lays the first perimeter of a twisted, fluted vase in silk PLA. From 1.5 s the film
+   is a time-lapse in the Octolapse manner: the vase grows layer by layer while the hotend rides its rising rim.
+   The hook: the camera climbs the wall a few millimetres away and the 0.2 mm layer lines glint in the side light like
+   contour lines. On 8.0 the print is done: the head hops up and parks away; the vase stands alone.
+   Renderer: SDF vase (star profile with twist and swell, a single 0.6 mm wall, analytic layer-bead normals filtered by
+   pixel footprint), hotend parts, textured PEI, LED area light with soft shadows, silk sheen, macro DOF. */
+const { E, clamp, inv, lerp } = Reel;
+const stage = Reel.makeStage('#060708');
+Reel.ownJitter = true;
+const DBG = Reel.Q.get('cam');
+const H = 1.20, LH = 0.002;                // vase height (12 cm), layer height (0.2 mm); 1 unit = 10 cm
+
+const rm = Reel.RM(stage, {
+  bloom: 0.30, th: 1.0, expo: 1.0, vig: 0.38, grain: 0.026, ca: 0.5, contrast: 1.06, sat: 1.02, bands: 6,
+  lift: [0.004, 0.005, 0.007], gain: [1.0, 1.0, 1.0],
+  uniforms: `
+uniform vec3 uRo, uTa; uniform float uTanF, uTm;
+uniform vec3 uN;            // nozzle tip
+uniform vec3 uG;            // the gantry's reference (the head slides along it when it parks)
+uniform float uH, uTh0, uProg, uLed;`,
+  scene: `
+const float VH = ${H.toFixed(3)}, LH = ${LH.toFixed(4)};
+const vec3 LIGHT_COL = vec3(1.);   // desk-lamp (key light) colour: diffuse, specular, metal reflections, bulb, haze
+// ------------------------------------------------------------ the vase: a twisted star with a swell and a flared lip
+float vR(float y){ float u = y/VH; return .34 + .10*sin(u*3.1416*1.05)*(1. - .2*u) - .06*smoothstep(.55, .85, u) + .10*smoothstep(.8, 1., u); }
+float vTw(float y){ return y*1.25; }
+float vProf(float th, float y){ return vR(y)*(1. + .075*cos(9.*(th - vTw(y)))); }
+float dVase(vec3 p, out float side){
+  float rho = length(p.xz), th = atan(p.z, p.x);
+  float y = clamp(p.y, 0., VH);
+  float r = vProf(th, y);
+  float dr = rho - r; side = dr;
+  float d = (abs(dr) - .003)*.62;
+  // top: the rim is the current height (time-lapse) ; a solid bottom 4 layers thick
+  d = max(d, p.y - uH);
+  d = max(d, -p.y);
+  float bot = max(max(rho - r + .003, p.y - LH*4.), -p.y)*.62;
+  if (uH > LH*4.) d = min(d, bot);
+  return d;
+}
+// first-layer perimeter being drawn (real-time part): a bead from th0 to th0 + 2pi*prog
+float dBead(vec3 p){
+  float rho = length(p.xz), th = atan(p.z, p.x);
+  float a = mod(th - uTh0, 6.2831853);
+  float r = vProf(th, 0.);
+  vec2 q = vec2(rho - r, p.y - LH*.5);
+  float dRing = (length(q*vec2(1., 2.2)) - .0024)*.5;
+  if (a <= uProg*6.2831853) return dRing;
+  // outside the printed arc: distance to its two ends (never a false hit on the unprinted part)
+  float t1 = uTh0 + uProg*6.2831853;
+  vec3 e0 = vec3(vProf(uTh0, 0.)*cos(uTh0), LH*.5, vProf(uTh0, 0.)*sin(uTh0));
+  vec3 e1 = vec3(vProf(t1, 0.)*cos(t1), LH*.5, vProf(t1, 0.)*sin(t1));
+  return max(dRing, min(length(p - e0), length(p - e1)) - .0026);
+}
+// skirt and a purge line (printed before the film starts)
+float dSkirt(vec3 p){
+  float rho = length(p.xz), th = atan(p.z, p.x);
+  float r = vProf(th, 0.) + .12;
+  float d = length(vec2(rho - r, (p.y - LH*.5)*2.2)) - .0024;
+  float pg = length(vec2(abs(p.z - .92) , (p.y - LH*.7)*1.8)) - .0035;
+  pg = max(pg, abs(p.x + .35) - .55);
+  return min(d, pg)*.5;
+}
+// ------------------------------------------------------------ hotend
+float hexP(vec2 p, float r){ p = abs(p); return max(p.x*.866 + p.y*.5, p.y) - r; }
+float gPart;
+float dHotend(vec3 p){
+  // an all-metal hotend (V6 type) on a carriage plate: units 1 = 10 cm, so .01 = 1 mm
+  vec3 q = p - uN;
+  if (length(q - vec3(0., .35, -.05)) > .95) { gPart = 0.; return length(q - vec3(0., .35, -.05)) - .85; }
+  float d = 1e3; gPart = 3.;
+  // brass nozzle: cone + hex
+  float cone = max(length(q.xz) - mix(.0035, .016, clamp(q.y/.024, 0., 1.)), max(-q.y, q.y - .026));
+  float hx = max(hexP(q.xz, .030), max(.024 - q.y, q.y - .046));
+  d = min(cone*.8, hx);
+  // aluminium heater block in a red silicone sock (open at the bottom around the nozzle)
+  float sock = sdRoundBox(q - vec3(.018, .094, 0.), vec3(.108, .050, .084), .022);
+  sock = max(sock, -max(length(q.xz) - .040, q.y - .05));
+  sock += .0004*vnoise(q*260.);                                  // moulded texture
+  if (sock < d) { d = sock; gPart = 4.; }
+  // the heater cartridge and its lead, the thermistor leads
+  float cart = max(length((q - vec3(.068, .082, 0.)).xy) - .019, abs(q.z) - .122);
+  if (cart < d) { d = cart; gPart = 12.; }
+  float wr = min(sdCapsule(q, vec3(.068, .082, .122), vec3(.09, .16, .17), .006), sdCapsule(q, vec3(.09, .16, .17), vec3(.12, .42, .12), .006));
+  wr = min(wr, min(sdCapsule(q, vec3(.050, .082, .122), vec3(.06, .17, .175), .006), sdCapsule(q, vec3(.06, .17, .175), vec3(.10, .43, .13), .006)));
+  if (wr < d) { d = wr; gPart = 11.; }
+  float th = min(sdCapsule(q, vec3(-.06, .10, -.09), vec3(-.10, .20, -.15), .004), sdCapsule(q, vec3(-.05, .10, -.09), vec3(-.09, .21, -.15), .004));
+  if (th < d) { d = th; gPart = 13.; }
+  // heat break (thin steel) and the finned heatsink
+  float hbk = max(length(q.xz) - .016, max(.140 - q.y, q.y - .175));
+  if (hbk < d) { d = hbk; gPart = 12.; }
+  float fy = fract((q.y - .17)*38.);
+  float fin = .056 + .055*smoothstep(.62, .52, abs(fy - .5)*2.)*step(.17, q.y);
+  float hs = max(length(q.xz) - fin, max(.168 - q.y, q.y - .42))*.6;
+  if (hs < d) { d = hs; gPart = 6.; }
+  // a 30 mm fan clamped to the heatsink's left side: square frame, open throat, seven blades round a hub
+  vec3 fq = q - vec3(-.165, .30, 0.);
+  float fr = sdRoundBox(fq, vec3(.045, .15, .15), .015);
+  float throat = length(fq.yz) - .132;
+  fr = max(fr, -max(throat, abs(fq.x) - .06));
+  fr = max(fr, -max(length(abs(fq.yz) - vec2(.118)) - .012, abs(fq.x) - .06));   // screw holes
+  if (fr < d) { d = fr; gPart = 5.; }
+  {
+    float ang = atan(fq.z, fq.y), rr = length(fq.yz);
+    float bl = abs(fract(ang*7./6.2831853 + rr*4.5 + uTm*.0) - .5) - .17;
+    float blade = max(max(bl*rr*.9, abs(fq.x + .005) - .012), max(rr - .124, .04 - rr));
+    blade = min(blade, max(rr - .045, abs(fq.x + .005) - .022));
+    if (blade < d) { d = blade; gPart = 10.; }
+  }
+  // the part-cooling blower on the right, its duct running down to the nozzle
+  vec3 bq = q - vec3(.29, .40, -.02);
+  float bw = max(length(bq.xy) - .17, abs(bq.z) - .075);
+  bw = min(bw, sdRoundBox(bq - vec3(-.10, -.16, 0.), vec3(.06, .08, .06), .01));
+  float duct = sdCapsule(q, vec3(.20, .21, -.01), vec3(.075, .048, 0.), .024);
+  duct = max(duct, -sdCapsule(q, vec3(.20, .21, -.01), vec3(.052, .032, 0.), .012));
+  bw = min(bw, duct);
+  bw = max(bw, -max(length(bq.xy) - .055, -bq.z - .1));        // the blower's intake
+  if (bw < d) { d = bw; gPart = 5.; }
+  // carriage plate behind (black anodised) with a few screws
+  vec3 pq = q - vec3(0., .52, -.19);
+  float pl = sdRoundBox(pq, vec3(.36, .30, .016), .01);
+  if (pl < d) { d = pl; gPart = 14.; }
+  for (int i = 0; i < 4; i++){ vec2 o = vec2(i < 2 ? -.29 : .29, (i % 2) == 0 ? -.23 : .23); float sc = max(length(pq.xy - o) - .020, abs(pq.z - .022) - .008); if (sc < d) { d = sc; gPart = 12.; } }
+  return d;
+}
+// ---- 2020 aluminium extrusion along one axis (slots on all four faces)
+float ext20(vec2 c, float len, float along){
+  // c: cross-section coords, along: coordinate along the bar measured from its centre
+  vec2 a = abs(c);
+  float d = max(max(a.x, a.y) - .10, abs(along) - len);
+  float slotX = max(a.x - .031, .10 - .055 - a.y);
+  float slotY = max(a.y - .031, .10 - .055 - a.x);
+  return max(d, -max(min(slotX, slotY), abs(along) - len - .01));
+}
+float gFrame; float gShPass = 0.;
+float dFrame(vec3 p){
+  gFrame = 15.;
+  float d = 1e3;
+  // uprights at the four corners, top and base rectangles
+  vec2 cq = vec2(abs(p.x) - 1.95, abs(p.z) - 1.75);
+  d = min(d, ext20(cq, 2.22, p.y - 1.48));
+  d = min(d, ext20(vec2(p.y - 3.70, abs(p.z) - 1.75), 1.85, p.x));
+  d = min(d, ext20(vec2(abs(p.x) - 1.95, p.y - 3.70), 1.65, p.z));
+  d = min(d, ext20(vec2(p.y + .64, abs(p.z) - 1.75), 1.85, p.x));
+  d = min(d, ext20(vec2(abs(p.x) - 1.95, p.y + .64), 1.65, p.z));
+  // the moving gantry: Y rails at the sides and the X beam the head rides on
+  float yG = uG.y + .95;
+  d = min(d, ext20(vec2(abs(p.x) - 1.80, p.y - yG), 1.58, p.z));
+  float xb = ext20(vec2(p.y - yG, p.z - (uG.z - .40)), 1.80, p.x);
+  xb = min(xb, max(abs(p.y - yG) - .10, max(abs(p.z - (uG.z - .40)) - .10, abs(p.x) - 1.80)) + .0);
+  d = min(d, xb);
+  // feet
+  d = min(d, sdCylinder(vec3(abs(p.x) - 1.95, p.y + .77, abs(p.z) - 1.75), .03, .09));
+  // bed carrier plate, springs and levelling knobs, and the two Y rods under it
+  d = min(d, sdBox(p - vec3(0., -.25, 0.), vec3(1.10, .025, 1.10)));
+  float rods = length(vec2(abs(p.x) - .62, p.y + .45)) - .04; rods = max(rods, abs(p.z) - 1.70);
+  if (rods < d) { d = rods; gFrame = 12.; }
+  vec3 kq = vec3(abs(p.x) - .98, p.y, abs(p.z) - .98);
+  float spring = max(abs(length(kq.xz) - .055) - .010, abs(kq.y + .165) - .055);
+  spring = max(spring, -(abs(fract((kq.y + .165)*55.) - .5) - .22)*.02 - 0.);
+  if (spring < d) { d = spring; gFrame = 12.; }
+  float knob = sdCylinder(kq - vec3(0., -.33, 0.), .045, .13) - .01;
+  if (knob < d) { d = knob; gFrame = 19.; }
+  // Z lead screws (threaded) with their steppers below, and brass nuts on the gantry
+  vec3 zq = vec3(abs(p.x) - 1.72, p.y, p.z + 1.45);
+  float scr = max(length(zq.xz) - .040 - .006*(1. - gShPass)*sin(atan(zq.z, zq.x) + zq.y*125.), abs(zq.y - 1.53) - 2.07);
+  if (scr*.7 < d) { d = scr*.7; gFrame = 17.; }
+  float nut = max(length(zq.xz) - .085, abs(zq.y - yG) - .05);
+  if (nut < d) { d = nut; gFrame = 3.; }
+  float mot = sdRoundBox(zq - vec3(0., -.33, 0.), vec3(.21, .21, .21), .02);
+  if (mot < d) { d = mot; gFrame = 18.; }
+  float xm = sdRoundBox(p - vec3(-1.62, yG + .05, uG.z - .40 - .02), vec3(.21, .21, .21), .02);
+  if (xm < d) { d = xm; gFrame = 18.; }
+  // GT2 belts: two strands along the X beam's front, and along each Y rail
+  float bx = max(max(abs(abs(p.y - yG) - .042) - .015, abs(p.z - (uG.z - .40 + .108)) - .005), abs(p.x) - 1.70);
+  float by = max(max(abs(p.y - yG - .108) - .005, abs(abs(p.x) - 1.80) - .015), abs(p.z) - 1.50);
+  float belt = min(bx, by);
+  if (belt < d) { d = belt; gFrame = 16.; }
+  // the printer's own LED strip under the top front bar
+  float led = sdBox(p - vec3(0., 3.585, 1.70), vec3(1.70, .012, .035));
+  if (led < d) { d = led; gFrame = 7.; }
+  return d;
+}
+// ---- the bench around the printer (all of it soft in the depth of field)
+const float DESK = -.80;
+float gEnv; float gSpool;
+float sdSpoolZ(vec3 q){   // a 1 kg spool standing on its rim, axis along x (the windings face the room)
+  float r = length(q.yz);
+  float fl = max(abs(abs(q.x) - .33) - .022, r - .98);
+  float wind = max(abs(q.x) - .31, r - .88);
+  float d = min(fl, wind);
+  return max(d, .28 - r);                    // the hub hole
+}
+float mapEnv(vec3 p){
+  float d = p.y - DESK; gEnv = 20.;                                         // birch-ply desk
+  float w = p.z + 3.55; if (w < d) { d = w; gEnv = 21.; }                   // the wall
+  float pg = sdBox(p - vec3(0., 2.0, -3.48), vec3(5.2, 2.75, .03));          // pegboard
+  if (pg < d) { d = pg; gEnv = 22.; }
+  // tools hanging on the pegboard
+  if (abs(p.z + 3.38) < .4 && p.y > -.2 && p.y < 2.6) {
+    float t;
+    // pliers (red grips)
+    t = min(sdCapsule(p, vec3(-3.02, .45, -3.38), vec3(-2.95, 1.30, -3.38), .055), sdCapsule(p, vec3(-2.76, .45, -3.38), vec3(-2.86, 1.30, -3.38), .055));
+    if (t < d) { d = t; gEnv = 24.; }
+    t = min(sdCapsule(p, vec3(-2.95, 1.30, -3.38), vec3(-2.90, 1.78, -3.38), .045), sdCapsule(p, vec3(-2.86, 1.30, -3.38), vec3(-2.90, 1.78, -3.38), .045));
+    if (t < d) { d = t; gEnv = 23.; }
+    // hex keys fanned from a holder
+    float hk = sdBox(p - vec3(-1.65, 1.62, -3.38), vec3(.30, .07, .06));
+    if (hk < d) { d = hk; gEnv = 26.; }
+    for (int i = 0; i < 6; i++){ float fi = float(i); vec3 a = vec3(-1.88 + fi*.09, 1.55, -3.36); t = min(sdCapsule(p, a, a - vec3(0., .45 + fi*.10, 0.), .016 + fi*.004), sdCapsule(p, a - vec3(0., .45 + fi*.10, 0.), a - vec3(-.13 - fi*.02, .45 + fi*.10, 0.), .016 + fi*.004)); if (t < d) { d = t; gEnv = 23.; } }
+    // scraper: handle up, blade down
+    t = sdCapsule(p, vec3(-.35, .70, -3.37), vec3(-.35, 1.45, -3.37), .06); if (t < d) { d = t; gEnv = 25.; }
+    t = sdBox(p - vec3(-.35, .43, -3.37), vec3(.17, .17, .008)) - .004; if (t < d) { d = t; gEnv = 23.; }
+    // side cutters (blue grips)
+    t = min(sdCapsule(p, vec3(.82, .50, -3.38), vec3(.90, 1.25, -3.38), .05), sdCapsule(p, vec3(1.08, .50, -3.38), vec3(.98, 1.25, -3.38), .05));
+    if (t < d) { d = t; gEnv = 27.; }
+    t = min(sdCapsule(p, vec3(.90, 1.25, -3.38), vec3(.94, 1.62, -3.38), .04), sdCapsule(p, vec3(.98, 1.25, -3.38), vec3(.94, 1.62, -3.38), .04));
+    if (t < d) { d = t; gEnv = 23.; }
+    // a caliper
+    t = sdBox(p - vec3(2.15, 1.05, -3.38), vec3(.045, .80, .015)); t = min(t, sdBox(p - vec3(2.30, 1.70, -3.38), vec3(.16, .04, .015)));
+    if (t < d) { d = t; gEnv = 23.; }
+    // a roll of kapton tape on a hook
+    t = sdTorus((p - vec3(3.25, 1.30, -3.33)).xzy, vec2(.22, .07)); if (t < d) { d = t; gEnv = 28.; }
+  }
+  // a low shelf on the wall, right, with spools; more spools standing on the desk
+  float sh = sdBox(p - vec3(3.4, 1.20, -3.10), vec3(1.75, .04, .40)); if (sh < d) { d = sh; gEnv = 29.; }
+  if (p.z < -1.3) {
+    float sp;
+    sp = sdSpoolZ(p - vec3(-3.45, DESK + .98, -2.55)); if (sp < d) { d = sp; gEnv = 30.; gSpool = 0.; }
+    sp = sdSpoolZ(p - vec3(-2.25, DESK + .98, -2.85)); if (sp < d) { d = sp; gEnv = 30.; gSpool = 1.; }
+    sp = sdSpoolZ(p - vec3(3.35, DESK + .98, -2.45)); if (sp < d) { d = sp; gEnv = 30.; gSpool = 2.; }
+    sp = sdSpoolZ(p - vec3(2.35, 1.24 + .98, -3.10)); if (sp < d) { d = sp; gEnv = 30.; gSpool = 3.; }
+    sp = sdSpoolZ(p - vec3(4.45, 1.24 + .98, -3.10)); if (sp < d) { d = sp; gEnv = 30.; gSpool = 4.; }
+  }
+  // the desk lamp: a weighted base, two arms, a shade aimed at the printer, a warm bulb
+  if (length(p - vec3(-2.8, 1.0, .6)) < 2.6) {
+    float lb = sdCylinder(p - vec3(-3.4, DESK + .04, .6), .04, .55) - .01; if (lb < d) { d = lb; gEnv = 31.; }
+    float ar = min(sdCapsule(p, vec3(-3.4, DESK + .06, .6), vec3(-3.05, 1.60, .25), .045), sdCapsule(p, vec3(-3.05, 1.60, .25), vec3(-2.27, 2.74, .86), .04));
+    if (ar < d) { d = ar; gEnv = 32.; }
+    vec3 S = vec3(-2.25, 2.75, .85), A = normalize(vec3(.656, -.714, -.248));
+    vec3 q = p - S; float u = dot(q, A); float rr = length(q - A*u);
+    float cone = max(abs(rr - mix(.18, .52, clamp(u/.7, 0., 1.))) - .018, max(-u, u - .7));
+    cone = min(cone, max(length(q) - .20, -u));
+    if (cone < d) { d = cone; gEnv = 31.; }
+    float bulb = length(q - A*.32) - .13; if (bulb < d) { d = bulb; gEnv = 33.; }
+  }
+  // a pothos in a terracotta pot, back right
+  vec3 pq = p - vec3(3.15, DESK, -1.35);
+  if (length(pq - vec3(0., .5, 0.)) < 1.4) {
+    float r = mix(.31, .40, clamp(pq.y/.62, 0., 1.));
+    float pot = max(length(pq.xz) - r, max(-pq.y, pq.y - .62));
+    pot = min(pot, max(length(pq.xz) - .43, abs(pq.y - .58) - .05));
+    if (pot < d) { d = pot; gEnv = 34.; }
+    for (int i = 0; i < 9; i++){
+      float fi = float(i), an = fi*2.39996;
+      vec3 c = vec3(cos(an)*(.18 + .05*mod(fi, 3.)), .78 + .10*mod(fi, 4.), sin(an)*(.18 + .05*mod(fi, 3.)));
+      vec3 dir = normalize(vec3(cos(an), .55 + .25*sin(fi), sin(an)));
+      vec3 lq = pq - c - dir*.25;
+      float lf = sdEllipsoid(lq, vec3(.30, .30, .30)*vec3(1.));
+      lf = sdEllipsoid(vec3(dot(lq, dir), dot(lq, normalize(cross(dir, vec3(0., 1., 0.)))), dot(lq, normalize(cross(cross(dir, vec3(0., 1., 0.)), dir)))), vec3(.28, .15, .025));
+      if (lf < d) { d = lf; gEnv = 35.; }
+    }
+  }
+  // a few printed parts on the desk in front: a calibration cube, a gear, a little vase
+  if (length(p - vec3(1.35, DESK + .2, 2.2)) < .9) {
+    float c1 = sdRoundBox(p - vec3(1.30, DESK + .10, 2.10), vec3(.10, .10, .10), .006); if (c1 < d) { d = c1; gEnv = 36.; }
+    vec3 gq = p - vec3(1.78, DESK + .03, 1.98); float ga = atan(gq.z, gq.x); float gr = length(gq.xz) - .26 - .025*smoothstep(-.3, .3, sin(ga*18.));
+    float g = max(max(gr, abs(gq.y) - .03), .07 - length(gq.xz)); if (g < d) { d = g; gEnv = 37.; }
+    vec3 vq = p - vec3(.95, DESK, 2.40); float vr = .09 + .03*sin(vq.y*14.);
+    float vs = max(abs(length(vq.xz) - vr) - .01, max(-vq.y, vq.y - .30)); if (vs < d) { d = vs; gEnv = 38.; }
+  }
+  return d;
+}
+float mapNearD(vec3 p){
+  // for shadows the vase wall is thickened inward (its 0.6 mm wall is too thin for a stepped shadow ray)
+  float rho = length(p.xz), th = atan(p.z, p.x);
+  float rv = vProf(th, clamp(p.y, 0., VH));
+  float d = max(max((abs(rho - rv + .03) - .03)*.62, p.y - uH), -p.y);
+  if (uH > LH*4.) d = min(d, max(max((rho - rv)*.62, p.y - LH*4.), -p.y));
+  d = min(d, dBead(p)); d = min(d, dSkirt(p));
+  d = min(d, sdBox(p - vec3(0., -.004, 0.), vec3(1.15, .002, 1.15)) - .002);
+  d = min(d, sdBox(p - vec3(0., -.06, 0.), vec3(1.12, .05, 1.12)));
+  d = min(d, dHotend(p));
+  gShPass = 1.; d = min(d, dFrame(p)); gShPass = 0.;
+  return d;
+}
+// ------------------------------------------------------------ scene map
+// ids: 1 sheet, 2 vase, 3 brass, 4 sock, 5 black plastic, 6 aluminium, 7 LED, 8 bead/skirt, 9 bed, 10 fan blades, 11 wires, 12 steel,
+//      13 thermistor leads, 14 carriage plate, 15 2020 extrusion, 16 belt, 17 lead screw, 18 stepper, 19 knob; 20+ the bench
+vec2 map(vec3 p){
+  float side;
+  vec2 r = vec2(dVase(p, side), 2.);
+  float b = dBead(p); if (b < r.x) r = vec2(b, 8.);
+  float s = dSkirt(p); if (s < r.x) r = vec2(s, 8.);
+  // bed: the PEI sheet (0.6 mm) on a black aluminium bed
+  float sheet = sdBox(p - vec3(0., -.004, 0.), vec3(1.15, .002, 1.15)) - .002;
+  if (sheet < r.x) r = vec2(sheet, 1.);
+  float bed = sdBox(p - vec3(0., -.06, 0.), vec3(1.12, .05, 1.12));
+  if (bed < r.x) r = vec2(bed, 9.);
+  float he = dHotend(p); if (he < r.x) r = vec2(he, gPart);
+  float fr = dFrame(p); if (fr < r.x) r = vec2(fr, gFrame);
+  float en = mapEnv(p); if (en < r.x) r = vec2(en, gEnv);
+  return r;
+}
+vec3 calcN(vec3 p, float e){ vec2 k = vec2(1., -1.)*e; return normalize(k.xyy*map(p + k.xyy).x + k.yyx*map(p + k.yyx).x + k.yxy*map(p + k.yxy).x + k.xxx*map(p + k.xxx).x); }
+float calcAO(vec3 p, vec3 n){ float o = 0., s = 1.; for (int i = 0; i < 5; i++){ float h = .010 + .05*float(i); o += (h - map(p + n*h).x)*s; s *= .7; } return clamp(1. - 2.2*o, 0., 1.); }
+float gJit = 0.;
+float shadow(vec3 ro, vec3 rd, float tmax){
+  // improved soft shadows (no banding between steps), with a per-pixel jittered start
+  float r = 1., t = .008 + .01*gJit, ph = 1e10;
+  for (int i = 0; i < 90; i++){
+    float h = mapNearD(ro + rd*t);
+    float y = h*h/(2.*ph), dd = sqrt(max(h*h - y*y, 0.));
+    r = min(r, 8.*dd/max(t - y, 1e-4));
+    ph = h; t += clamp(h, .006, .10);
+    if (r < .005 || t > tmax) break;
+  }
+  return clamp(r, 0., 1.);
+}
+// ------------------------------------------------------------ lights
+const vec3 LEDP = vec3(-1.25, .70, .30);
+float D_GGX(float nh, float a){ float a2 = a*a; float d = nh*nh*(a2 - 1.) + 1.; return a2/(PI*d*d); }
+vec3 ledDir(vec3 p, out float dist, out float area){
+  // nearest point on the LED bar (a vertical segment) -> a soft area light
+  vec3 a = LEDP - vec3(0., .6, 0.), b = LEDP + vec3(0., .6, 0.);
+  vec3 ba = b - a; float h = clamp(dot(p - a, ba)/dot(ba, ba), 0., 1.);
+  vec3 c = a + ba*h; vec3 d = c - p; dist = length(d); area = 1.; return d/dist;
+}
+vec3 segLight(vec3 p, vec3 a, vec3 b, out float dist){ vec3 ba = b - a; float h = clamp(dot(p - a, ba)/dot(ba, ba), 0., 1.); vec3 d = a + ba*h - p; dist = length(d); return d/dist; }
+vec3 lobe(vec3 n, vec3 v, vec3 L, vec3 alb, float rough, float metal, float sheen, vec3 tng){
+  vec3 hv = normalize(L + v); float nh = max(dot(n, hv), 0.), nv = max(dot(n, v), 1e-3), ndl = max(dot(n, L), 0.);
+  float a = max(rough*rough, .004);
+  vec3 F0 = mix(vec3(.04), alb, metal);
+  vec3 F = F0 + (1. - F0)*pow(1. - max(dot(hv, v), 0.), 5.);
+  vec3 spec = D_GGX(nh, a)*F*.25/max(nv, .15);
+  // silk PLA: a highlight stretched across the layer lines (anisotropic, tinted by the pigment)
+  if (sheen > 0.) { float th = dot(hv, tng); spec += (alb*1.6 + .15)*sheen*exp(-th*th/.012)*pow(nh, 4.)*1.4; }
+  return (alb*(1. - metal)*ndl/PI*2.4 + spec*ndl);
+}
+const vec3 LAMP = vec3(-2.05, 2.54, .78); const vec3 LAMPA = vec3(.656, -.714, -.248);
+vec3 shade(vec3 p, vec3 n, vec3 v, vec3 alb, float rough, float metal, float sheen, vec3 tng){
+  vec3 col = vec3(0.);
+  float ds;
+  // key: the desk lamp, warm, from the upper left (a soft-edged pool of light)
+  vec3 Lv = LAMP - p; float Ld = length(Lv); vec3 L1 = Lv/Ld;
+  float spot = mix(.22, 1., smoothstep(.45, .85, dot(-L1, LAMPA)));
+  float s1 = shadow(p + n*.004, L1, Ld - .2);
+  col += lobe(n, v, L1, alb, rough, metal, sheen, tng)*LIGHT_COL*vec3(1., .80, .56)*44./(1. + Ld*Ld*.30)*spot*s1;
+  // the printer's own LED strip, cool, from the top front
+  vec3 L2 = segLight(p, vec3(-1.7, 3.57, 1.70), vec3(1.7, 3.57, 1.70), ds);
+  float s2 = shadow(p + n*.004, L2, ds - .05);
+  col += lobe(n, v, L2, alb, rough, metal, sheen, tng)*vec3(.88, .94, 1.)*10./(1. + ds*ds*.30)*s2*uLed;
+  // the room: warm ambient from the walls, a little bounce from the desk
+  float ao = calcAO(p, n);
+  col += alb*(1. - metal)*(vec3(.15, .125, .10)*(.6 + .4*n.y) + vec3(.10, .08, .06)*max(-n.y, 0.) + vec3(.06, .055, .05)*max(dot(n, normalize(vec3(.3, .3, 1.))), 0.))*ao;
+  // metals reflect the room: a warm, dim, soft environment with the lamp's bright patch
+  vec3 rr = reflect(-v, n);
+  vec3 envc = mix(vec3(.05, .04, .032), vec3(.16, .13, .10), smoothstep(-.3, .6, rr.y)) + LIGHT_COL*vec3(1., .8, .55)*1.8*pow(max(dot(rr, L1), 0.), 40.);
+  vec3 F0 = mix(vec3(.04), alb, metal);
+  col += F0*metal*envc*ao;
+  return col;
+}
+// the bench: simpler lighting (lamp with the printer's shadow, ambient)
+vec3 shadeEnv(vec3 p, vec3 n, vec3 v, vec3 alb, float rough){
+  vec3 Lv = LAMP - p; float Ld = length(Lv); vec3 L = Lv/Ld;
+  float spot = mix(.22, 1., smoothstep(.45, .85, dot(-L, LAMPA)));
+  float s = shadow(p + n*.01, L, Ld - .3);
+  vec3 h = normalize(L + v);
+  vec3 col = alb*max(dot(n, L), 0.)*LIGHT_COL*vec3(1., .80, .56)*44./(1. + Ld*Ld*.30)*spot*s/PI*2.4;
+  col += LIGHT_COL*vec3(1., .8, .56)*D_GGX(max(dot(n, h), 0.), max(rough*rough, .02))*.04*.25*max(dot(n, L), 0.)*44./(1. + Ld*Ld*.30)*spot*s;
+  col += alb*(vec3(.15, .125, .10)*(.6 + .4*n.y) + vec3(.09, .075, .06)*max(-n.y, 0.));
+  return col;
+}
+// ------------------------------------------------------------ render
+vec3 render(vec2 fc){
+  vec2 uvn = (2.*fc - uRes)/uRes.y;
+  vec3 ww = normalize(uTa - uRo), uu = normalize(cross(ww, vec3(0., 1., 0.))), vv = cross(uu, ww);
+  vec3 rd = normalize(ww + (uu*uvn.x + vv*uvn.y)*uTanF), ro = uRo;
+  gJit = fract(52.9829189*fract(dot(fc, vec2(.06711056, .00583715))) + uTm*3.7);
+  float t = 0.; vec2 h; bool hit = false;
+  for (int i = 0; i < 300; i++){
+    vec3 p = ro + rd*t; h = map(p);
+    if (h.x < .00015*(1. + t*2.)) { hit = true; break; }
+    t += h.x*.9; if (t > 40.) break;
+  }
+  vec3 col;
+  if (!hit) {
+    col = vec3(.06, .05, .04);
+    gDepth = 25.;
+  } else {
+    vec3 p = ro + rd*t; gDepth = t;
+    float id = h.y;
+    float fp = t*uTanF*2./uRes.y;                 // one pixel at this depth (world units)
+    vec3 n = calcN(p, max(.00025, fp*.5));
+    vec3 v = -rd;
+    if (id == 1.) {
+      // gold textured PEI: powder-coated speckle
+      float k1 = clamp(fp*900.*.7 - .2, 0., 1.), k2 = clamp(fp*260.*.7 - .2, 0., 1.);
+      float n1 = mix(vnoise(p*900.), .5, k1), n2 = mix(vnoise(p*260. + 3.), .5, k2);
+      vec3 alb = mix(vec3(.55, .40, .19), vec3(.30, .19, .07), smoothstep(.45, .8, n2)*(1. - k2) + .25*k2)*(.85 + .3*n1);
+      alb = pow(alb, vec3(1.6));
+      vec3 nn = normalize(n + (1. - k1)*vec3(vnoise(p*700.) - .5, 0., vnoise(p*700. + 9.) - .5)*.6);
+      col = shade(p, nn, v, alb, .58, .18, 0., vec3(1., 0., 0.));
+      // edge of the sheet / fade into the dark beyond
+    } else if (id == 2. || id == 8.) {
+      // silk PLA: teal with a pearly sheen; layer beads as normals, filtered by the pixel footprint
+      vec3 alb = pow(vec3(.06, .42, .41), vec3(1.7));
+      float rho = length(p.xz);
+      vec3 radial = vec3(p.x/rho, 0., p.z/rho);
+      float u = p.y/LH; float fu = fract(u) - .5;
+      float vis = 1. - smoothstep(.22, .45, fp/LH);               // fade the beads out when a layer is under ~3 px
+      float slope = -fu*2.2;                                     // round bead: the normal tilts up / down across each line
+      vec3 nn = normalize(n + vec3(0., slope*vis*.9, 0.));
+      vec3 tng = normalize(cross(vec3(0., 1., 0.), radial));     // along the layer
+      // darker valleys between the beads
+      alb *= 1. - .35*vis*smoothstep(.3, .5, abs(fu)) - .08*(1. - vis);
+      if (id == 8.) { nn = n; }
+      col = shade(p, nn, v, alb, .28, 0., 1.2, tng);
+      // a filtered average sheen when the beads are too small to resolve: banded glints along the height
+      col += alb*(1. - vis)*.0;
+    } else if (id == 3.) {
+      col = shade(p, n, v, vec3(.95, .72, .38), .20, 1., 0., vec3(0.));
+    } else if (id == 10.) {
+      col = shade(p, n, v, vec3(.012, .012, .014), .45, 0., 0., vec3(0.));
+    } else if (id == 11.) {
+      col = shade(p, n, v, pow(vec3(.62, .08, .06), vec3(1.6)), .35, 0., 0., vec3(0.));
+    } else if (id == 12.) {
+      col = shade(p, n, v, vec3(.62, .63, .65), .18, 1., 0., vec3(0.));
+    } else if (id == 13.) {
+      col = shade(p, n, v, vec3(.70, .70, .68), .4, 0., 0., vec3(0.));
+    } else if (id == 14.) {
+      col = shade(p, n, v, vec3(.05, .05, .055), .32, 1., 0., vec3(0.));
+    } else if (id == 4.) {
+      col = shade(p, n, v, pow(vec3(.80, .22, .10), vec3(1.8)), .55, 0., 0., vec3(0.));          // silicone sock
+    } else if (id == 5.) {
+      // printed black PETG: faint layer lines
+      float ll = .9 + .1*sin(p.y*2200.);
+      col = shade(p, n, v, vec3(.020, .021, .024)*ll, .42, 0., 0., vec3(0.));
+    } else if (id == 6.) {
+      col = shade(p, n, v, vec3(.78, .79, .81), .30, 1., 0., vec3(0.));                         // aluminium
+    } else if (id == 7.) {
+      col = vec3(.85, .92, 1.)*6.*uLed;
+    } else if (id == 15.) {
+      col = shade(p, n, v, vec3(.80, .81, .83), .38, 1., 0., vec3(0.));                           // anodised aluminium extrusion
+    } else if (id == 16.) {
+      col = shade(p, n, v, vec3(.018, .018, .02)*(.8 + .4*step(.5, fract(p.x*50. + p.z*50.))), .6, 0., 0., vec3(0.));   // toothed belt
+    } else if (id == 17.) {
+      col = shade(p, n, v, vec3(.70, .70, .72), .25, 1., 0., vec3(0.));
+    } else if (id == 18.) {
+      col = shade(p, n, v, abs(fract(p.y*6.) - .5) < .4 ? vec3(.03, .03, .033) : vec3(.6, .6, .62), .4, .5, 0., vec3(0.));   // stepper: black body, silver end caps
+    } else if (id == 19.) {
+      col = shade(p, n, v, pow(vec3(.85, .55, .10), vec3(2.)), .45, 0., 0., vec3(0.));          // yellow levelling knobs
+    } else if (id >= 20.) {
+      vec3 alb = vec3(.5); float rough = .6;
+      if (id == 20.) { // birch ply desk
+        float g = fract(p.z*1.4 + .3*fbm(vec3(p.x*.08, p.z*.6, 1.)));
+        alb = mix(vec3(.80, .66, .48), vec3(.70, .55, .38), smoothstep(.6, .95, g)*.6)*(.92 + .1*vnoise(vec3(p.x*.4, p.z*30., 2.)));
+        alb = pow(alb, vec3(2.2)); rough = .45;
+      } else if (id == 21.) { alb = pow(vec3(.80, .76, .70), vec3(2.2)); rough = .9; }
+      else if (id == 22.) {   // pegboard: a grid of holes
+        vec2 hq = (fract(p.xy/.254) - .5)*.254; float hole = smoothstep(.034, .028, length(hq));
+        alb = pow(vec3(.86, .84, .80), vec3(2.2))*(1. - .85*hole); rough = .8;
+      }
+      else if (id == 23.) { alb = vec3(.55, .56, .58); rough = .3; }
+      else if (id == 24.) { alb = pow(vec3(.78, .12, .08), vec3(2.)); rough = .5; }
+      else if (id == 25.) { alb = pow(vec3(.92, .52, .10), vec3(2.)); rough = .5; }
+      else if (id == 26.) { alb = vec3(.02); rough = .5; }
+      else if (id == 27.) { alb = pow(vec3(.12, .30, .78), vec3(2.)); rough = .5; }
+      else if (id == 28.) { alb = pow(vec3(.95, .55, .12), vec3(2.)); rough = .25; }
+      else if (id == 29.) { alb = pow(vec3(.55, .38, .24), vec3(2.2)); rough = .5; }
+      else if (id == 30.) {   // a spool: flanges in black / clear plastic, the filament wound in fine turns
+        vec3 sc = gSpool < .5 ? vec3(-3.45, DESK + .98, -2.55) : gSpool < 1.5 ? vec3(-2.25, DESK + .98, -2.85) : gSpool < 2.5 ? vec3(3.35, DESK + .98, -2.45) : gSpool < 3.5 ? vec3(2.35, 2.22, -3.10) : vec3(4.45, 2.22, -3.10);
+        vec3 q = p - sc; float r = length(q.yz);
+        vec3 fc = gSpool < .5 ? vec3(.95, .42, .08) : gSpool < 1.5 ? vec3(.90, .88, .82) : gSpool < 2.5 ? vec3(.78, .10, .10) : gSpool < 3.5 ? vec3(.10, .55, .50) : vec3(.95, .80, .15);
+        bool flange = abs(q.x) > .305;
+        float fpx = length(p - uRo)*uTanF*2./uRes.y;
+        alb = flange ? pow(vec3(.62, .48, .32), vec3(2.2)) : pow(fc, vec3(2.))*(.9 + .1*sin(q.x*900.)*(1. - smoothstep(.0012, .003, fpx)));
+        rough = flange ? .8 : .3;
+      }
+      else if (id == 31.) { alb = vec3(.015); rough = .45; }
+      else if (id == 32.) { alb = vec3(.6); rough = .2; }
+      else if (id == 34.) { alb = pow(vec3(.72, .38, .22), vec3(2.)); rough = .85; }
+      else if (id == 35.) { alb = pow(vec3(.20, .45, .12), vec3(2.))*(.8 + .4*vnoise(p*12.)); rough = .45; }
+      else if (id == 36.) { alb = pow(vec3(.95, .45, .08), vec3(2.)); rough = .4; }
+      else if (id == 37.) { alb = pow(vec3(.55, .56, .58), vec3(2.)); rough = .45; }
+      else if (id == 38.) { alb = pow(vec3(.85, .85, .88), vec3(2.)); rough = .4; }
+      if (id == 33.) col = LIGHT_COL*vec3(1., .82, .55)*12.;
+      else col = shadeEnv(p, n, v, alb, rough);
+    } else {
+      col = shade(p, n, v, vec3(.008), .85, 0., 0., vec3(0.))*.6;
+    }
+  }
+  // a little haze round the lamp bulb
+  vec3 w = LAMP - ro; float tl = clamp(dot(w, rd), 0., gDepth);
+  float dd = length(w - rd*tl);
+  col += LIGHT_COL*vec3(1., .78, .5)*.10*exp(-dd*dd*3.);
+  return col;
+}`,
+});
+
+/* ------------------------------------------------------------------ the print */
+const TH0 = 0.0;           // the seam / where the head parks during the time-lapse (camera-right)
+function vR(y) { const u = y / H; return 0.34 + 0.10 * Math.sin(u * Math.PI * 1.05) * (1 - 0.2 * u) - 0.06 * clamp((u - 0.55) / 0.3) ** 2 * (3 - 2 * clamp((u - 0.55) / 0.3)) + 0.10 * (clamp((u - 0.8) / 0.2) ** 2 * (3 - 2 * clamp((u - 0.8) / 0.2))); }
+function vProf(th, y) { return vR(y) * (1 + 0.075 * Math.cos(9 * (th - y * 1.25))); }
+function printAt(t) {
+  // 0-1.5 s: the first perimeter in real time; 1.5-7.6 s: time-lapse growth; 8.0: hop + park
+  const prog = clamp(t / 1.5);
+  const hgt = t < 1.5 ? LH : LH * 4 + (H - LH * 4) * E.inOutSine(clamp((t - 1.5) / 6.1));
+  let th = TH0 + prog * 2 * Math.PI;
+  const y = t < 1.5 ? LH : hgt;
+  const r = vProf(th, Math.min(y, H));
+  const N = [r * Math.cos(th), y + 0.0006, r * Math.sin(th)];
+  // 8.0: a z-hop, then the head slides away along its beam and out of frame, done by ~8.45
+  const k = E.inOutCubic(clamp((t - 7.95) / 0.5));
+  const hop = 0.15 * E.outCubic(clamp((t - 7.95) / 0.2)) + 0.012 * clamp((t - 7.9) / 0.05);
+  N[1] += hop;
+  const G = N.slice();
+  N[0] += 1.25 * k;
+  return { N, G, hgt: t < 1.5 ? 0 : hgt, prog: t < 1.5 ? prog : 1 };
+}
+
+/* ------------------------------------------------------------------ camera */
+const CK = [
+  { t: 0.0, p: [0.58, 0.055, 0.55], a: [0.36, 0.010, 0.12], fov: 30 },
+  { t: 0.6, p: [0.04, 0.060, 0.78], a: [-0.19, 0.012, 0.34], fov: 30 },
+  { t: 1.4, p: [-0.60, 0.12, 0.66], a: [-0.36, 0.02, -0.02], fov: 30 },
+  { t: 2.4, p: [-0.30, 0.55, 1.65], a: [0.0, 0.22, 0.0], fov: 32 },
+  { t: 3.4, p: [0.45, 0.62, 1.70], a: [0.0, 0.38, 0.0], fov: 32 },
+  { t: 4.1, p: [-0.62, 0.18, 0.56], a: [-0.24, 0.22, 0.36], fov: 24 },
+  { t: 4.6, p: [-0.58, 0.50, 0.60], a: [-0.22, 0.56, 0.38], fov: 24 },
+  { t: 5.25, p: [-0.28, 0.95, 0.78], a: [-0.04, 0.68, 0.16], fov: 26 },
+  { t: 6.4, p: [0.30, 1.35, 2.05], a: [0.0, 0.70, 0.0], fov: 32 },
+  { t: 8.0, p: [0.68, 1.16, 2.88], a: [0.0, 0.64, 0.0], fov: 30 },
+  { t: 10.0, p: [0.67, 1.15, 2.84], a: [0.0, 0.64, 0.0], fov: 30 },
+];
+const camT = Track(CK.map((k) => ({ t: k.t, v: [...k.p, ...k.a, k.fov] })), { easeIn: false, easeOut: true });
+function camAt(t) {
+  if (DBG) { const v = DBG.split(',').map(Number); return { p: v.slice(0, 3), a: v.slice(3, 6), fov: v[6] || 30 }; }
+  const v = camT(t), key = { p: v.slice(0, 3), a: v.slice(3, 6), fov: v[6] };
+  // the first perimeter: the lens rides along with the nozzle (a smoothed follow), then hands over to the keyed move
+  const w = E.inOutSine(clamp((t - 1.15) / 0.9));
+  if (w >= 1) return key;
+  let n = [0, 0, 0], ws = 0;
+  for (let k = -6; k <= 6; k++) { const tt = clamp(t + k * 0.03, 0, 1.5), g = Math.exp(-(k * k) / 14); const q = printAt(tt).N; n = n.map((x, i) => x + q[i] * g); ws += g; }
+  n = n.map((x) => x / ws);
+  const ang = Math.atan2(n[2], n[0]) + 0.55;                     // a little ahead of the nozzle, outside the outline
+  const fol = { p: [n[0] + Math.cos(ang) * 0.48, 0.085, n[2] + Math.sin(ang) * 0.48], a: [n[0], 0.02, n[2]], fov: 30 };
+  return { p: fol.p.map((x, i) => lerp(x, key.p[i], w)), a: fol.a.map((x, i) => lerp(x, key.a[i], w)), fov: lerp(fol.fov, key.fov, w) };
+}
+
+const cues = [{ t: 0.0, sfx: 'stepper_run', gain: 0.7 }, { t: 4.0, sfx: 'layer_rise', gain: 0.6 }, { t: 8.0, sfx: 'print_done', gain: 0.9 }];
+for (let k = 3; k <= 15; k++) cues.push({ t: k * 0.5, sfx: 'timelapse_tick', gain: k === 3 ? 0.7 : 0.45 });   // the time-lapse shutter, one frame per beat
+
+Reel.scene({
+  duration: 10, fps: 30,
+  cues,
+  render(t) {
+    const cam = camAt(t);
+    const pr = printAt(t);
+    const tanF = Math.tan(cam.fov * Math.PI / 360);
+    const fd = Math.hypot(cam.a[0] - cam.p[0], cam.a[1] - cam.p[1], cam.a[2] - cam.p[2]);
+    rm.set('uRo', cam.p).set('uTa', cam.a).set('uTanF', tanF).set('uTm', t)
+      .set('uN', pr.N).set('uG', pr.G).set('uH', pr.hgt).set('uTh0', TH0).set('uProg', pr.prog).set('uLed', 1);
+    const Ra = fd < 0.8 ? 0.014 : lerp(0.03, 0.075, clamp((fd - 0.8) / 1.6));      // a fast lens: the bench melts into bokeh
+    rm.render(t, { focus: fd, aperture: Reel.Q.get('nodof') ? 0 : Ra * 342 / tanF, maxCoc: 30, expo: 1.2 });
+  },
+});
+</script></body></html>

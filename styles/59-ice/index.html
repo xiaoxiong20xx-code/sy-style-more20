@@ -1,0 +1,550 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>59 冰雕 · Ice Carving</title>
+<script src="../../lib/core.js"></script><script src="../../lib/track.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 59 冰雕 · ICE CARVING =====
+   Real world: a night event hall, a block of clear ice on a wet black stone floor, a carver's long flat chisel.
+   The swan is roughed out; on every beat the chisel shaves a chunk off the rough shell — chips and snow spray — and the
+   smooth, frosty swan comes out from wing to beak. On 4.0 the LED in the plinth comes on: light climbs through the
+   ice, catches every bubble and crack, the frosted cuts glow, the edges split into rainbow. The camera circles low;
+   on 8.0 a single drop of melt water lets go of the beak.
+   SDF swan (ellipsoids, S-neck of round cones, fan wings with feather grooves, plinth); the rough shell is cut into
+   Worley chunks that vanish on the strike nearest to them; ice traced like glass (IOR 1.31, multiple interfaces) with
+   in-ice scattering from bubbles, frosted surfaces, per-channel IOR at the exit for dispersion, a wet mirror floor. */
+const { E, clamp, inv, lerp } = Reel;
+const stage = Reel.makeStage('#020306');
+Reel.ownJitter = true;
+const C = Reel.cfg({});
+
+const STR = [   // strikes: time, contact point, chisel direction (blade -> handle; from camera-right, along the surface)
+  { t: 0.5, p: [-0.1, 0.98, 0.36], d: [0.92, 0.32, 0.2] },
+  { t: 1.0, p: [-0.3, 0.86, 0.38], d: [0.9, 0.28, 0.25] },
+  { t: 1.5, p: [0.5, 0.66, 0.2], d: [0.9, 0.2, 0.35] },
+  { t: 2.0, p: [0.62, 0.98, 0.1], d: [0.95, 0.15, 0.25] },
+  { t: 2.5, p: [0.24, 1.27, 0.1], d: [0.9, 0.3, 0.3] },
+  { t: 3.0, p: [0.45, 1.6, 0.1], d: [0.8, 0.5, 0.3] },
+  { t: 3.5, p: [0.63, 1.5, 0.05], d: [0.9, 0.3, 0.3] },
+];
+const NCH = 40;
+// 光色旋钮：底座 LED 灯（4.0 秒亮起）的颜色。[1, 1, 1] = 原片。着色器里的 LIGHT_COL 和飘雪的 LED 部分都读这一处。
+const LIGHT_COL = [1, 1, 1];
+
+const SWAN_GLSL = `
+float sdRoundCone(vec3 p, vec3 a, vec3 b, float r1, float r2){
+  vec3 ba = b - a; float l2 = dot(ba, ba); float rr = r1 - r2; float a2 = l2 - rr * rr; float il2 = 1. / l2;
+  vec3 pa = p - a; float y = dot(pa, ba); float z = y - l2; vec3 xv = pa * l2 - ba * y; float x2 = dot(xv, xv);
+  float y2 = y * y * l2, z2 = z * z * l2; float k = sign(rr) * rr * rr * x2;
+  if (sign(z) * a2 * z2 > k) return sqrt(x2 + z2) * il2 - r2;
+  if (sign(y) * a2 * y2 < k) return sqrt(x2 + y2) * il2 - r1;
+  return (sqrt(x2 * a2 * il2) + y * rr) * il2 - r1;
+}
+vec3 cub(vec3 a, vec3 b, vec3 c, vec3 d, float t){ float s = 1. - t; return s * s * s * a + 3. * s * s * t * b + 3. * s * t * t * c + t * t * t * d; }
+float wing(vec3 p, float s){
+  vec3 O = vec3(.04, .82, s * .21);
+  vec3 U = normalize(vec3(-1., .85, s * .2));
+  vec3 V = normalize(cross(vec3(0., 0., s), U)); V *= sign(V.y + 1e-4) * -1.;   // points up-back
+  vec3 W = cross(U, V);
+  vec3 q = p - O; vec3 l = vec3(dot(q, U), dot(q, V), dot(q, W) * s);
+  float r = length(l.xy), a = atan(l.y, l.x);
+  float R = .68 * (1. - .28 * smoothstep(-.6, .7, a)) + .04 * abs(cos(a * 11.)) * smoothstep(.3, .5, r / .68);
+  float d2 = max(r - R, max(-.65 - a, a - .75) * r);
+  // thick at the shoulder, thinning out; three terraces of feathers with scalloped edges
+  float rn = r / .68;
+  float th = .085 * pow(max(1. - rn, 0.), .55) + .02;
+  for (int k = 0; k < 3; k++){
+    float Rk = (.3 + .2 * float(k)) * .68 + .022 * abs(cos(a * (7. + 3. * float(k))));
+    th -= .012 * smoothstep(Rk - .006, Rk + .006, r);
+  }
+  float z = l.z - .1 * r * r + .03 * sin(a * 2.);
+  // the outer face is rounded like a feathered back, the inner face flatter
+  float tz = z > 0. ? th * (1. - .35 * pow(abs(fract(a * 5.5 + .25) - .5) * 2., 2.) * step(.55, rn)) : th * .7;
+  vec2 w = vec2(d2, abs(z) - tz);
+  float d = min(max(w.x, w.y), 0.) + length(max(w, 0.));
+  // V-cut grooves between the primaries, deeper toward the tips
+  float g = abs(fract(a * 5.5 + .25) - .5);
+  d += .012 * smoothstep(.08, .0, g) * smoothstep(.45, .7, rn) * step(0., z);
+  return d * .8;
+}
+float sdSwan(vec3 p){
+  float d = sdEllipsoid(p - vec3(-.02, .64, 0.), vec3(.56, .3, .34));
+  d = smin(d, sdEllipsoid(p - vec3(.3, .72, 0.), vec3(.26, .25, .26)), .14);
+  d = smin(d, sdEllipsoid(rotZ(.55) * (p - vec3(-.52, .8, 0.)), vec3(.2, .06, .13)), .12);
+  // the neck
+  vec3 P0 = vec3(.32, .74, 0.), P1 = vec3(.66, .96, 0.), P2 = vec3(.1, 1.3, 0.), P3 = vec3(.36, 1.5, 0.);
+  vec3 pr = P0; float rp = .155;
+  if (length(p - vec3(.35, 1.1, 0.)) < .65) {
+    for (int i = 1; i <= 12; i++){ float t = float(i) / 12.; vec3 c = cub(P0, P1, P2, P3, t); float r = mix(.155, .075, pow(t, .75)); d = smin(d, sdRoundCone(p, pr, c, rp, r), .05); pr = c; rp = r; }
+    d = smin(d, sdEllipsoid(rotZ(-.2) * (p - vec3(.43, 1.56, 0.)), vec3(.13, .095, .09)), .05);
+    d = smin(d, sdRoundCone(p, vec3(.5, 1.53, 0.), vec3(.69, 1.47, 0.), .042, .009), .02);
+  }
+  d = smin(d, wing(p, 1.), .05);
+  d = smin(d, wing(p, -1.), .05);
+  // the plinth
+  d = smin(d, sdRoundBox(p - vec3(0., .2, 0.), vec3(.66, .2, .44), .025), .06);
+  return d;
+}
+`;
+const rm = Reel.RM(stage, {
+  bloom: 0.6, th: 1.0, expo: 1.0, vig: 0.45, grain: 0.03, ca: 0.5, contrast: 1.05, sat: 1.0, bands: 6,
+  lift: [0.003, 0.004, 0.007],
+  uniforms: `
+uniform vec3 uRo, uTa; uniform float uF, uT;
+uniform vec4 uStr[7];          // strike point, time
+uniform sampler2D uCell;       // each chunk's distance to the swan (baked once)
+uniform float uMargin, uCarveK; // how far from the swan chunks may still stand; 1 while carving, 0 after
+uniform vec4 uCh[${NCH}];        // chip position, size (0 = none)
+uniform vec3 uChiT, uChiD; uniform float uChiOn;   // chisel blade tip, direction
+uniform vec4 uGlow;            // inner light level, front height, frost, work light
+uniform vec4 uDrop;            // drop centre, radius
+uniform float uDropS;          // drop stretch
+uniform vec4 uFl; uniform vec3 uFlR;   // the snowflake that lands on the beak: centre + size, rotation
+uniform vec4 uMo[160]; uniform vec4 uMoC[160]; uniform int uNM; uniform float uFocus;   // falling snow: screen xy, radius, intensity / colour, distance`,
+  scene: `
+${SWAN_GLSL}
+float chunkTime(vec3 s){
+  float bt = 9., bd = 1e3;
+  for (int k = 0; k < 7; k++){ float d = length(s - uStr[k].xyz); if (d < bd) { bd = d; bt = uStr[k].w; } }
+  return bt;
+}
+float cellDist(vec3 g){
+  ivec3 i = ivec3(g) + ivec3(7, 2, 5);
+  if (i.x < 0 || i.y < 0 || i.z < 0 || i.x > 13 || i.y > 15 || i.z > 9) return 9.;
+  return texelFetch(uCell, ivec2(i.x + i.z * 14, i.y), 0).r;
+}
+bool presentCell(vec3 g, vec3 s){
+  float ds = cellDist(g);
+  if (ds > uMargin) return false;
+
+  return true;
+}
+float sdIce(vec3 p){
+  float d = sdSwan(p);
+  if (uT < 3.67) {
+    float rough = sdRoundBox(p - vec3(0., .84, 0.), vec3(.74, .84, .5), .006);
+    if (rough < d) {
+      vec3 c = floor(p / .13); float d1 = 1e3, dP = 1e3, dR = 1e3; float pres1 = 1.;
+      for (int i = -1; i <= 1; i++) for (int j = -1; j <= 1; j++) for (int k = -1; k <= 1; k++){
+        vec3 g = c + vec3(i, j, k); vec3 s = (g + .15 + .7 * hash33(g)) * .13;
+        float dd = length(p - s);
+        bool pr = presentCell(g, s);
+        if (pr) dP = min(dP, dd); else dR = min(dR, dd);
+        if (dd < d1) { d1 = dd; pres1 = pr ? 1. : 0.; }
+      }
+      float cell = pres1 > .5 ? -(min(dR, .5) - d1) * .5 : (min(dP, .5) - d1) * .5;
+      d = min(d, max(rough, cell));
+    }
+  }
+  // the drop of melt water
+  if (uDrop.w > .001) {
+    vec3 q = p - uDrop.xyz; q.y /= uDropS;
+    d = min(d, (length(q) - uDrop.w) * min(uDropS, 1.));
+  }
+  return d;
+}
+// chips and the chisel are opaque-ish small things
+float sdChips(vec3 p){
+  float d = 1e3;
+  for (int i = 0; i < ${NCH}; i++){
+    vec4 c = uCh[i]; if (c.w <= 0.) continue;
+    vec3 q = p - c.xyz; if (dot(q, q) > .04) { d = min(d, length(q) - c.w * 1.5); continue; }
+    vec3 h = hash33(vec3(float(i), c.w * 97., 1.));
+    q = rotX(h.x * 6.28 + uT * 7.) * rotY(h.y * 6.28 + uT * 5.) * q;
+    d = min(d, sdRoundBox(q, vec3(c.w, c.w * .55, c.w * .3), c.w * .15));
+  }
+  return d;
+}
+float sdFlake(vec3 p){
+  if (uFl.w <= 0.) return 1e3;
+  vec3 q = p - uFl.xyz;
+  if (dot(q, q) > uFl.w * uFl.w * 9.) return length(q) - uFl.w * 2.5;
+  q = rotZ(uFlR.x) * rotX(uFlR.y) * rotY(uFlR.z) * q / uFl.w;      // flake lies in its local xz plane, radius 1
+  float a = atan(q.z, q.x), r = length(q.xz);
+  a = mod(a + .5236, 1.0472) - .5236;
+  vec2 s = vec2(cos(a), abs(sin(a))) * r;
+  float d = length(s - vec2(clamp(s.x, 0., 1.), 0.)) - .055 * (1. - .5 * clamp(s.x, 0., 1.));
+  for (int k = 0; k < 3; k++){
+    float b0 = .32 + .2 * float(k), bl = .34 - .09 * float(k);
+    vec2 a0 = vec2(b0, 0.), dir = vec2(.5, .866);
+    float h = clamp(dot(s - a0, dir), 0., bl);
+    d = min(d, length(s - a0 - dir * h) - .035);
+  }
+  d = min(d, r - .16);                                              // the hexagonal plate in the middle
+  return max(d, abs(q.y) - .025) * uFl.w;
+}
+float sdChisel(vec3 p){
+  if (uChiOn < .5) return 1e3;
+  vec3 D = normalize(uChiD);
+  vec3 S = normalize(cross(D, vec3(0., 1., 0.)));
+  vec3 Uu = cross(S, D);
+  vec3 q = p - uChiT; vec3 l = vec3(dot(q, S), dot(q, Uu), dot(q, D));
+  // blade: wide, thin, bevelled at the edge
+  float bz = clamp(l.z / .34, 0., 1.);
+  float blade = sdRoundBox(l - vec3(0., 0., .17), vec3(.004 + .01 * smoothstep(0., .25, bz), .05 - .012 * bz, .17), .002);
+  float sock = sdCapsule(l, vec3(0., 0., .33), vec3(0., 0., .47), .021 + .004 * clamp((l.z - .33) / .14, 0., 1.));
+  float handle = sdCapsule(l, vec3(0., 0., .47), vec3(0., 0., 1.55), .03);
+  return min(min(blade, sock), handle);
+}
+const vec3 LK = normalize(vec3(-.35, .88, .3));   // the open dusk sky above
+const vec3 LIGHT_COL = vec3(${LIGHT_COL.join(', ')});   // plinth LED colour, set in JS
+// --- winter dusk: blue-hour sky, a warm afterglow low on one side, two rows of snowy pines, lanterns in the snow ---
+float pines(float az, float el, float seed, float sc, out float snowM){
+  float x = az * sc; float c = floor(x);
+  float f = fract(x) - .5 + .25 * (hash11(c * 2.3 + seed) - .5);
+  float h = (.045 + .1 * hash11(c + seed)) * step(.2, hash11(c * 1.7 + seed));
+  float w = .5 * (.3 + .22 * hash11(c * 3.1 + seed));
+  float y = el / max(h, 1e-4);
+  float jag = vnoise2(vec2(y * 13., c * 3.1 + seed)) * .55 + vnoise2(vec2(y * 41., c * 7.3)) * .3;
+  float hw = w * pow(max(1. - y, 0.), .85) * (.62 + .6 * jag);
+  float m = step(0., y) * step(y, 1.03) * smoothstep(hw + .02, hw - .02, abs(f));
+  snowM = m * smoothstep(.5, .78, vnoise2(vec2(f * 18. + c, y * 26.)) + .25 * (1. - abs(f) / max(hw, 1e-3)) - .15);
+  return m;
+}
+vec3 bg(vec3 rd){
+  float el = asin(clamp(rd.y, -1., 1.)), az = atan(rd.x, -rd.z);
+  // blue-hour sky, a warm afterglow low in the west
+  vec3 c = mix(vec3(.075, .095, .2), vec3(.008, .016, .055), smoothstep(-.02, .55, el));
+  c += vec3(.5, .22, .12) * exp(-max(el, 0.) * 11.) * exp(-pow(az + .9, 2.) * 1.1) * .55;
+  c *= .6 + .4 * uGlow.w;
+  // far row of pines (hazy), near row (darker), snow lying in patches on the branches
+  float sn; float m1 = pines(az, el + .004, 3., 9., sn);
+  c = mix(c, mix(vec3(.032, .045, .085), vec3(.11, .13, .2), sn), m1 * .9);
+  float sn2; float m2 = pines(az + .3, el + .014, 7., 5.5, sn2);
+  c = mix(c, mix(vec3(.012, .018, .032), vec3(.16, .19, .28), sn2) * (.6 + .4 * uGlow.w), m2);
+  // the snowfield to the horizon
+  if (el < -.004) c = mix(vec3(.07, .085, .16), vec3(.12, .14, .24), smoothstep(-.004, -.2, el)) * (.65 + .35 * uGlow.w);
+  // lanterns and ice lanterns standing in the snow at two distances: warm and cold points with halos
+  for (int L = 0; L < 2; L++) {
+    float sc = L == 0 ? 15. : 6.;
+    vec2 q = vec2(az * sc + float(L) * 2.3, (el + (L == 0 ? .006 : .03)) * sc * 4.);
+    vec2 cc = vec2(floor(q.x), float(L)); float h = hash12(cc + 1.);
+    if (h > (L == 0 ? .4 : .62)) {
+      vec2 o = vec2(fract(q.x) - .25 - .5 * hash12(cc + 3.), q.y);
+      float ice = step(.8, hash12(cc + 9.));
+      vec3 lc = mix(vec3(1., .58, .25), vec3(.55, .78, 1.), ice);
+      float core = smoothstep(L == 0 ? .14 : .2, .02, length(o * vec2(1., 1.3)));
+      c += lc * (core * (L == 0 ? 1.4 : 2.2) + smoothstep(.45, .0, length(o)) * (L == 0 ? .1 : .16)) * (.6 + .4 * hash12(cc + 11.));
+    }
+  }
+  return c;
+}
+float groundH(vec2 xz){
+  float h = .05 * fbm2(xz * .55) + .015 * fbm2(xz * 3.);
+  // the carver's boot prints coming in from front-right
+  for (int i = 0; i < 12; i++){
+    float fi = float(i);
+    vec2 c = vec2(1.15 + fi * .22, .95 + fi * .3) + vec2((mod(fi, 2.) - .5) * .14, 0.);
+    vec2 d = xz - c; d = mat2(.8, -.6, .6, .8) * d;
+    h -= .035 * smoothstep(1., .55, length(d / vec2(.065, .14)));
+  }
+  return h;
+}
+float snowSD(vec3 q){
+  float g = q.y + .32 - groundH(q.xz);
+  float pl = sdRoundBox(q - vec3(0., -.17, 0.), vec3(.98, .16, .72), .1) - .012 * fbm(q * 6.);   // the packed-snow stand
+  return smin(g, pl, .12);
+}
+vec3 render(vec2 fc){
+  vec2 uv = (fc - .5 * uRes) / uRes.y * 2.;
+  mat3 cm = camMat(uRo, uTa, 0.);
+  vec3 rd = normalize(cm * vec3(uv, uF)), p = uRo;
+  vec3 acc = vec3(0.), thr = vec3(1.);
+  bool inI = false; float firstD = -1.;
+  const vec3 ABS = vec3(.13, .03, .012);
+  float jit = hash12(fc + fract(uT * 7.31) * 113.);
+  for (int b = 0; b < 8; b++){
+    float tt = 0.; bool hit = false; int what = 0;
+    for (int i = 0; i < 220; i++){
+      vec3 q = p + rd * tt;
+      float di = sdIce(q);
+      if (inI) {
+        float dd = -di;
+        if (dd < .0006) { hit = true; what = 1; break; }
+        float st = clamp(dd * .7, .004, .03) * (.8 + .4 * jit);
+        // light inside the ice: climbs from the plinth, scattered by bubbles and the cloudy heart
+        float bub = smoothstep(.62, .9, vnoise(q * 38.)) * .35 + smoothstep(.55, .8, fbm(q * 9.)) * smoothstep(.25, .0, abs(q.z)) * .5;
+        // tiny seed bubbles: bright specks
+        vec3 bc = floor(q * 30.); vec3 bo = (bc + .2 + .6 * hash33(bc)) / 30.;
+        float sb = step(.955, hash13(bc + 7.)) * smoothstep(.0045, .001, length(q - bo));
+        acc += thr * vec3(.8, .9, 1.) * sb * (.3 + 1.6 * uGlow.x * LIGHT_COL) * .5 * (1. - .95 * uCarveK);
+        // a crack plane through the body: a sheet that catches the light
+        float cp = dot(q - vec3(-.05, .7, .02), normalize(vec3(.5, .35, .8)));
+        float cm = smoothstep(.16, .1, length((q - vec3(-.05, .7, .02)) * vec3(1., 1.6, 1.)) + .08 * fbm(q * 8.));
+        cm *= .35 + .65 * smoothstep(.45, .75, fbm(q * 22.));      // a cracked sheet is patchy, not a disc
+        if (abs(cp) < st * .6 && cm > .01) { acc += thr * vec3(.75, .88, 1.) * (.35 * uGlow.w + .45 * uGlow.x * LIGHT_COL) * cm * .3; thr *= 1. - .15 * cm; }
+        float lf = uGlow.x * smoothstep(uGlow.y + .1, uGlow.y - .15, q.y) * (.7 + 1.6 * exp(-q.y / .55));
+        acc += thr * LIGHT_COL * vec3(.62, .82, 1.) * lf * (.1 + bub * 1.8) * st;
+        acc += thr * vec3(.5, .6, .7) * bub * .02 * uGlow.w * st;
+        if (uCarveK > .001) {
+          float trail = smoothstep(.74, .9, vnoise(q * vec3(30., 7., 30.))) * (.4 + .6 * vnoise(q * 60.));
+          float cloud = smoothstep(.42, .75, fbm(q * 4. + 3.)) * smoothstep(.5, .12, length((q.xz - vec2(0., .02)) * vec2(1., 1.4)));
+          acc += thr * vec3(.64, .72, .86) * (trail * 1.3 + cloud * 1.1) * st * (.35 + .65 * uGlow.w) * uCarveK;
+          acc += thr * vec3(.5, .58, .72) * st * .55 * uGlow.w * uCarveK;
+          thr *= exp(-(vec3(cloud * 2.2 + trail * 1.2 + .35) + ABS * 1.8) * st * uCarveK);
+        }
+        thr *= exp(-ABS * st);
+        tt += st;
+      } else {
+        float d = min(di, min(min(sdChips(q), sdChisel(q)), sdFlake(q)));
+        float fl = tt < 24. ? snowSD(q) : 1e3; if (fl < d) d = fl;
+        if (d < .0006) { hit = true; what = (fl <= d + .0001 && fl < di) ? 3 : di <= d + .0001 ? 1 : 2; break; }
+        tt += d * .85; if (tt > 25.) break;
+      }
+    }
+    if (firstD < 0.) firstD = hit ? tt : 25.;
+    if (!hit) { acc += thr * bg(rd); break; }
+    p += rd * tt;
+    if (what == 3) {        // snow: soft, bright, glittering; lit by the dusk sky, the far lanterns and, later, the plinth
+      vec2 e = vec2(.004, 0.);
+      vec3 n = normalize(vec3(snowSD(p + e.xyy) - snowSD(p - e.xyy), snowSD(p + e.yxy) - snowSD(p - e.yxy), snowSD(p + e.yyx) - snowSD(p - e.yyx)));
+      float ao = clamp(.55 + .45 * smoothstep(-.06, .02, groundH(p.xz) - .02), 0., 1.);
+      float r = length(p.xz);
+      vec3 L = vec3(.15, .2, .38) * (.45 + .55 * max(n.y, 0.)) * (.55 + .45 * uGlow.w)
+             + vec3(1., .58, .28) * .09 * max(dot(n, normalize(vec3(-.6, .2, -.8))), 0.)
+             + LIGHT_COL * vec3(.55, .78, 1.) * uGlow.x * 1.4 * exp(-max(r - .55, 0.) * 2.2) * max(n.y, .2);
+      vec3 c = vec3(.9, .93, 1.) * L * ao;
+      // glitter: crystals catching the light
+      vec3 gc = floor(p * 260.);
+      float gl = step(.985, hash13(gc)) * pow(max(dot(reflect(rd, n), normalize(vec3(-.3, .5, -.8) + hash33(gc) * .6 - .3)), 0.), 30.);
+      c += vec3(.9, .95, 1.) * gl * (1.5 + 3. * uGlow.x * LIGHT_COL);
+      // the chips that fell round the stand
+      c += vec3(.7, .85, 1.) * step(.992, hash13(floor(p * 90.))) * smoothstep(1.4, .9, r) * (.4 + 1.5 * uGlow.x * LIGHT_COL);
+      acc += thr * mix(c, bg(rd), smoothstep(6., 18., length(p - uRo)));
+      break;
+    }
+    if (what == 2) {        // chips / chisel
+      vec2 e = vec2(.0007, 0.);
+      #define SO(x) min(min(sdChips(x), sdChisel(x)), sdFlake(x))
+      vec3 n = normalize(vec3(SO(p + e.xyy) - SO(p - e.xyy), SO(p + e.yxy) - SO(p - e.yxy), SO(p + e.yyx) - SO(p - e.yyx)));
+      if (sdFlake(p) < min(sdChips(p), sdChisel(p))) {      // the snowflake: white crystal, sparkling
+        float tw = pow(max(dot(reflect(rd, n), normalize(vec3(-.2, .8, .5))), 0.), 40.);
+        acc += thr * (vec3(.85, .9, 1.) * (.6 + .4 * abs(n.y)) * (.7 + .3 * uGlow.w) + LIGHT_COL * vec3(.7, .88, 1.) * uGlow.x * 1.9 + vec3(1., .95, .9) * tw * 5.);
+        break;
+      }
+      bool isChisel = sdChisel(p) < sdChips(p);
+      vec3 V = -rd, R = reflect(rd, n);
+      if (isChisel) {
+        float L = dot(p - uChiT, normalize(uChiD));
+        bool wood = L > .47;
+        vec3 grainP = p - uChiT;
+        float gr = vnoise2(vec2(L * 6., dot(grainP, normalize(cross(normalize(uChiD), vec3(0., 1., 0.)))) * 260.));
+        vec3 alb = wood ? mix(vec3(.2, .13, .075), vec3(.32, .22, .13), gr) : vec3(.55, .57, .6);
+        float F = wood ? .04 : .3;
+        vec3 spec = (wood ? bg(R) : mix(bg(R), bg(normalize(n + vec3(0., 1., 0.))), .75)) * F * (wood ? 1. : 1.6) + vec3(.9, .95, 1.) * pow(max(dot(R, LK), 0.), wood ? 20. : 200.) * (wood ? .3 : 9.) * uGlow.w;
+        acc += thr * (alb * (max(dot(n, LK), 0.) * 1.1 + .1) * uGlow.w * (wood ? 1. : .25) + spec);
+      } else {
+        acc += thr * (vec3(.75, .85, .95) * (max(dot(n, LK), 0.) * .9 + .15) * uGlow.w + vec3(.9, .95, 1.) * pow(max(dot(R, LK), 0.), 40.) * 4. * uGlow.w);
+      }
+      break;
+    }
+    vec2 e = vec2(.0006, 0.);
+    vec3 n = normalize(vec3(sdIce(p + e.xyy) - sdIce(p - e.xyy), sdIce(p + e.yxy) - sdIce(p - e.yxy), sdIce(p + e.yyx) - sdIce(p - e.yyx)));
+    // frost: fresh chisel cuts (the swan's surface, the facets left by a removed chunk) are white and rough;
+    // the original block faces are clear and wet
+    float dsw = sdSwan(p);
+    float fresh = abs(dsw) < .004 ? 1. : 0.;
+    if (uT < 3.67 && fresh < .5) { float rough = sdRoundBox(p - vec3(0., .84, 0.), vec3(.74, .84, .5), .006); fresh = abs(rough) < .004 ? 0. : 1.; }
+    if (uDrop.w > .001 && length((p - uDrop.xyz) / vec3(1., uDropS, 1.)) < uDrop.w * 1.3) fresh = 0.;
+    float fr = (uGlow.z + .3 * uCarveK) * fresh * (.55 + .45 * fbm(p * 14.));
+    if (fresh < .5) fr = uCarveK * (.2 + .15 * clamp((.95 - uMargin) / .8, 0., 1.)) * (.6 + .4 * fbm(p * 5.));      // the raw block's sawn faces carry a thin frost bloom
+    vec3 nn = inI ? -n : n;
+    vec3 nf = normalize(nn + (vec3(vnoise(p * 160.), vnoise(p * 160. + 3.), vnoise(p * 160. + 7.)) - .5) * .25 * fr * (1. - .8 * uCarveK));
+    // the sawn faces of the raw block are not glass: shallow saw ripples bend what is seen through them
+    if (fresh < .5 && uCarveK > .001) nf = normalize(nf + (vec3(vnoise(p * 6.), vnoise(p * 6. + 5.), vnoise(p * 6. + 9.)) - .5) * .14 * uCarveK
+                                                + (vec3(vnoise(p * 34.), vnoise(p * 34. + 2.), vnoise(p * 34. + 4.)) - .5) * .05 * uCarveK);
+    float cosi = clamp(-dot(rd, nf), 0., 1.);
+    float F = schlick(cosi, .02);
+    if (!inI) {
+      vec3 R = reflect(rd, nf);
+      float mir = 1. - .9 * clamp(fr * 2.2, 0., 1.) * uCarveK;           // frost breaks the mirror
+      acc += thr * F * mir * (mix(bg(R), bg(normalize(n + vec3(0., .6, 0.))), .5 * uCarveK) + vec3(.8, .9, 1.) * 2.5 * uGlow.w * smoothstep(.96, .995, dot(R, LK)));
+      acc += thr * fr * vec3(.66, .73, .86) * (.35 + .4 * max(n.y, 0.)) * uGlow.w * 1.0 * uCarveK;   // soft cold-white scatter of the cut
+      if (uDrop.w > .001 && length((p - uDrop.xyz) / vec3(1., uDropS, 1.)) < uDrop.w * 1.3)
+        acc += thr * (LIGHT_COL * vec3(.75, .9, 1.) * (.9 * uGlow.x) * (.4 + .6 * pow(1. - cosi, 2.)) + vec3(1.) * 8. * pow(max(dot(R, normalize(vec3(-.3, .9, .4))), 0.), 300.));
+      // the frost scatters the work light and, once it is on, the inner light
+      float lf = uGlow.x * smoothstep(uGlow.y + .1, uGlow.y - .15, p.y) * (.7 + 1.6 * exp(-p.y / .55));
+      acc += thr * fr * (vec3(.5, .58, .75) * (max(dot(n, LK), 0.) * .8 + .3) * uGlow.w * .5 + LIGHT_COL * vec3(.55, .78, 1.) * lf * .5);
+      thr *= (1. - F) * (1. - min(.72 * fr + .18 * uCarveK * min(fr * 2.5, 1.), .82));
+    } else {
+      thr *= 1. - F;
+    }
+    vec3 tr = refract(rd, nf, inI ? 1.31 : 1. / 1.31);
+    if (dot(tr, tr) < .01) { rd = reflect(rd, nf); p += nf * .002; thr *= 1. - .45 * uCarveK; continue; }
+    if (inI) {
+      // leaving the ice: split the colours a little (dispersion at the edges)
+      vec3 tR = refract(rd, nf, 1.302), tB = refract(rd, nf, 1.322);
+      if (dot(tR, tR) > .01 && dot(tB, tB) > .01) {
+        float ex = abs(dot(tr, nf));
+        vec3 disp = vec3(bg(tR).r, 0., bg(tB).b) - vec3(bg(tr).r, 0., bg(tr).b);
+        acc += thr * disp * smoothstep(.55, .05, ex) * (2. + 6. * uGlow.x) * (1. - uCarveK);
+        // the inner light split at grazing exits: rainbow rims
+        acc += thr * LIGHT_COL * uGlow.x * (1. - uCarveK) * smoothstep(.35, .05, ex) * .35 * (.5 + .5 * cos(6.2831 * (vec3(0., .33, .67) + ex * 3. + dot(p, vec3(4.)))));
+      }
+    }
+    rd = tr; inI = !inI; p -= nf * .0025;
+  }
+  float mw = 0.;
+  for (int i = 0; i < 160; i++){
+    if (i >= uNM) break;
+    vec4 m = uMo[i]; float d = length(fc - m.xy);
+    if (d < m.z) { float w = smoothstep(m.z, m.z * .45, d) * (uMoC[i].a < firstD ? 1. : .25); acc += uMoC[i].rgb * m.w * w; mw = max(mw, w); }
+  }
+  gDepth = mw > .05 ? uFocus : firstD;      // flakes already carry their own blur: keep the lens pass off them
+  return acc;
+}`,
+});
+
+/* ---------------- timeline ---------------- */
+const nrm = (a) => { const l = Math.hypot(...a); return a.map((v) => v / l); };
+const CHIPS = [];
+(function () {
+  for (let k = 0; k < STR.length; k++) {
+    const R = Reel.rng(590 + k), S = STR[k];
+    for (let i = 0; i < 16; i++) {
+      const out = nrm([S.d[0] * 0.3 + (R() - 0.5) * 1.6, 0.6 + R() * 1.1, S.d[2] * 0.3 + (R() - 0.5) * 1.4]);
+      const sp = 1.2 + R() * 2.2;
+      CHIPS.push({ t0: S.t + 0.02 + R() * 0.06, p: S.p, v: out.map((v) => v * sp), s: 0.006 + 0.016 * R() * R() });
+    }
+  }
+})();
+const chA = new Float32Array(NCH * 4), stA = new Float32Array(28);
+STR.forEach((s, k) => stA.set([...s.p, s.t], k * 4));
+function chips(t) {
+  chA.fill(0); let n = 0;
+  for (const c of CHIPS) {
+    const a = t - c.t0; if (a < 0 || a > 1.1 || n >= NCH) continue;
+    const pos = [c.p[0] + c.v[0] * a, c.p[1] + c.v[1] * a - 4.9 * 1.9 * a * a, c.p[2] + c.v[2] * a];
+    if (pos[1] < c.s) continue;
+    chA.set([...pos, c.s * 0.65], n * 4); n++;
+  }
+}
+// the chisel: approaches, shaves through the contact on the beat, draws back
+function chisel(t) {
+  let k = STR.findIndex((s, i) => t < s.t + (i === STR.length - 1 ? 0.45 : 0.3));
+  if (k < 0) return { on: 0, T: [0, 0, 0], D: [1, 0, 0] };
+  const S = STR[k], prev = STR[Math.max(0, k - 1)];
+  const D = nrm(S.d);
+  const u = t - S.t;
+  let off;
+  if (u < -0.18) {     // travelling from the last cut
+    const v = k === 0 ? 1 : clamp((t - (prev.t + 0.3)) / (S.t - 0.18 - (prev.t + 0.3))), w = E.inOutSine(v);
+    const A = k === 0 ? S.p.map((x, i) => x + D[i] * 0.5) : prev.p.map((x, i) => x + nrm(prev.d)[i] * 0.22);
+    const B = S.p.map((x, i) => x + D[i] * 0.2);
+    return { on: 1, T: A.map((x, i) => lerp(x, B[i], w)), D: nrm(D.map((x, i) => lerp(nrm(prev.d)[i], x, w))) };
+  }
+  if (u < 0) off = lerp(0.2, 0.0, E.inQuad(inv(-0.18, 0, u)));            // the push
+  else off = lerp(-0.035, 0.22, E.outCubic(inv(0, 0.3, u))) + (k === STR.length - 1 ? 2.6 * E.inCubic(inv(0.1, 0.43, u)) : 0);   // through, then back (out of frame after the last cut)
+  const tang = nrm([-D[2], 0.25, D[0]]);
+  const T = S.p.map((x, i) => x + D[i] * off + tang[i] * (u > 0 ? -0.06 * inv(0, 0.1, u) : 0));
+  return { on: t < 3.95 ? 1 : 0, T, D };
+}
+// falling snow: flakes in a box round the stand, falling and swaying, projected each frame (deterministic)
+const FLK = Array.from({ length: 420 }, (_, i) => { const r = Reel.rng(5900 + i); return { x: (r() - 0.5) * 5.5, y: r() * 3.2, z: (r() - 0.5) * 5.5, v: 0.22 + r() * 0.2, ph: r() * 6.28, sw: 0.04 + r() * 0.08, s: 0.005 + r() * 0.006, b: 0.5 + r() * 0.5 }; });
+const moA = new Float32Array(160 * 4), moC = new Float32Array(160 * 4);
+function snow(t, ro, ta, f, glow, sky) {
+  moA.fill(0); moC.fill(0);
+  const W = 1920 * Reel.RS, H = 1080 * Reel.RS;
+  const w = [ta[0] - ro[0], ta[1] - ro[1], ta[2] - ro[2]], wl = Math.hypot(...w); w.forEach((v, i) => (w[i] = v / wl));
+  const u = [w[2] * 0 - 0 * w[1], 0, 0]; { const c = [w[1] * 0 - w[2] * 1, w[2] * 0 - w[0] * 0, w[0] * 1 - w[1] * 0]; const l = Math.hypot(...c); u[0] = c[0] / l; u[1] = c[1] / l; u[2] = c[2] / l; }
+  const v = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+  const focus = wl;
+  let n = 0;
+  for (const k of FLK) {
+    if (n >= 160) break;
+    const y = ((k.y - k.v * t) % 3.2 + 3.2) % 3.2 - 0.35;
+    const X = [k.x + k.sw * Math.sin(t * 1.3 + k.ph), y, k.z + k.sw * Math.cos(t * 1.1 + k.ph * 1.7)];
+    const d = [X[0] - ro[0], X[1] - ro[1], X[2] - ro[2]];
+    const z = d[0] * w[0] + d[1] * w[1] + d[2] * w[2]; if (z < 0.25) continue;
+    const sx = (d[0] * u[0] + d[1] * u[1] + d[2] * u[2]) / z * f, sy = (d[0] * v[0] + d[1] * v[1] + d[2] * v[2]) / z * f;
+    const px = sx * H / 2 + W / 2, py = sy * H / 2 + H / 2;
+    if (px < -40 || px > W + 40 || py < -40 || py > H + 40) continue;
+    const coc = Math.abs(1 / focus - 1 / z) * 16 * W / 1216 * 0.5;
+    const rp = k.s / z * f * H / 2;
+    const rad = Math.max(1.4 * Reel.RS, Math.min(30 * Reel.RS, rp + coc));
+    const dg = Math.hypot(X[0] - 0.1, X[1] - 0.8, X[2]);
+    const I = k.b * Math.pow(Math.max(rp, 1.4 * Reel.RS) / rad, 1.3) * 1.1;
+    moA.set([px, py, rad, I], n * 4);
+    const lit = 0.22 + 0.18 * sky;
+    const gl = glow * 1.6 * Math.exp(-Math.max(dg - 0.5, 0) / 0.55);
+    moC.set([0.8 * lit + 0.6 * gl * LIGHT_COL[0], 0.86 * lit + 0.8 * gl * LIGHT_COL[1], 1.0 * lit + 1.0 * gl * LIGHT_COL[2], Math.hypot(...d)], n * 4);
+    n++;
+  }
+  return n;
+}
+const CAM = Track([
+  { t: 0.0, v: [0.55, 1.15, 2.1, -0.12, 0.9, 0.25, 2.5] },
+  { t: 1.5, v: [1.0, 1.0, 2.15, 0.2, 0.85, 0.1, 2.4] },
+  { t: 2.6, v: [1.15, 1.35, 2.15, 0.35, 1.15, 0.05, 2.4] },
+  { t: 3.6, v: [1.5, 1.05, 2.9, 0.1, 0.85, 0.0, 2.25] },
+  { t: 5.0, v: [-0.6, 0.55, 3.1, 0.05, 0.85, 0.0, 2.3] },
+  { t: 6.5, v: [0.35, 0.95, 2.75, 0.2, 0.95, 0.0, 2.4] },
+  { t: 7.35, v: [0.88, 1.36, 1.7, 0.5, 1.28, 0.0, 2.7] },
+  { t: 8.0, v: [1.05, 1.5, 1.2, 0.58, 1.38, 0.0, 2.9], stop: true },
+  { t: 10.0, v: [1.048, 1.5, 1.198, 0.58, 1.38, 0.0, 2.902] },
+]);
+
+const glc = rm.canvas.getContext('webgl2');
+const G2 = Reel.GL(rm.canvas);
+let cellT = null;
+function bakeCells() {
+  glc.getExtension('EXT_color_buffer_float');
+  const pr = G2.program(`#version 300 es
+precision highp float; in vec2 uv; out vec4 o;
+` + Reel.RM_COMMON + SWAN_GLSL + `
+void main(){ ivec2 f = ivec2(gl_FragCoord.xy); vec3 g = vec3(float(f.x % 14 - 7), float(f.y - 2), float(f.x / 14 - 5));
+  vec3 s = (g + .15 + .7 * hash33(g)) * .13; o = vec4(sdSwan(s), 0., 0., 1.); }`);
+  cellT = G2.target(140, 16, { float: true });
+  glc.disable(glc.SCISSOR_TEST);
+  pr.use().draw(cellT);
+  glc.bindTexture(glc.TEXTURE_2D, cellT.tex);
+  glc.texParameteri(glc.TEXTURE_2D, glc.TEXTURE_MIN_FILTER, glc.NEAREST); glc.texParameteri(glc.TEXTURE_2D, glc.TEXTURE_MAG_FILTER, glc.NEAREST);
+  if (Reel.Q.has('dbgcell')) { const buf = new Float32Array(140 * 16 * 4); glc.bindFramebuffer(glc.FRAMEBUFFER, cellT.fb); glc.readPixels(0, 0, 140, 16, glc.RGBA, glc.FLOAT, buf); const v = []; for (let i = 0; i < buf.length; i += 4) v.push(buf[i]); v.sort((x, y) => x - y); console.error('CELL', v[0], v[Math.floor(v.length * 0.25)], v[Math.floor(v.length / 2)], v[Math.floor(v.length * 0.75)], v[v.length - 1]); }
+}
+// the block shrinks one layer per strike: outermost chunks first
+const MRG = [0.95, 0.42, 0.28, 0.19, 0.13, 0.08, 0.04, -0.15];
+function margin(t) { let n = 0; STR.forEach((st, i) => { n += i < STR.length - 1 ? clamp((t - (st.t - 0.03)) / 0.42) : Math.pow(clamp((t - (st.t - 0.03)) / 0.19), 1.8); }); const i = Math.min(Math.floor(n), 6); return lerp(MRG[i], MRG[i + 1], n - i); }
+
+Reel.scene({
+  duration: 10, fps: 30,
+  async setup() { bakeCells(); },
+  cues: [
+    ...STR.map((s) => ({ t: s.t, sfx: 'ice_chisel', gain: 0.75 })),
+    { t: 4.0, sfx: 'ice_glow', gain: 0.9 }, { t: 4.5, sfx: 'ice_shimmer', gain: 0.6 },
+    { t: 8.0, sfx: 'flake_chime', gain: 0.75 },
+  ],
+  render(t) {
+    chips(t);
+    const ch = chisel(t);
+    const cv = CAM(t), ro = [cv[0], cv[1], cv[2]], ta = [cv[3], cv[4], cv[5]];
+    const glow = t < 4.0 ? 0 : E.outCubic(clamp((t - 4.0) / 0.25));
+    const front = lerp(-0.2, 2.0, E.inOutSine(inv(4.0, 4.55, t)));
+    const frost = lerp(0.6, 0.38, E.inOutSine(inv(3.6, 6.0, t)));
+    const work = lerp(1.0, 0.35, E.inOutSine(inv(3.85, 4.2, t)));
+    // the drop: gathers at the beak tip, lets go on 8.0
+    const B = [0.69, 1.462, 0];
+    let drop = [0, 0, 0, 0], ds = 1;
+    // a single snowflake drifts down out of the dusk and settles on the beak tip on 8.0
+    let flake = [0, 0, 0, 0], flR = [0, 0, 0];
+    if (t > 6.4) {
+      const LND = [0.636, 1.524, 0.012], u = clamp((t - 6.4) / 1.6), e = 1 - Math.pow(1 - u, 2.2);
+      const S0 = [LND[0] - 0.3, LND[1] + 0.6, LND[2] + 0.22];
+      const sway = (1 - u) * 0.07;
+      flake = [lerp(S0[0], LND[0], e) + sway * Math.sin(t * 5.1), lerp(S0[1], LND[1], e), lerp(S0[2], LND[2], e) + sway * Math.cos(t * 3.7), 0.034];
+      const settle = t < 8.0 ? 0 : Math.exp(-(t - 8.0) * 12) * Math.sin((t - 8.0) * 30) * 0.08;
+      flR = [lerp(0.9 * Math.sin(t * 4.3), -0.25, e) + settle, lerp(0.7 * Math.cos(t * 3.1), -0.95, e), lerp(t * 2.2, 0.3, e)];
+      if (t >= 8.0) { flake = [...LND, 0.034]; flR = [-0.25 + settle, -0.95, 0.3]; }
+    }
+    glc.activeTexture(glc.TEXTURE4); glc.bindTexture(glc.TEXTURE_2D, cellT.tex); glc.activeTexture(glc.TEXTURE0);
+    rm.set('uCell', { __ints: 1, v: 4 }).set('uMargin', margin(t)).set('uCarveK', 1 - Track.easeRange(t, 3.95, 4.5));
+    rm.set('uRo', ro).set('uTa', ta).set('uF', cv[6]).set('uT', t)
+      .set('uStr', stA).set('uCh', chA)
+      .set('uChiT', ch.T).set('uChiD', ch.D).set('uChiOn', ch.on)
+      .set('uGlow', [glow, front, frost, work]).set('uDrop', drop).set('uDropS', ds)
+      .set('uFl', flake).set('uFlR', flR);
+    const nm = snow(t, ro, ta, cv[6], glow, work);
+    rm.set('uMo', moA).set('uMoC', moC).set('uNM', { __ints: 1, v: nm }).set('uFocus', Math.hypot(ro[0] - ta[0], ro[1] - ta[1], ro[2] - ta[2]));
+    const focus = Math.hypot(ro[0] - ta[0], ro[1] - ta[1], ro[2] - ta[2]);
+    rm.render(t, { focus, aperture: 16, maxCoc: 18 });
+  },
+});
+</script></body></html>

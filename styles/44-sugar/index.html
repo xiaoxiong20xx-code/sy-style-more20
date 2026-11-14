@@ -1,0 +1,660 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>44 糖画 · Sugar Painting</title>
+<script src="../../lib/core.js"></script>
+<script src="../../lib/strokegl.js"></script>
+<script src="../../lib/track.js"></script>
+<script src="../../lib/craftd.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 44 糖画 · SUGAR PAINTING DRAGON =====
+   A sugar-painting stall in a night market: a cold, polished white-marble slab on the stall's wooden table under one
+   warm lamp; beside it a clay charcoal stove glowing through its mouth with the syrup pot on top, steam rising; a straw
+   bundle stuck with finished sugar paintings; behind, out of focus, red lanterns, strings of bulbs, other stalls' lights
+   and people passing. A small
+   copper ladle trickles a thread of hot syrup and draws a dragon the way sugar-painting masters do: the head with open
+   jaws, teeth, tongue, horns, mane, beard and whiskers; an S-coiled body whose outline is filled with one continuous run
+   of little loops for scales; flame fins, four clawed legs, a flame tail, a pearl, two curling clouds — all joined.
+   The sugar is a body, not a line: a height field (one round bead per pour, flat puddles where the hand paused) that is
+   ray-marched as amber glass — Fresnel glaze with hard highlights, refraction of the marble under it, Beer-law colour
+   from pale gold where thin to deep amber where thick, a few tiny bubbles.
+   0.0 the thread is already falling, the jaws first · body, legs, fins, tail on the beats · 3.0–3.9 the loops of scales ·
+   4.0 the stall's back light comes on and the camera drops low: light comes through the sugar, amber, and is focused
+   onto the marble (hook) · pearl, whiskers, mane, clouds · 7.2 a bamboo stick is laid in and sealed with a dab of syrup ·
+   7.45 the spatula slides under · 8.0 the painting is lifted and stood up on its stick, the back light through it · hold. */
+const stage = Reel.makeStage('#0d0a08');
+Reel.ownJitter = true;
+const { clamp, lerp, E } = Reel;
+const gl = CD.init(stage);
+const W = CD.W, H = CD.H;
+const POST = CD.post(gl);
+const QUAD = SG.quad(gl);
+const HD = '#version 300 es\nprecision highp float;\nprecision highp int;\n';
+const R = Reel.rng(4444), rr = (a, b) => a + (b - a) * R();
+// sugar map: slab-space cm (y up), x ∈ [-18, 18], y ∈ [-12, 12]
+const SX0 = -18, SY0 = -12, SWc = 36, SHc = 24, PXC = 50;
+const MW = SWc * PXC, MH = SHc * PXC;
+const HMAX = 0.5;
+
+// ---------------- the pour ----------------
+const ST = new SG.Strokes();
+const SEGS = [];
+let sid = 1;
+function pour(pts, t0, t1, w, o = {}) {
+  // puddles where the hand paused: at both ends and at every sharp turn of the path
+  let Ls = [0]; for (let i = 1; i < pts.length; i++) Ls.push(Ls[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]));
+  const Lt = Ls[Ls.length - 1] || 1, bumps = [];
+  for (let i = 1; i < pts.length - 1; i++) {
+    const ax = pts[i][0] - pts[i - 1][0], ay = pts[i][1] - pts[i - 1][1], bx = pts[i + 1][0] - pts[i][0], by = pts[i + 1][1] - pts[i][1];
+    const c = (ax * bx + ay * by) / ((Math.hypot(ax, ay) * Math.hypot(bx, by)) || 1);
+    if (c < 0.2 && !o.noPuddle) bumps.push(Ls[i] / Lt);
+  }
+  const sd = sid * 1.7;
+  const wf = (u) => {
+    let f = 1 + 0.5 * (Math.exp(-u * Lt / 0.35) + Math.exp(-(1 - u) * Lt / 0.35)) + 0.07 * Math.sin(u * Lt * 3.1 + sd);
+    for (const b of bumps) f += 0.55 * Math.exp(-Math.pow((u - b) * Lt / 0.22, 2));
+    return f;
+  };
+  if (!o.noTool) SEGS.push([t0, t1, SG.crSample(pts, 0.1)]);
+  ST.add(pts, { w, t0, t1, kind: 0, seed: (sid++ * 3.7) % 91, ds: 0.035, pad: 0.35, lin: !!o.lin, wf });
+}
+const arc = (cx, cy, rx, ry, a0, a1, n = 24, rot = 0) => Array.from({ length: n + 1 }, (_, i) => {
+  const a = lerp(a0, a1, i / n), x = Math.cos(a) * rx, y = Math.sin(a) * ry;
+  return [cx + x * Math.cos(rot) - y * Math.sin(rot), cy + x * Math.sin(rot) + y * Math.cos(rot)];
+});
+const spiral = (cx, cy, r0, r1, a0, turns, n = 40) => Array.from({ length: n + 1 }, (_, i) => { const u = i / n, a = a0 + u * turns * 6.2832, r = lerp(r0, r1, u); return [cx + Math.cos(a) * r, cy + Math.sin(a) * r]; });
+// body
+const SPINE = [[-8.0, 3.2], [-5.6, 5.8], [-2.0, 5.6], [0.8, 2.6], [3.0, -1.4], [6.2, -3.8], [9.6, -3.0], [11.8, -0.2], [12.4, 2.6]];
+const spine = SG.crSample(SPINE, 0.08);
+const spineAt = (u) => spine[Math.min(spine.length - 1, Math.max(0, Math.round(u * (spine.length - 1))))];
+const spineT = (u) => { const a = spineAt(u - 0.01), b = spineAt(u + 0.01); const dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy) || 1; return [dx / l, dy / l]; };
+const spineN = (u) => { const t = spineT(u); return [-t[1], t[0]]; };
+const thick = (u) => lerp(2.0, 0.45, Math.pow(u, 1.15)) * (0.86 + 0.22 * Math.sin(Math.PI * Math.min(1, u * 2)));
+const edgeP = (side, u, k = 1) => { const p = spineAt(u), n = spineN(u), r = thick(u) * side * k; return [p[0] + n[0] * r, p[1] + n[1] * r]; };
+const edge = (side, u0, u1, n, k = 1) => Array.from({ length: n + 1 }, (_, i) => edgeP(side, lerp(u0, u1, i / n), k));
+let PIV = 0;
+(function dragon() {
+  let t = -0.08;
+  const seg = (pts, dur, w, o) => { pour(pts, t, t + dur, w, o); t += dur; };
+  // ---- head (facing left), the jaws open
+  seg([[-8.9, 5.3], [-10.4, 5.1], [-12.1, 4.8], [-13.4, 5.0], [-13.6, 5.5], [-13.1, 5.8], [-12.8, 5.4]], 0.26, 0.4);            // upper jaw, curled nose
+  seg([[-13.4, 4.6], [-12.4, 4.25], [-11.3, 3.95], [-10.2, 3.65]], 0.12, 0.36);                                                // upper lip
+  seg([[-10.2, 3.65], [-11.8, 2.95], [-13.0, 2.25], [-12.6, 1.85], [-11.0, 2.15], [-9.1, 2.75]], 0.2, 0.38);                   // lower jaw
+  const teethU = []; for (let k = 0; k <= 10; k++) { const x = lerp(-13.1, -11.0, k / 10), y = lerp(4.55, 3.92, k / 10); teethU.push([x, y - (k % 2 ? 0.42 : 0)]); }
+  seg(teethU, 0.08, 0.2, { noPuddle: true });
+  const teethL = []; for (let k = 0; k <= 8; k++) { const x = lerp(-12.6, -10.9, k / 8), y = lerp(2.3, 3.2, k / 8); teethL.push([x, y + (k % 2 ? 0.38 : 0)]); }
+  seg(teethL, 0.07, 0.2, { noPuddle: true });
+  seg([[-10.6, 3.35], [-11.8, 3.5], [-12.9, 3.15], [-14.0, 3.4], [-14.5, 3.75], [-14.0, 3.4], [-14.4, 2.95]], 0.12, 0.22);       // tongue, forked
+  seg(arc(-10.9, 5.55, 0.55, 0.48, 0, 6.4, 16), 0.06, 0.3);                                                                    // eye
+  seg([[-10.85, 5.55], [-10.8, 5.6]], 0.03, 0.75);                                                                              // pupil: a drop
+  seg([[-11.8, 6.0], [-10.9, 6.55], [-9.8, 6.5], [-9.3, 6.0], [-9.6, 5.7]], 0.08, 0.3);                                         // brow curl
+  // horns: two antlers sweeping back
+  seg([[-9.6, 6.4], [-9.1, 7.8], [-8.0, 8.9], [-6.5, 9.4], [-7.4, 8.6], [-7.0, 10.3], [-7.8, 8.9], [-8.6, 8.6], [-8.6, 10.0]], 0.16, 0.32);
+  seg([[-9.0, 6.0], [-8.2, 7.2], [-6.9, 8.0], [-5.5, 8.2], [-6.2, 7.6], [-5.6, 9.1]], 0.12, 0.3);
+  // mane: flames behind the head
+  for (let k = 0; k < 4; k++) {
+    const b = [-8.6 + k * 0.55, 5.6 - k * 0.55], d = [0.9 + k * 0.1, 0.5 - k * 0.25];
+    seg([b, [b[0] + d[0] * 0.8, b[1] + d[1] * 1.6 + 0.4], [b[0] + d[0] * 1.8, b[1] + d[1] * 1.2 + 0.2], [b[0] + d[0] * 1.5, b[1] + d[1] * 0.5], [b[0] + d[0] * 2.6, b[1] + d[1] * 1.5]], 0.07, 0.26);
+  }
+  // beard
+  seg([[-11.0, 2.2], [-11.6, 1.3], [-11.0, 0.5], [-11.7, -0.3], [-11.2, -0.9]], 0.09, 0.24);
+  seg([[-10.2, 2.45], [-10.4, 1.4], [-9.8, 0.7], [-10.3, -0.1]], 0.08, 0.24);
+  // ---- body: back edge to the tail, round the tail, belly edge back to the throat (1.0–1.95)
+  t = Math.max(t, 1.0);
+  seg([[-8.9, 5.3]].concat(edge(1, 0.0, 1.0, 40)), 0.5, 0.42);
+  seg([[12.5, 3.0], [12.9, 3.6], [12.4, 3.4]].concat(edge(-1, 1.0, 0.0, 40)).concat([[-9.1, 2.75]]), 0.45, 0.42);
+  // ---- dorsal flame fins along the back (2.0–2.35)
+  t = 2.0;
+  const fins = [];
+  for (let i = 0; i < 17; i++) {
+    const u = 0.04 + i * 0.055, b0 = edgeP(1, u), b1 = edgeP(1, u + 0.03), n = spineN(u + 0.015), tg = spineT(u);
+    const h = 1.0 * (1 - u * 0.55);
+    fins.push(b0, [b0[0] + n[0] * h * 0.6 - tg[0] * 0.25, b0[1] + n[1] * h * 0.6 - tg[1] * 0.25], [b0[0] + n[0] * h + tg[0] * 0.35, b0[1] + n[1] * h + tg[1] * 0.35], b1);
+  }
+  seg(fins, 0.35, 0.26, { noPuddle: true });
+  // ---- belly plates (2.35–2.5)
+  for (let i = 0; i < 20; i++) { const u = 0.05 + i * 0.045; pour([edgeP(-1, u), edgeP(-1, u, 0.35)], t + i * 0.007, t + i * 0.007 + 0.012, 0.2, { noTool: i % 4 !== 0, noPuddle: true }); }
+  t += 0.15;
+  // ---- four legs with elbow tufts and curled claws (2.5–3.0)
+  [[0.11, -1], [0.29, -1], [0.6, -1], [0.79, -1]].forEach(([u, side], k) => {
+    const a = edgeP(side, u), n = spineN(u), tg = spineT(u);
+    const elbow = [a[0] + n[0] * 1.8 * side + tg[0] * 0.6, a[1] + n[1] * 1.8 * side + tg[1] * 0.6];
+    const foot = [elbow[0] - tg[0] * 1.1 + n[0] * 0.6 * side, elbow[1] - tg[1] * 1.1 + n[1] * 0.6 * side];
+    const t0 = 2.5 + k * 0.125;
+    pour([a, elbow, foot], t0, t0 + 0.05, 0.36);
+    // three hooked claws
+    for (let c = 0; c < 3; c++) {
+      const ang = Math.atan2(n[1] * side, n[0] * side) + (c - 1) * 0.6;
+      const tip = [foot[0] + Math.cos(ang) * 0.75, foot[1] + Math.sin(ang) * 0.75];
+      pour([foot, tip, [tip[0] + Math.cos(ang + 1.6) * 0.3, tip[1] + Math.sin(ang + 1.6) * 0.3]], t0 + 0.05 + c * 0.015, t0 + 0.06 + c * 0.015, 0.26, { noTool: c > 0 });
+    }
+    // flame tuft at the elbow
+    pour([elbow, [elbow[0] + tg[0] * 0.9 + 0.2, elbow[1] + tg[1] * 0.9 - 0.3], [elbow[0] + tg[0] * 0.5, elbow[1] + tg[1] * 0.5 - 0.6], [elbow[0] + tg[0] * 1.4, elbow[1] + tg[1] * 1.4 - 0.7]], t0 + 0.1, t0 + 0.12, 0.22, { noTool: true });
+  });
+  // ---- tail flame fan
+  for (let k = 0; k < 5; k++) {
+    const a = 0.3 + k * 0.42, b = [12.5, 3.0];
+    pour([b, [b[0] + Math.cos(a) * 1.2, b[1] + Math.sin(a) * 1.4], [b[0] + Math.cos(a + 0.35) * 2.1, b[1] + Math.sin(a + 0.35) * 2.3], [b[0] + Math.cos(a - 0.1) * 2.8, b[1] + Math.sin(a - 0.1) * 3.0]], 2.98 - 0.12 + k * 0.024, 2.98 - 0.1 + k * 0.024, 0.26, { noTool: k > 0 });
+  }
+  // ---- the scales: one continuous run of little loops along the body (3.0–3.9)
+  const loops = [];
+  let ph = 0, prev = spineAt(0.03);
+  for (let u = 0.03; u < 0.95; u += 0.0005) {
+    const p = spineAt(u), n = spineN(u), tg = spineT(u), th = thick(u);
+    const rL = 0.36 * th + 0.1;                         // loop radius follows the body's width
+    const ds = Math.hypot(p[0] - prev[0], p[1] - prev[1]); prev = p;
+    ph += 6.2832 * ds / (rL * 1.15);                    // one loop per ~1.15 radii of travel: the loops overlap like cursive e's
+    loops.push([p[0] + n[0] * (0.08 * th + rL * Math.cos(ph)) - tg[0] * rL * Math.sin(ph), p[1] + n[1] * (0.08 * th + rL * Math.cos(ph)) - tg[1] * rL * Math.sin(ph)]);
+  }
+  pour(loops, 3.0, 3.9, 0.21, { noPuddle: true, lin: true });
+  // ---- the pearl and its flames (4.5–5.1)
+  pour(arc(-15.0, -4.6, 1.7, 1.7, 1.2, 1.2 + 6.35, 32), 4.5, 4.66, 0.36);
+  pour(spiral(-15.0, -4.6, 1.3, 0.15, 1.2, 2.2, 50), 4.66, 4.88, 0.24, { noPuddle: true });
+  for (let k = 0; k < 6; k++) {
+    const a = k / 6 * 6.283 + 0.3, b = [-15.0 + Math.cos(a) * 1.7, -4.6 + Math.sin(a) * 1.7];
+    pour([b, [b[0] + Math.cos(a + 0.4) * 0.6, b[1] + Math.sin(a + 0.4) * 0.6], [b[0] + Math.cos(a - 0.2) * 1.1, b[1] + Math.sin(a - 0.2) * 1.1]], 4.88 + k * 0.025, 4.9 + k * 0.025, 0.22, { noTool: k > 0 });
+  }
+  // ---- whiskers: long S-curves thrown fast (5.2–5.8), joining the pearl
+  pour([[-12.9, 4.6], [-14.3, 5.8], [-13.6, 7.4], [-14.9, 8.7], [-14.1, 9.9]], 5.2, 5.45, 0.22);
+  pour([[-12.5, 2.4], [-14.0, 1.2], [-13.4, -0.6], [-14.4, -2.2], [-15.0, -2.9]], 5.5, 5.75, 0.22);
+  // ---- clouds: three joined spiral curls each (5.9–6.9)
+  [[-3.6, -6.8, 1], [5.6, 7.4, -1]].forEach(([cx, cy, dir], k) => {
+    const t0 = 5.9 + k * 0.5;
+    pour(spiral(cx, cy, 1.1, 0.2, 3.4, 1.3 * dir, 28), t0, t0 + 0.12, 0.26, { noPuddle: true });
+    pour(spiral(cx + 1.9, cy + 0.5, 0.9, 0.18, 3.4, 1.2 * dir, 24), t0 + 0.13, t0 + 0.24, 0.26, { noPuddle: true });
+    pour(spiral(cx + 3.4, cy - 0.2, 0.75, 0.15, 3.4, 1.1 * dir, 20), t0 + 0.25, t0 + 0.34, 0.26, { noPuddle: true });
+    pour([[cx - 1.1, cy - 0.4], [cx + 1.5, cy - 1.2], [cx + 3.6, cy - 1.0], [cx + 5.2, cy - 1.6]], t0 + 0.35, t0 + 0.42, 0.26);
+  });
+  // connectors so it all lifts as one piece: cloud ↔ claw, cloud ↔ fin
+  { const a = [-3.2, -6.0], b = edgeP(-1, 0.43, 1.6); pour([a, [lerp(a[0], b[0], 0.3) - 0.9, lerp(a[1], b[1], 0.3)], [lerp(a[0], b[0], 0.55) + 0.8, lerp(a[1], b[1], 0.55)], [lerp(a[0], b[0], 0.8) - 0.5, lerp(a[1], b[1], 0.8)], b], 6.95, 7.0, 0.24, { noPuddle: true }); }
+  { const a = [5.0, 6.6], b = edgeP(1, 0.22, 1.2); pour([a, [lerp(a[0], b[0], 0.35) + 0.7, lerp(a[1], b[1], 0.35)], [lerp(a[0], b[0], 0.7) - 0.6, lerp(a[1], b[1], 0.7)], b], 7.0, 7.05, 0.24, { noPuddle: true }); }
+  PIV = -9.4;
+})();
+SEGS.sort((p, q) => p[0] - q[0]);
+// the stick: laid in along the body at 7.2, sealed with a dab of syrup at 7.35
+const STICK = { x: 1.0, y0: -15.5, y1: 3.4 };
+ST.add([[0.8, -0.6], [1.2, 0.6], [0.8, 1.6]], { w: 0.95, t0: 7.35, t1: 7.42, kind: 0, seed: 9, ds: 0.035, pad: 0.35 });
+
+// ---------------- GL ----------------
+const pSugar = SG.prog(gl, SG.VS_STROKE, HD + `
+in vec4 v0; flat in vec4 v1; flat in vec4 v2; flat in vec4 v3; flat in vec4 v4;
+uniform float T; out vec4 o;
+${SG.GLSL_NOISE}
+void main(){
+  float s = v0.z, v = v0.w, L = v1.x, w = v1.y, t0 = v1.z, t1 = v1.w, seed = v4.x;
+  if (T < t0) discard;
+  float head = L*clamp((T - t0)/max(t1 - t0, 1e-3), 0., 1.);
+  float ds = s < 0. ? -s : (s > head ? s - head : 0.);
+  float r = length(vec2(ds/(w*.5), v));
+  if (r >= 1.) discard;
+  // a round bead (wider puddles keep the same height, so they read flatter); hot sugar is a touch taller just behind the spout
+  float age = T - (t0 + (t1 - t0)*clamp(s/max(L, 1e-3), 0., 1.));
+  float hh = w*.47*pow(1. - r*r, .55)*(1. + .12*exp(-age*6.))*(1. + .04*(vn(vec2(s*9., seed)) - .5));
+  o = vec4(hh/${HMAX.toFixed(2)}, 0., 0., 1.);
+}`);
+const tS = SG.tex(gl, MW, MH, {}), fS = SG.fbo(gl, [tS]);
+ST.upload(gl);
+const FS = HD + `
+out vec4 o;
+${CD.GLSL}
+uniform sampler2D uS;
+uniform float uT, uBack, uTop;
+uniform mat4 uSug, uSugInv;            // sugar local ↔ world (rigid)
+uniform vec3 uLad;                      // ladle spout
+uniform vec3 uS0, uS1, uS2;            // the falling thread (quadratic)
+uniform float uStream, uLadOn;
+uniform vec4 uStick;                   // (visible, lifted)
+uniform vec4 uSpat;                    // (x offset, visible, tilt, -) in the sugar's frame
+const vec2 SMIN = vec2(${SX0.toFixed(1)}, ${SY0.toFixed(1)}), SSZ = vec2(${SWc.toFixed(1)}, ${SHc.toFixed(1)});
+float hS(vec2 q){ vec2 uv = (q - SMIN)/SSZ; if (uv.x < 0. || uv.y < 0. || uv.x > 1. || uv.y > 1.) return 0.; return texture(uS, vec2(uv.x, 1. - uv.y)).r*${HMAX.toFixed(2)}; }
+vec3 marbleAlb(vec2 p){
+  vec2 q = p*.11;
+  float w = fbm(q*1.3 + vec2(fbm(q*.7 + 3.), fbm(q*.9 + 9.))*1.6);
+  float v = abs(sin((q.x*.8 + q.y*.35 + w*3.2)*3.1));
+  float vein = smoothstep(.12, .0, v)*.5 + smoothstep(.04, .0, abs(sin((q.x*.3 - q.y*.9 + w*5.)*2.2)))*.28;
+  vec3 base = vec3(.78, .78, .77)*(.95 + .06*fbm(p*.6));
+  return mix(base, vec3(.34, .36, .39), clamp(vein, 0., .8));
+}
+const vec3 LT = normalize(vec3(-.3, .25, .92));             // the stall lamp, above
+vec3 LB(){ return normalize(vec3(.05, .97, .2)); }          // the back light, low behind the slab
+const vec3 LIGHT_COL = vec3(1.);   // stall lamp colour: everything scaled by uTop; vec3(1.) = original
+const vec3 BACK_COL = vec3(1.);    // back light colour (the 4.0 hook): everything scaled by uBack; vec3(1.) = original
+vec3 envCol(vec3 rd){
+  vec3 c = mix(vec3(.005, .004, .004), vec3(.02, .013, .009), smoothstep(-.2, .5, rd.z));
+  // the stall's own lamp: a small softbox above
+  float dl = dot(rd, LT);
+  c += vec3(1., .88, .7)*LIGHT_COL*uTop*(9.*smoothstep(.992, .998, dl) + .6*smoothstep(.9, .99, dl));
+  if (rd.y > .05) {
+    vec2 q = vec2(rd.x, rd.z)/rd.y;                  // directions as points on a screen one unit ahead (x right, up)
+    c += vec3(.05, .025, .012)*smoothstep(.25, -.05, q.y);                     // warm haze over the market
+    // other stalls' lights, low on the horizon: warm and cool panels
+    for (int i = 0; i < 7; i++) {
+      float fi = float(i);
+      vec2 cc = vec2(-1.5 + fi*.48 + .1*sin(fi*2.3), -.025 + .02*fract(fi*.61));
+      vec2 hs = vec2(.035 + .03*fract(fi*.37), .01 + .008*fract(fi*.53));
+      vec2 dq = abs(q - cc) - hs;
+      float m = 1. - smoothstep(-.005, .01, max(dq.x, dq.y));
+      c += (mod(fi, 3.) == 1. ? vec3(.75, .85, 1.)*.9 : vec3(1., .66, .36)*1.4)*m;
+    }
+    // strings of bulbs sagging between poles
+    for (int sI = 0; sI < 3; sI++) {
+      float fs = float(sI), x0 = -1.5 + fs*.95, hgt = .115 + .02*fs;
+      for (int k = 0; k < 14; k++) {
+        float x = x0 + float(k)*.075, u = (x - x0)/1.0 - .5;
+        vec2 b = vec2(x, hgt - .07*(1. - 4.*u*u));
+        c += vec3(1., .72, .38)*9.*smoothstep(.0075, .0, length(q - b));
+      }
+    }
+    // red paper lanterns
+    for (int i = 0; i < 6; i++) {
+      float fi = float(i);
+      vec2 lc = vec2(-1.15 + fi*.47 + .06*sin(fi*1.7), .035 + .045*fract(fi*.618));
+      vec2 d2 = (q - lc)/vec2(.03, .038);
+      float r = length(d2);
+      float body = 1. - smoothstep(.9, 1., r);
+      float caps = smoothstep(.72, .82, abs(d2.y));
+      c = mix(c, mix(vec3(1., .42, .14)*4.5, vec3(.85, .06, .03)*2.2, smoothstep(.1, .95, r))*(1. - .7*caps) + vec3(.4, .3, .05)*caps, body);
+    }
+    // people walking past the stall, dark against the lights
+    for (int i = 0; i < 5; i++) {
+      float fi = float(i);
+      float x = mod(-1.6 + fi*.73 + (fract(fi*.37) - .5)*uT*.05*(i % 2 == 0 ? 1. : -1.) + 1.8, 3.6) - 1.8;
+      float sc = .8 + .35*fract(fi*.71);
+      float bodyD = length(max(abs(q - vec2(x, -.06*sc)) - vec2(.03, .13)*sc, 0.)) - .02*sc;
+      float headD = length(q - vec2(x + .004, .1*sc)) - .022*sc;
+      float m = smoothstep(0., .008, min(bodyD, headD));
+      c = c*mix(.07, 1., m) + vec3(.05, .025, .01)*(1. - m);
+    }
+    // the stall's back light (the hook): a bare bulb behind the slab, with a modest glow
+    float db = dot(rd, LB());
+    c += vec3(1., .6, .28)*BACK_COL*uBack*(14.*smoothstep(.9975, .9995, db) + .35*smoothstep(.985, .999, db));
+  }
+  return c;
+}
+// what polished stone and lacquer reflect: the same night, but soft (no sharp shapes)
+vec3 envSoft(vec3 rd){
+  vec3 c = mix(vec3(.005, .004, .004), vec3(.02, .013, .009), smoothstep(-.2, .5, rd.z));
+  float dl = dot(rd, LT);
+  c += vec3(1., .88, .7)*LIGHT_COL*uTop*(2.5*smoothstep(.97, .998, dl) + .4*smoothstep(.85, .99, dl));
+  if (rd.y > .02) {
+    float el = rd.z/rd.y;
+    c += vec3(1., .55, .25)*.45*exp(-pow((el - .1)*5., 2.))*smoothstep(.02, .3, rd.y);    // the market's lights, smeared
+    c += vec3(.9, .2, .06)*.25*exp(-pow((el - .19)*7., 2.))*smoothstep(.02, .3, rd.y);    // the lanterns' red
+    float db = dot(rd, LB());
+    c += vec3(1., .6, .28)*BACK_COL*uBack*(1.2*smoothstep(.97, .998, db));
+  }
+  return c;
+}
+// light falling on the marble (lamp pool + back light grazing) and the amber light the sugar focuses onto it
+vec3 marbleLit(vec2 p, float shadowT){
+  vec3 alb = marbleAlb(p);
+  float pool = exp(-dot(p - vec2(-3., 1.), p - vec2(-3., 1.))/900.);
+  vec3 col = alb*(vec3(1., .88, .7)*1.15*LIGHT_COL*uTop*LT.z*shadowT*(.3 + .7*pool) + vec3(.012, .012, .015));
+  col += alb*vec3(1., .55, .22)*2.*BACK_COL*uBack*LB().z*smoothstep(-30., 20., p.y);
+  if (uStick.y < .5) {
+    vec3 l = (uSugInv*vec4(p, 0., 1.)).xyz;
+    // the back light, refracted through a bead, lands a little in front of it (towards -y) as an amber streak
+    float c1 = hS(l.xy + vec2(0., .55)), c2 = hS(l.xy + vec2(0., 1.0));
+    float g = abs(hS(l.xy + vec2(.04, .55)) - hS(l.xy + vec2(-.04, .55)))*6.;
+    col += vec3(1., .55, .15)*BACK_COL*uBack*(smoothstep(.05, .3, c1)*.9 + smoothstep(.05, .3, c2)*.35 + g)*.8;
+    // and the lamp focuses a gold rim beside each bead
+    float c3 = hS(l.xy - LT.xy/LT.z*.3);
+    col += vec3(1., .7, .3)*LIGHT_COL*uTop*smoothstep(.05, .25, c3)*(1. - smoothstep(.02, .1, hS(l.xy)))*.25;
+  }
+  return col;
+}
+float sdLadle(vec3 p){
+  if (uLadOn < .5) return 1e3;
+  vec3 c = uLad + vec3(-.9, 0., .8);
+  float bowl = max(abs(length(p - c) - 1.25) - .06, p.z - c.z - .05);
+  float lip = length(vec2(length(p.xy - c.xy) - 1.25, p.z - c.z - .05)) - .09;
+  float handle = sdCapsule(p, c + vec3(.6, .7, .9), c + vec3(.35, .45, .82)*16., .17);
+  return min(min(bowl, lip), handle);
+}
+float sdStream(vec3 p){
+  if (uStream < .5) return 1e3;
+  float best = 1e3; vec3 prev = uS0;
+  for (int i = 1; i <= 8; i++) { float u = float(i)/8.; vec3 cur = mix(mix(uS0, uS1, u), mix(uS1, uS2, u), u);
+    vec3 pa = p - prev, ba = cur - prev; float h = clamp(dot(pa, ba)/dot(ba, ba), 0., 1.); best = min(best, length(pa - ba*h) - mix(.075, .05, u)); prev = cur; }
+  return best;
+}
+float sdStick(vec3 p){
+  if (uStick.x < .5) return 1e3;
+  vec3 l = (uSugInv*vec4(p, 1.)).xyz;
+  return sdCapsule(l, vec3(${STICK.x.toFixed(2)}, ${STICK.y0.toFixed(2)}, .26), vec3(${STICK.x.toFixed(2)}, ${STICK.y1.toFixed(2)}, .26), .25);
+}
+float sdSpat(vec3 p){
+  if (uSpat.y < .5) return 1e3;
+  vec3 l = (uSugInv*vec4(p, 1.)).xyz;
+  vec3 q = l - vec3(uSpat.x, ${(-9.4 - 3.6).toFixed(2)}, -.06);
+  q.yz = mat2(cos(uSpat.z), sin(uSpat.z), -sin(uSpat.z), cos(uSpat.z))*q.yz;
+  return sdRoundBox(q, vec3(4.2, 4.0, .035), .03);
+}
+const vec2 STOVE = vec2(19., 31.), STRAW = vec2(-24., 42.);
+float sdStall(vec3 p, out float id, bool withSlab){
+  // the marble slab's sides, the wooden table, the stove and pot, the straw bundle
+  float d = 1e3; id = 5.;
+  if (withSlab) {
+    d = sdBox(p - vec3(0., 1., -2.), vec3(32., 21., 1.4));      // its top sits under the (analytic) marble surface, so the two never compete
+    float tb = sdBox(p - vec3(0., 12., -4.5), vec3(80., 36., 1.5)); if (tb < d) { d = tb; id = 6.; }
+  }
+  vec2 sq = p.xy - STOVE;
+  float stove = max(length(sq) - 10.5 + .6*smoothstep(10., 13., p.z), abs(p.z - 5.) - 8.); if (stove < d) { d = stove; id = 7.; }
+  float pot = max(max(abs(length(sq) - 9.2) - .45, abs(p.z - 17.) - 4.), -(length(sq) - 8.7) + 0.*p.z);
+  pot = min(max(abs(length(sq) - 9.2) - .45, abs(p.z - 17.) - 4.), max(length(sq) - 8.8, abs(p.z - 13.6) - .6));
+  if (pot < d) { d = pot; id = 8.; }
+  float syrup = max(length(sq) - 8.8, abs(p.z - 19.4) - .05); if (syrup < d) { d = syrup; id = 9.; }
+  vec2 wq = p.xy - STRAW;
+  float pole = sdCapsule(p, vec3(STRAW, -3.), vec3(STRAW, 64.), .9); if (pole < d) { d = pole; id = 10.; }
+  float straw = sdCapsule(p, vec3(STRAW, 42.), vec3(STRAW, 60.), 6.2); if (straw < d) { d = straw; id = 11.; }
+  for (int k = 0; k < 6; k++) {
+    float a = -2.2 + float(k)*.75, h = 44. + 4.*mod(float(k), 3.);
+    vec3 base = vec3(STRAW + vec2(cos(a), sin(a))*5.5, h), tip = base + vec3(cos(a)*7., sin(a)*4. - 2., 9. + 2.*float(k % 2));
+    float st = sdCapsule(p, base, tip, .22); if (st < d) { d = st; id = 10.; }
+    vec3 c = tip + vec3(0., 0., 4.5);
+    vec3 dq = p - c;
+    float disc = max(length(dq.xz) - (4. + .8*float(k % 3)), abs(dq.y) - .18); if (disc < d) { d = disc; id = 12.; }
+  }
+  return d;
+}
+float sdObj(vec3 p, out float id){
+  float d = sdLadle(p); id = 1.;
+  float s = sdStream(p); if (s < d) { d = s; id = 2.; }
+  float k = sdStick(p); if (k < d) { d = k; id = 3.; }
+  float sp = sdSpat(p); if (sp < d) { d = sp; id = 4.; }
+  float sid2; float st = sdStall(p, sid2, true); if (st < d) { d = st; id = sid2; }
+  return d;
+}
+float sdCaster(vec3 p){   // what can throw a shadow on the slab (not the slab or the table themselves)
+  float id2; float d = min(min(sdLadle(p), sdStream(p)), min(sdStick(p), sdSpat(p)));
+  return min(d, sdStall(p, id2, false));
+}
+bool sugarHit(vec3 ro, vec3 rd, out float tHit, out vec3 lp){
+  vec3 lo = (uSugInv*vec4(ro, 1.)).xyz, ld = (uSugInv*vec4(rd, 0.)).xyz;
+  float top = ${HMAX.toFixed(2)};
+  if (abs(ld.z) < 1e-4) return false;
+  float t0 = (top - lo.z)/ld.z, t1 = (0. - lo.z)/ld.z;
+  if (t0 > t1) { float tt = t0; t0 = t1; t1 = tt; }
+  t0 = max(t0, 0.); if (t1 < 0.) return false;
+  float dt = (t1 - t0)/72.;
+  float prevT = t0;
+  for (int i = 0; i <= 72; i++) {
+    float t = t0 + dt*float(i);
+    vec3 q = lo + ld*t;
+    float h = hS(q.xy);
+    if (h > .01 && q.z < h && q.z > -.001) {
+      float a = prevT, b = t;
+      for (int k = 0; k < 7; k++) { float m = .5*(a + b); vec3 qm = lo + ld*m; if (qm.z < hS(qm.xy)) b = m; else a = m; }
+      tHit = b; lp = lo + ld*b; return true;
+    }
+    prevT = t;
+  }
+  return false;
+}
+vec3 shadeSugar(vec3 lp, vec3 rd){
+  vec3 ld = (uSugInv*vec4(rd, 0.)).xyz;
+  float e = .025;
+  float h0 = hS(lp.xy);
+  vec3 nl = normalize(vec3(-(hS(lp.xy + vec2(e, 0.)) - hS(lp.xy - vec2(e, 0.)))/(2.*e), -(hS(lp.xy + vec2(0., e)) - hS(lp.xy - vec2(0., e)))/(2.*e), 1.));
+  vec3 n = normalize((uSug*vec4(nl, 0.)).xyz);
+  float cosi = max(dot(n, -rd), 0.);
+  float fr = .04 + .96*pow(1. - cosi, 5.);
+  // refract in, cross the sugar, see what lies under/behind it
+  vec3 rdl = refract(ld, nl, 1./1.5);
+  float path = (h0 + .02)/max(-rdl.z, .22);
+  vec2 exitp = lp.xy + rdl.xy*(h0/max(-rdl.z, .22));
+  vec3 sigma = vec3(1.4, 4.3, 12.);                       // pale gold where thin, deep amber where thick
+  vec3 Tr = exp(-sigma*path);
+  vec3 behind;
+  bool lifted = uStick.y > .5;
+  if (!lifted) {
+    vec3 wexit = (uSug*vec4(exitp, 0., 1.)).xyz;
+    behind = marbleLit(wexit.xy, 1.);
+    // back light trapped in the bead and sent down onto the marble right under it
+    behind += vec3(1., .62, .28)*BACK_COL*uBack*2.4*smoothstep(.04, .3, h0);
+    behind += vec3(1., .85, .6)*LIGHT_COL*uTop*.35*smoothstep(.06, .35, h0);
+  } else {
+    vec3 out_ = refract(rdl, vec3(0., 0., 1.), 1.5);
+    if (dot(out_, out_) < .5) out_ = reflect(rdl, vec3(0., 0., 1.));
+    // standing up against the stall's lights: the lanterns and bulbs behind glow through the sugar, softened by it
+    vec3 wd = normalize((uSug*vec4(out_.xy, -abs(out_.z), 0.)).xyz);
+    behind = envSoft(wd)*.8 + vec3(1., .62, .3)*BACK_COL*(.55 + 2.*pow(max(dot(wd, LB()), 0.), 6.));
+  }
+  if (lifted) Tr = exp(-sigma*vec3(1.15, 1.25, 1.3)*(path*1.7 + .05));   // seen edge-on to the light it crosses more sugar: deeper amber
+  vec3 col = behind*Tr*(1. - fr*(lifted ? .5 : 1.));
+  if (lifted) {
+    // light scattered inside the sugar: thin parts glow pale gold, thick parts deep amber
+    float th = clamp(h0/${HMAX.toFixed(2)}, 0., 1.);
+    col += mix(vec3(.95, .62, .22), vec3(.55, .16, .02), th)*BACK_COL*uBack*.3*(1. - exp(-h0*6.));
+    // a bright rim where the bead's edge bends the back light towards the lens
+    float edgeL = 1. - nl.z;
+    col += vec3(1., .78, .45)*BACK_COL*uBack*1.1*smoothstep(.35, .8, edgeL)*smoothstep(.02, .06, h0);
+  }
+  // tiny bubbles caught in the thick parts: dark centre, bright rim
+  vec2 bq = lp.xy*9.; vec2 bi = floor(bq), bf = fract(bq) - .5;
+  float bh = hash12(bi);
+  if (bh > .93 && h0 > .14) {
+    float br = .12 + .18*hash12(bi + 3.), bd = length(bf - (hash22(bi) - .5)*.5)/br;
+    col = mix(col, col*.5 + vec3(1., .8, .5)*(.4*BACK_COL*uBack + .25*LIGHT_COL*uTop)*smoothstep(.65, 1., bd), smoothstep(1.05, .9, bd));
+  }
+  // the glaze: hard highlights from the lamp, the string lights and the back light
+  vec3 rf = reflect(rd, n);
+  col += envCol(rf)*fr*(lifted ? .35 : 1.3);
+  col += vec3(1., .9, .75)*LIGHT_COL*uTop*(40.*pow(max(dot(rf, LT), 0.), 900.) + 1.2*pow(max(dot(rf, LT), 0.), 80.));
+  col += vec3(1., .65, .35)*BACK_COL*uBack*(25.*pow(max(dot(rf, LB()), 0.), 700.) + .6*pow(max(dot(rf, LB()), 0.), 40.));
+  return col;
+}
+void main(){
+  vec3 ro = uCamP, rd = camRay(gl_FragCoord.xy);
+  vec3 col; float depth = 900.;
+  float t = .5, id = 0.; bool hitO = false;
+  for (int i = 0; i < 150; i++) { float d = sdObj(ro + rd*t, id); if (d < .002*t) { hitO = true; break; } t += d*.9; if (t > 400.) break; }
+  float tSug; vec3 lp; bool hitS = sugarHit(ro, rd, tSug, lp);
+  float tSlab = rd.z < 0. ? -ro.z/rd.z : 1e9;
+  vec3 ps = ro + rd*tSlab;
+  bool onSlab = tSlab < 1e8 && abs(ps.x) < 32. && ps.y > -20. && ps.y < 22.;
+  float tBest = 1e9; int which = 0;
+  if (hitO && t < tBest) { tBest = t; which = 1; }
+  if (hitS && tSug < tBest) { tBest = tSug; which = 2; }
+  if (onSlab && tSlab < tBest) { tBest = tSlab; which = 3; }
+  if (which == 1) {
+    vec3 p = ro + rd*t; depth = t;
+    vec2 e = vec2(.004, 0.); float dd;
+    vec3 n = normalize(vec3(sdObj(p + e.xyy, dd) - sdObj(p - e.xyy, dd), sdObj(p + e.yxy, dd) - sdObj(p - e.yxy, dd), sdObj(p + e.yyx, dd) - sdObj(p - e.yyx, dd)));
+    sdObj(p, id);
+    vec3 rf = reflect(rd, n);
+    float fr = .04 + .96*pow(1. - max(dot(n, -rd), 0.), 5.);
+    // what a shiny object sees: the room above, and the bright marble below
+    vec3 envR = rf.z > 0. ? envCol(rf) : marbleLit((p + rf*(p.z/max(-rf.z, .05))).xy, 1.)*.9;
+    if (id == 1.) {          // polished copper, a little tarnished
+      vec3 cu = vec3(.95, .6, .45)*(.8 + .25*fbm(p.xy*3.));
+      col = cu*(envR*1.1 + vec3(1., .9, .75)*LIGHT_COL*uTop*(6.*pow(max(dot(rf, LT), 0.), 120.) + .5*pow(max(dot(rf, LT), 0.), 8.)) + vec3(1., .55, .25)*BACK_COL*uBack*1.5*pow(max(dot(rf, LB()), 0.), 10.));
+    } else if (id == 2.) {   // the hot thread: amber, lit through
+      col = vec3(.9, .45, .1)*(.5 + 1.5*BACK_COL*uBack + .6*LIGHT_COL*uTop) + envR*fr;
+    } else if (id == 3.) {   // bamboo stick
+      vec3 l = (uSugInv*vec4(p, 1.)).xyz;
+      vec3 a = mix(vec3(.62, .48, .26), vec3(.5, .37, .19), vn(vec2(l.y*3., atan(l.z - .26, l.x - ${STICK.x.toFixed(2)})*4.)));
+      col = a*(vec3(1., .88, .7)*1.15*LIGHT_COL*uTop*max(dot(n, LT), 0.) + .06) + vec3(1., .55, .2)*BACK_COL*uBack*.7*max(dot(n, LB()), 0.);
+    } else if (id >= 5.) {
+      vec3 L = LT;
+      vec3 alb = vec3(.5); float sp2 = .05, rg = .5;
+      if (id == 5.) { alb = marbleAlb(p.xy + p.z*3.)*.9; sp2 = .5; rg = .1; }                                    // polished slab edge
+      else if (id == 6.) { float g = fbm(vec2(p.x*.05, p.y*.6)); alb = mix(vec3(.16, .06, .03), vec3(.26, .11, .05), .5 + .5*sin(p.x*.12 + g*8.)); sp2 = .25; rg = .3; }  // lacquered table
+      else if (id == 7.) {   // clay stove: terracotta, soot at the top, coals glowing through its mouth
+        alb = mix(vec3(.30, .14, .08), vec3(.08, .06, .05), smoothstep(6., 13., p.z))*(.8 + .3*fbm(p.xy*.4 + p.z*.3));
+        float ang = atan(p.y - STOVE.y, p.x - STOVE.x);
+        float mouth = smoothstep(.3, .22, abs(ang + 1.6))*smoothstep(.5, 1.2, p.z)*smoothstep(6., 5.2, p.z + 2.5*(abs(ang + 1.6)/.3)*(abs(ang + 1.6)/.3));   // an arched mouth
+        float fl = .75 + .25*sin(uT*7.3 + p.x*.9) + .2*vn(vec2(p.x*.8, uT*3.));
+        col = mix(vec3(1., .22, .03), vec3(1., .5, .12), vn(vec2(ang*30., p.z*2.) + uT*2.))*2.6*fl*mouth;
+        alb *= 1. - mouth;
+        sp2 = .02;
+      }
+      else if (id == 8.) { alb = vec3(.05, .045, .04); sp2 = .6; rg = .2; }                                      // iron pot
+      else if (id == 9.) { alb = vec3(.25, .09, .01); sp2 = 1.; rg = .05; }                                      // hot syrup
+      else if (id == 10.) { alb = vec3(.4, .3, .15)*(.8 + .3*vn(vec2(p.z*.3, p.x*3.))); sp2 = .1; }              // bamboo
+      else if (id == 11.) { float sw = vn(vec2(atan(p.y - STRAW.y, p.x - STRAW.x)*30., p.z*.4)); alb = mix(vec3(.35, .25, .1), vec3(.6, .45, .2), sw); sp2 = .02; }   // straw
+      else {   // finished sugar paintings stuck in the straw, lit through by the lanterns
+        alb = vec3(.2, .08, .01); sp2 = 1.; rg = .05;
+        col = vec3(1., .5, .12)*(.9 + .6*vn(p.xz*2.))*(.6 + .8*BACK_COL*uBack);
+      }
+      if (id != 7. && id != 12.) col = vec3(0.);
+      float ndl = max(dot(n, L), 0.);
+      col += alb*(vec3(1., .88, .7)*1.15*LIGHT_COL*uTop*ndl + vec3(.03, .025, .02));
+      // warm light from the coals on the table and the pot
+      vec3 cl = vec3(STOVE + vec2(0., -9.), 4.) - p; float dc = length(cl);
+      col += alb*vec3(1., .4, .1)*30.*max(dot(n, cl/dc), 0.)/(1. + dc*dc*.05);
+      col += vec3(1., .6, .3)*BACK_COL*uBack*.5*alb*max(dot(n, LB()), 0.);
+      col += envSoft(rf)*fr*sp2 + vec3(1., .9, .75)*LIGHT_COL*uTop*pow(max(dot(rf, LT), 0.), 2./(rg*rg))*sp2*1.5;
+    } else {                 // steel spatula
+      col = vec3(.55, .55, .58)*(envR*.6 + vec3(1., .9, .75)*LIGHT_COL*uTop*3.*pow(max(dot(rf, LT), 0.), 60.) + vec3(1., .55, .25)*BACK_COL*uBack*2.*pow(max(dot(rf, LB()), 0.), 12.)) + .02;
+    }
+  } else if (which == 2) {
+    col = shadeSugar(lp, rd); depth = tSug;
+  } else if (which == 3) {
+    depth = tSlab;
+    float shS = 1.;
+    vec3 sp = ps + LT*.02;
+    if (uStick.y < .5) { vec3 l = (uSugInv*vec4(ps, 1.)).xyz; shS = 1. - .3*smoothstep(.03, .3, hS(l.xy - LT.xy/LT.z*.25)); }
+    float dl = 1e3, ts = .3; for (int i = 0; i < 32; i++) { float d = sdCaster(sp + LT*ts); dl = min(dl, d/ts); ts += clamp(d, .15, 3.); if (ts > 60.) break; }
+    shS *= mix(.4, 1., clamp(dl*6., 0., 1.));
+    col = marbleLit(ps.xy, shS);
+    vec3 n = vec3(0., 0., 1.);
+    float fr = .03 + .97*pow(1. - max(dot(n, -rd), 0.), 5.);
+    col += envSoft(reflect(rd, n))*fr*.9;
+    col += vec3(1., .5, .15)*BACK_COL*uBack*.25*exp(-pow((ps.y - 16.)*.06, 2.));
+  } else col = envCol(rd);
+  // steam rising off the syrup pot: a soft column of wisps, lit warm
+  {
+    vec2 oc = ro.xy - STOVE; float a = dot(rd.xy, rd.xy), b = dot(oc, rd.xy), cc = dot(oc, oc) - 100.;
+    float disc = b*b - a*cc;
+    if (disc > 0.) {
+      float s0 = (-b - sqrt(disc))/a, s1 = (-b + sqrt(disc))/a;
+      s0 = max(s0, 0.); s1 = min(s1, depth);
+      float acc = 0.; vec3 sc = vec3(0.);
+      for (int i = 0; i < 18; i++) {
+        float st = mix(s0, s1, (float(i) + .5)/18.);
+        vec3 sp = ro + rd*st;
+        if (sp.z < 20. || sp.z > 80.) continue;
+        float rz = length(sp.xy - STOVE - vec2(sin(sp.z*.08 + uT*.7)*2., 0.));
+        float den = smoothstep(.5, .78, fbm3(vec2(sp.x*.12 + sin(uT*.4), sp.z*.07 - uT*.9)) + .1*vn(sp.xy*.4))*smoothstep(9., 3., rz)*smoothstep(20., 26., sp.z)*smoothstep(80., 45., sp.z);
+        acc += den*(s1 - s0)/18.*.12;
+      }
+      acc = clamp(acc*1.8, 0., .7);
+      col = mix(col, vec3(.55, .42, .32)*(.35 + .8*BACK_COL*uBack) + vec3(.2, .08, .02), acc);
+    }
+  }
+  o = vec4(col, cocOf(depth*dot(rd, uCamF)));
+}`;
+const prog = SG.prog(gl, SG.VS_QUAD, FS);
+
+// ---------------- motion ----------------
+function headAt(t) {
+  const segs = SEGS;
+  const kp = (S, u) => { const x = clamp(u) * (S.length - 1), i = Math.min(S.length - 2, Math.floor(x)), f = x - i; return [lerp(S[i][0], S[i + 1][0], f), lerp(S[i][1], S[i + 1][1], f)]; };
+  if (t < segs[0][0]) return { p: segs[0][2][0], pour: 1, v: [0, 0] };
+  for (let i = 0; i < segs.length; i++) {
+    const [a, b, S] = segs[i], nx = segs[i + 1];
+    if (t >= a && t <= b) { const u = (t - a) / Math.max(b - a, 1e-3), p = kp(S, u), p2 = kp(S, Math.min(1, u + 0.02)); return { p, pour: 1, v: [(p2[0] - p[0]) / 0.02 / (b - a), (p2[1] - p[1]) / 0.02 / (b - a)] }; }
+    if (t > b && (!nx || t < nx[0])) {
+      const end = S[S.length - 1];
+      if (!nx) { const u = clamp((t - b) / 0.35); return { p: [end[0] + u * 8, end[1] + u * 6], pour: 0, v: [0, 0] }; }
+      const s = nx[2][0], u = (t - b) / (nx[0] - b);
+      return { p: [lerp(end[0], s[0], E.inOutSine(u)), lerp(end[1], s[1], E.inOutSine(u))], pour: nx[0] - b < 0.08 ? 1 : 0, v: [0, 0] };
+    }
+  }
+  return { p: [0, 0], pour: 0, v: [0, 0] };
+}
+// the ladle: precomputed at 240 Hz, top speed 45 cm/s; it rises a little while it travels and leaves up and away after the last pour
+let _lad = null;
+function LADLE(t) {
+  if (!_lad) {
+    const dt = 1 / 240, n = Math.round(10 / dt) + 1; _lad = new Float32Array(n * 3);
+    let p = null;
+    for (let i = 0; i < n; i++) {
+      const tt = i * dt, h = headAt(tt);
+      const tg = tt < 7.1 ? [h.p[0], h.p[1]] : [26, 26];
+      if (!p) p = [tg[0], tg[1], 6];
+      const vm = (tt < 7.1 ? 75 : 60) * dt;
+      const dx = tg[0] - p[0], dy = tg[1] - p[1], d = Math.hypot(dx, dy);
+      if (d > vm) { p[0] += dx / d * vm; p[1] += dy / d * vm; } else { p[0] = tg[0]; p[1] = tg[1]; }
+      const zt = tt < 7.1 ? 6 + 2.5 * clamp((Math.hypot(tg[0] - p[0], tg[1] - p[1]) - 0.4) / 3) : 16;
+      p[2] += (zt - p[2]) * Math.min(1, dt * 10);
+      _lad.set(p, i * 3);
+    }
+  }
+  const n = _lad.length / 3, x = clamp(t / 10) * (n - 1), i = Math.min(n - 2, Math.floor(x)), f = x - i;
+  return [0, 1, 2].map((d) => lerp(_lad[i * 3 + d], _lad[i * 3 + 3 + d], f));
+}
+function mat(rotX, tz, pivotY) {
+  const c = Math.cos(rotX), s = Math.sin(rotX);
+  const M = new Float32Array([1, 0, 0, 0, 0, c, s, 0, 0, -s, c, 0, 0, pivotY - c * pivotY, -s * pivotY + tz, 1]);
+  const Mi = new Float32Array([1, 0, 0, 0, 0, c, -s, 0, 0, s, c, 0, 0, 0, 0, 1]);
+  const tyy = M[13], tzz = M[14];
+  Mi[13] = -(c * tyy + s * tzz); Mi[14] = -(-s * tyy + c * tzz);
+  return [M, Mi];
+}
+const CAM = Track([
+  { t: 0, v: [-13.5, -8.5, 12.5, -11.5, 3.8, 0] },
+  { t: 1.2, v: [-6, -13, 17, -4.5, 2.6, 0] },
+  { t: 2.4, v: [2, -19, 23, 0.5, 0.5, 0] },
+  { t: 3.8, v: [0, -26, 28, 0, 0, 0] },
+  { t: 4.6, v: [-2, -31, 8.2, -0.5, 1.5, 4.4] },
+  { t: 6.5, v: [1.5, -30, 9.4, 0, 1.5, 4.6] },
+  { t: 7.55, v: [0.5, -31, 15, 0.5, -3, 3.5] },
+  { t: 8.45, v: [0.5, -52, 11, 0.5, -9.4, 11.5] },
+  { t: 10, v: [0.5, -52, 11, 0.5, -9.4, 11.5] },
+], {});
+
+Reel.scene({
+  duration: 10, fps: 30,
+  async setup() {},
+  cues: [
+    { t: 0.0, sfx: 'market', gain: 0.35 },
+    { t: 0.0, sfx: 'syrup_pour', gain: 0.55 }, { t: 1.0, sfx: 'syrup_pour', gain: 0.5 },
+    { t: 0.5, sfx: 'syrup_tick', gain: 0.4 }, { t: 1.5, sfx: 'syrup_tick', gain: 0.4 }, { t: 2.0, sfx: 'syrup_tick', gain: 0.4 },
+    { t: 2.5, sfx: 'syrup_tick', gain: 0.4 }, { t: 3.0, sfx: 'syrup_pour', gain: 0.45 }, { t: 3.5, sfx: 'syrup_tick', gain: 0.4 },
+    { t: 4.0, sfx: 'glow_on', gain: 0.7 },
+    { t: 4.5, sfx: 'syrup_pour', gain: 0.45 }, { t: 5.2, sfx: 'syrup_flick', gain: 0.45 }, { t: 5.5, sfx: 'syrup_flick', gain: 0.4 }, { t: 5.9, sfx: 'syrup_pour', gain: 0.4 },
+    { t: 7.2, sfx: 'stick_press', gain: 0.6 }, { t: 7.45, sfx: 'scrape', gain: 0.5 },
+    { t: 7.82, sfx: 'sugar_lift', gain: 0.85 },
+  ],
+  render(t) {
+    const frame = Math.round(t * 30);
+    SG.bind(gl, fS); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.BLEND); gl.blendEquation(gl.MAX); gl.blendFunc(gl.ONE, gl.ONE);
+    pSugar.use().f('T', t).f('PS', MW, MH).f('VIEW', SX0, SY0, PXC);
+    ST.draw();
+    gl.blendEquation(gl.FUNC_ADD); gl.disable(gl.BLEND);
+    // the lift: pried up from 7.8, standing by 8.25
+    const lu = clamp((t - 7.8) / 0.45);
+    const rot = E.outBack(lu, 1.1) * Math.PI / 2 * (t > 7.8 ? 1 : 0);
+    const rise = E.inOutSine(clamp((t - 7.82) / 0.5)) * 6.5;
+    const [M, Mi] = mat(rot, rise, PIV);
+    const hd = headAt(t);
+    // the hand glides: a speed-limited follower of the pour point; the thread only falls when the spout is over the line
+    const lf = LADLE(t);
+    const lad = [lf[0] + 0.45, lf[1] + 0.15, lf[2] + 0.35 * Math.sin(t * 3)];
+    const v = hd.v;
+    const near = Math.hypot(lf[0] - hd.p[0], lf[1] - hd.p[1]) < 0.45;
+    const s0 = [lad[0] - 1.25, lad[1], lad[2] - 0.55], s2 = [hd.p[0], hd.p[1], 0.05], s1 = [lerp(s0[0], s2[0], 0.5) - v[0] * 0.015, lerp(s0[1], s2[1], 0.5) - v[1] * 0.015, lerp(s0[2], s2[2], 0.45)];
+    const ladOn = t < 7.7 ? 1 : 0;
+    const streamOn = ladOn && hd.pour && near && t < 7.1 ? 1 : 0;
+    const c = CAM(t);
+    const cam = CD.cam([c[0], c[1], c[2]], [c[3], c[4], c[5]], t < 4.4 ? 34 : 30);
+    const focusP = t < 3.6 ? [hd.p[0], hd.p[1], 0] : t < 7.6 ? [0, 1.5, 0] : [0.5, PIV, lerp(0, 11, clamp((t - 7.8) / 0.5))];
+    const focus = CD.depthOf(cam, focusP);
+    const back = E.inOutSine(clamp((t - 3.92) / 0.2));
+    POST.begin();
+    const P = prog.use();
+    CD.camU(P, cam, focus, t < 4 ? 16 : 30);
+    gl.uniformMatrix4fv(P.loc('uSug'), false, M); gl.uniformMatrix4fv(P.loc('uSugInv'), false, Mi);
+    const spX = lerp(-28, 1.0, E.outCubic(clamp((t - 7.45) / 0.3)));
+    P.t('uS', tS).f('uT', t).f('uBack', back).f('uTop', lerp(1, 0.6, back)).f('uLad', ...lad)
+      .f('uS0', ...s0).f('uS1', ...s1).f('uS2', ...s2).f('uStream', streamOn).f('uLadOn', ladOn)
+      .f('uStick', t > 7.2 ? 1 : 0, t > 7.8 ? 1 : 0, 0, 0)
+      .f('uSpat', spX, t > 7.45 && t < 8.15 ? 1 : 0, 0, 0);
+    QUAD.draw();
+    POST.finish({ exposure: lerp(0.85, 1.0, back), vignette: 0.42, grain: 0.03, ca: 0.3, seed: frame % 97, bloom: 0.16, bloomThresh: 1.4,
+      tint: [1.0, 0.98, 0.95], sat: 1.04, contrast: 1.05, dof: 34 });
+  },
+});
+</script></body></html>

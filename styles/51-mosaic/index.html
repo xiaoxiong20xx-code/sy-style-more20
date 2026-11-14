@@ -1,0 +1,550 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>51 马赛克 · Mosaic</title>
+<script src="../../lib/core.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script><script src="../../lib/track.js"></script><script src="../../lib/mosaic.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 51 马赛克 · BYZANTINE MOSAIC =====
+   A wall panel of tesserae in a dark chapel: a golden peacock on a lapis ground inside a red-and-white border.
+   The tesserae are laid the way a mosaicist lays them (andamento): rows that follow the bird's outline inside and out,
+   a black outline row, three halo rows of lapis, then straight courses; gold-leaf glass tiles are set each at its own
+   small angle, so a passing lamp makes them flash one after another.
+   0-3 s: steel tweezers press the last tesserae of the head into wet bedding mortar on the beats, the eye last.
+   Hook: the camera trucks along the wall while an oil lamp is carried the other way; the gold ignites in a wave.
+   8.0: a damp cloth sweeps across the panel and wipes off the mortar haze; the tesserae come up clean and wet.
+   Renderer: tiles from contour tracing (lib/mosaic.js) in a data texture + cell lists; relief ray-marched
+   analytically (crisp edges at any zoom), per-tile tilt and bevel, lamp shadows within the relief, gold leaf under
+   glass, smalti, stone, wet / dry lime mortar, cloth and tweezers as SDFs, depth of field. */
+const { E, clamp, inv, lerp } = Reel;
+const stage = Reel.makeStage('#070605');
+Reel.ownJitter = true;
+const DBG = Reel.Q.get('cam');
+const S = 0.030;                          // tessera size (1 unit ~ 33 cm -> 1 cm tesserae)
+const PX0 = -1.70, PY0 = -1.00, CS = 0.02, NXC = 170, NYC = 100;
+
+const rm = Reel.RM(stage, {
+  bloom: 0.30, th: 0.9, expo: 1.0, vig: 0.42, grain: 0.03, ca: 0.45, contrast: 1.05, sat: 1.0, bands: 8,
+  lift: [0.005, 0.004, 0.003], gain: [1.0, 0.99, 0.97],
+  uniforms: `
+uniform sampler2D uTiles, uCells;
+uniform vec3 uRo, uTa; uniform float uTanF, uTm;
+uniform vec3 uLamp; uniform float uLampI, uWipe, uFill, uWet;
+uniform vec4 uTw, uFly, uCloth;`,
+  scene: `
+const vec2 P0 = vec2(${PX0}, ${PY0}); const float CSZ = ${CS}; const int NXC = ${NXC}, NYC = ${NYC};
+const float ZT = .0072, ZB = -.0025;
+const vec3 LIGHT_COL = vec3(1.);   // colour of the oil lamp (all its entry points); vec3(1.) = original look
+vec4 TT(int i, int k){ int idx = i*3 + k; return texelFetch(uTiles, ivec2(idx & 1023, idx >> 10), 0); }
+float h1(float n){ return fract(sin(n*127.1 + 311.7)*43758.5453); }
+vec2 edgeN(vec2 a, vec2 b){ vec2 d = b - a; return normalize(vec2(d.y, -d.x)); }
+float tileD(vec2 q, vec4 a, vec4 b, vec4 c, out vec2 lq){
+  vec2 d = q - a.xy; float cs = cos(a.z), sn = sin(a.z);
+  lq = vec2(cs*d.x + sn*d.y, -sn*d.x + cs*d.y);
+  float hl = a.w, hw = b.x, k = c.w*91.7;
+  float m = min(hl, hw)*.34;
+  // each corner knocked a little off square by the hammer
+  vec2 p0 = vec2(-hl, -hw) + (vec2(h1(k), h1(k + 1.)) - .5)*m;
+  vec2 p1 = vec2( hl, -hw) + (vec2(h1(k + 2.), h1(k + 3.)) - .5)*m;
+  vec2 p2 = vec2( hl,  hw) + (vec2(h1(k + 4.), h1(k + 5.)) - .5)*m;
+  vec2 p3 = vec2(-hl,  hw) + (vec2(h1(k + 6.), h1(k + 7.)) - .5)*m;
+  float e = max(max(dot(lq - p0, edgeN(p0, p1)), dot(lq - p1, edgeN(p1, p2))), max(dot(lq - p2, edgeN(p2, p3)), dot(lq - p3, edgeN(p3, p0))));
+  // one or two chips out of the edges
+  for (int i = 0; i < 2; i++){
+    float hi = h1(k + 11. + float(i)*5.);
+    if (hi < .50) continue;
+    float ei = floor(h1(k + 12. + float(i)*5.)*4.); float tt = .2 + .6*h1(k + 13. + float(i)*5.);
+    vec2 A = ei < .5 ? p0 : ei < 1.5 ? p1 : ei < 2.5 ? p2 : p3;
+    vec2 B = ei < .5 ? p1 : ei < 1.5 ? p2 : ei < 2.5 ? p3 : p0;
+    float rc = min(hl, hw)*(.22 + .30*h1(k + 14. + float(i)*5.));
+    vec2 cc = mix(A, B, tt) + edgeN(A, B)*rc*.80;
+    e = max(e, -(length(lq - cc) - rc));
+  }
+  return e;
+}
+float tileTop(vec2 lq, float d, vec4 b, vec4 c){
+  float rough = c.x == 0. || c.x == 2. || c.x == 6. || c.x == 7. || c.x == 8. ? .6 : c.x == 1. ? .3 : 1.;   // glass faces are smoother than cleaved stone
+  float top = b.y + b.z*lq.x + b.w*lq.y + rough*(.00034*(vnoise2(lq*170. + b.y*9000.) - .5) + .00016*(vnoise2(lq*560. + b.x*3000.) - .5));
+  float R = .0011;
+  float e = max(d + R, 0.);
+  return top - R + sqrt(max(R*R - e*e, 0.));
+}
+float mortarH(vec2 q){ return -.0009 + .00025*vnoise2(q*180.) + .0002*vnoise2(q*900.); }
+float gTid; float gDmin; vec2 gLq;
+float hf(vec2 q){
+  gTid = -1.; gDmin = .05;
+  float m = mortarH(q);
+  // outside the panel: the plaster wall, a step back
+  vec2 pr = abs(q) - vec2(1.60, .90);
+  if (max(pr.x, pr.y) > 0.) { gTid = -2.; return -.0025 + .0004*vnoise2(q*60.); }
+  ivec2 ci = ivec2(floor((q - P0)/CSZ));
+  vec4 A = texelFetch(uCells, ivec2(ci.x*2, ci.y), 0), B = texelFetch(uCells, ivec2(ci.x*2 + 1, ci.y), 0);
+  float ids[8] = float[8](A.x, A.y, A.z, A.w, B.x, B.y, B.z, B.w);
+  float h = -1.;
+  for (int k = 0; k < 8; k++){
+    float id = ids[k]; if (id < 0.) break;
+    int i = int(id);
+    vec4 c = TT(i, 2); if (uTm < c.z) continue;
+    vec4 a = TT(i, 0), b = TT(i, 1);
+    vec2 lq; float d = tileD(q, a, b, c, lq);
+    gDmin = min(gDmin, d);
+    if (d < 0.) { float th = tileTop(lq, d, b, c); if (th > h) { h = th; gTid = id; gLq = lq; } }
+  }
+  // bedding mortar squeezes up a little against the tile edges
+  m += .0007*smoothstep(.0035, 0., gDmin);
+  if (h > m) return h;
+  gTid = -1.; return m;
+}
+// ------------------------------------------------------------ objects: tweezers, a tile in flight, the cloth
+vec3 TWA = normalize(vec3(.55, .42, .72));
+float sdTweezers(vec3 p){
+  vec3 q = p - uTw.xyz;
+  vec3 A = TWA, Sv = normalize(cross(A, vec3(0., 0., 1.))), W = cross(A, Sv);
+  float u = dot(q, A), v = dot(q, Sv), w = dot(q, W);
+  float uu = clamp(u, 0., .62);
+  float d = 1e3;
+  for (int s = -1; s <= 1; s += 2){
+    float off = float(s)*(uTw.w*.5 + .0019 + .028*uu*uu*2.2);
+    float wid = mix(.0028, .0105, smoothstep(0., .25, uu));
+    float bd = max(max(abs(v - off) - .0018, abs(w) - wid), max(-u, u - .62));
+    d = min(d, bd);
+  }
+  return d*.8;
+}
+float sdFly(vec3 p, out vec2 lq){
+  int i = int(uFly.w); vec4 a = TT(i, 0), b = TT(i, 1);
+  vec3 q = p - uFly.xyz; float cs = cos(a.z), sn = sin(a.z);
+  lq = vec2(cs*q.x + sn*q.y, -sn*q.x + cs*q.y);
+  return sdRoundBox(vec3(lq, q.z), vec3(a.w, b.x, .0032), .0018);
+}
+float spongePores(vec3 q){
+  // open pores at two scales: cellular-ish holes carved from value noise
+  float a = smoothstep(.56, .80, vnoise(q*70.)), b = smoothstep(.60, .82, vnoise(q*170. + 7.));
+  return a + .6*b;
+}
+float sdCloth(vec3 p){
+  // a natural sea sponge pressed to the wall: a lumpy rounded body full of open pores
+  vec3 q = p - uCloth.xyz;
+  float d = sdEllipsoid(q, vec3(.21, .15, .10));
+  d += .030*(vnoise(q*9.) - .5) + .012*(vnoise(q*23. + 3.) - .5);
+  d += .016*spongePores(q);
+  return d*.55;
+}
+vec2 mapObj(vec3 p){
+  vec2 r = vec2(1e3, 0.);
+  if (uTw.x > -9.) { float d = sdTweezers(p); if (d < r.x) r = vec2(d, 1.); }
+  if (uFly.w >= 0.) { vec2 lq; float d = sdFly(p, lq); if (d < r.x) r = vec2(d, 2.); }
+  if (uCloth.w > 0.) { float d = sdCloth(p); if (d < r.x) r = vec2(d, 3.); }
+  return r;
+}
+vec3 nObj(vec3 p){ vec2 k = vec2(1., -1.)*.0004; return normalize(k.xyy*mapObj(p + k.xyy).x + k.yyx*mapObj(p + k.yyx).x + k.yxy*mapObj(p + k.yxy).x + k.xxx*mapObj(p + k.xxx).x); }
+// ------------------------------------------------------------ materials
+vec3 matCol(float m, float sd, out float rough, out float metal, out float kind){
+  // kind: 0 stone (matte), 1 smalto (glass), 2 gold leaf under glass
+  rough = .55; metal = 0.; kind = 0.;
+  float j = fract(sd*17.31), j2 = fract(sd*5.77);
+  vec3 c;
+  if (m < .5) { c = mix(vec3(.06, .19, .44), vec3(.04, .13, .33), j); kind = 1.; }        // lapis smalto
+  else if (m < 1.5) { c = mix(vec3(1., .78, .38), vec3(.92, .66, .28), j); kind = 2.; metal = 1.; }   // gold
+  else if (m < 2.5) { c = mix(vec3(.10, .56, .55), vec3(.06, .44, .48), j); kind = 1.; }  // turquoise
+  else if (m < 3.5) { c = vec3(.045, .042, .040)*(.8 + .4*j); }                           // black stone
+  else if (m < 4.5) { c = vec3(.88, .86, .80)*(.88 + .12*j); }                            // white marble
+  else if (m < 5.5) { c = mix(vec3(.56, .16, .10), vec3(.46, .13, .09), j); }             // red stone
+  else if (m < 6.5) { c = mix(vec3(.12, .42, .20), vec3(.08, .34, .18), j); kind = 1.; }  // green smalto
+  else if (m < 7.5) { c = mix(vec3(.03, .09, .26), vec3(.02, .06, .19), j); kind = 1.; }  // deep blue
+  else if (m < 8.5) { c = vec3(.70, .08, .06); kind = 1.; }                               // red glass
+  else { c = vec3(.40, .20, .12)*(.85 + .3*j); }                                          // ochre stone
+  if (kind == 1.) rough = .16 + .10*j2;
+  if (kind == 2.) rough = .09 + .05*j2;
+  return pow(c, vec3(2.0));                // authored in display values -> linear albedo
+}
+float D_GGX(float nh, float a){ float a2 = a*a; float d = nh*nh*(a2 - 1.) + 1.; return a2/(PI*d*d); }
+float hfShadow(vec3 p, vec3 L, float Ld){
+  // march toward the lamp inside the relief slab only
+  float r = 1.;
+  if (L.z <= 0.) return 1.;
+  float tEnd = min((ZT - p.z)/L.z, Ld);
+  float t = .0008;
+  for (int i = 0; i < 14; i++){
+    vec3 q = p + L*t; float h = hf(q.xy);
+    r = min(r, clamp((q.z - h)/(t*.08) + .5, 0., 1.));
+    t += max(tEnd/14., .0006);
+    if (t > tEnd || r < .02) break;
+  }
+  return r;
+}
+vec3 env(vec3 r){ return mix(vec3(.02, .015, .011), vec3(.11, .085, .06), smoothstep(-.3, .9, r.y)) + LIGHT_COL*vec3(1., .80, .60)*.35*pow(max(dot(r, normalize(uLamp)), 0.), 4.); }
+vec3 shadeSurf(vec3 p, vec3 n, vec3 v, vec3 alb, float rough, float metal, float kind, float sh, float ao, float haze){
+  vec3 Lv = uLamp - p; float Ld = length(Lv); vec3 L = Lv/Ld;
+  vec3 Lc = LIGHT_COL*vec3(1., .80, .60)*uLampI/(1. + Ld*Ld*.7);
+  rough = mix(rough, .45, haze*.5);
+  float ndl = max(dot(n, L), 0.), nv = max(dot(n, v), 1e-3);
+  vec3 h = normalize(L + v); float nh = max(dot(n, h), 0.);
+  float a = max(rough*rough, .003);
+  vec3 col = vec3(0.);
+  if (kind > 1.5) {
+    // gold leaf under a thin glass skin
+    vec3 F = alb + (1. - alb)*pow(1. - max(dot(h, v), 0.), 5.);
+    col += D_GGX(nh, a)*F*.25/max(nv, .2)*ndl*Lc*sh*(1. - haze*.55);
+    col += alb*ndl*Lc*sh*.10;                                       // the crumpled leaf scatters a little
+    col += env(reflect(-v, n))*alb*1.2;
+    col += D_GGX(nh, .02)*.04*.25/max(nv, .2)*ndl*Lc*sh;             // the glass skin's own glint
+  } else {
+    float f0 = kind > .5 ? .05 : .03;
+    float F = f0 + (1. - f0)*pow(1. - max(dot(h, v), 0.), 5.);
+    col += alb*ndl*Lc*sh*(1. - F)/PI*2.6;
+    col += D_GGX(nh, a)*F*.25/max(nv, .2)*ndl*Lc*sh*(kind > .5 ? 1. : .4)*(1. - haze*.5);
+    col += env(reflect(-v, n))*F*(kind > .5 ? 1. : .3);
+  }
+  // a soft cool fill from the nave so the stone ground never goes black
+  vec3 Lf = normalize(vec3(-.3, .5, 1.));
+  col += alb*(1. - metal*.7)*vec3(.050, .055, .065)*uFill*(.4 + .6*max(dot(n, Lf), 0.))*ao;
+  return col;
+}
+// ------------------------------------------------------------ render
+vec3 render(vec2 fc){
+  vec2 uvn = (2.*fc - uRes)/uRes.y;
+  vec3 ww = normalize(uTa - uRo), uu = normalize(cross(ww, vec3(0., 1., 0.))), vv = cross(uu, ww);
+  vec3 rd = normalize(ww + (uu*uvn.x + vv*uvn.y)*uTanF), ro = uRo;
+  // objects in front of the wall
+  float to = 0.; vec2 ho = vec2(1e3, 0.); bool hitO = false;
+  float tw0 = (ZT - ro.z)/rd.z;
+  for (int i = 0; i < 120; i++){
+    vec3 p = ro + rd*to; ho = mapObj(p);
+    if (ho.x < .0002) { hitO = true; break; }
+    to += ho.x; if (to > tw0 + .02) break;
+  }
+  // the relief: linear search between the top and bottom planes, then bisection
+  float t0 = (ZT - ro.z)/rd.z, t1 = (ZB - ro.z)/rd.z;
+  float th = t1; bool hitW = false;
+  float dt = (t1 - t0)/28.;
+  float tp = t0;
+  for (int i = 1; i <= 28; i++){
+    float t = t0 + dt*float(i);
+    vec3 p = ro + rd*t;
+    if (p.z < hf(p.xy)) {
+      float a = tp, b = t;
+      for (int k = 0; k < 7; k++){ float m = .5*(a + b); vec3 q = ro + rd*m; if (q.z < hf(q.xy)) b = m; else a = m; }
+      th = b; hitW = true; break;
+    }
+    tp = t;
+  }
+  vec3 col; vec3 v = -rd;
+  if (hitO && (!hitW || to < th)) {
+    vec3 p = ro + rd*to; vec3 n = nObj(p);
+    gDepth = to;
+    if (ho.y == 1.) {                         // steel tweezers
+      vec3 r = reflect(-v, n);
+      vec3 Lv = uLamp - p; float Ld = length(Lv); vec3 L = Lv/Ld;
+      vec3 h = normalize(L + v);
+      col = vec3(.62, .63, .65)*(env(r)*3.5 + D_GGX(max(dot(n, h), 0.), .05)*.25*LIGHT_COL*vec3(1., .80, .60)*uLampI/(1. + Ld*Ld*.7)*max(dot(n, L), 0.) + LIGHT_COL*vec3(1., .85, .7)*.10*uLampI/(1. + Ld*Ld*.7)*max(dot(n, L), 0.));
+      col += vec3(.05, .055, .06)*uFill*(.5 + .5*n.z);
+    } else if (ho.y == 2.) {                  // the tessera in the tweezers
+      int i = int(uFly.w); vec4 c = TT(i, 2);
+      float rough, metal, kind; vec3 alb = matCol(c.x, c.y, rough, metal, kind);
+      col = shadeSurf(p, n, v, alb, rough, metal, kind, 1., 1., 0.);
+    } else {                                  // the wet sponge
+      vec3 Lv = uLamp - p; float Ld = length(Lv); vec3 L = Lv/Ld;
+      vec3 q = p - uCloth.xyz;
+      float pore = clamp(spongePores(q), 0., 1.);
+      float wetS = .55 + .45*smoothstep(.08, -.03, q.z);                    // soaked, darkest where it presses the wall
+      vec3 alb = mix(vec3(.66, .50, .30), vec3(.30, .20, .10), wetS)*(1. - .80*pore)*(.85 + .3*vnoise(q*30.));
+      alb = pow(alb, vec3(2.));
+      vec3 hh = normalize(L + v);
+      col = alb*(max(dot(n, L), 0.)*LIGHT_COL*vec3(1., .80, .60)*uLampI/(1. + Ld*Ld*.7)*.9 + vec3(.06, .065, .075)*uFill*(.5 + .5*n.z));
+      col += wetS*(1. - pore)*D_GGX(max(dot(n, hh), 0.), .10)*.05*.25*LIGHT_COL*vec3(1., .80, .60)*uLampI/(1. + Ld*Ld*.7);   // wet glints on the lumps
+    }
+    return col;
+  }
+  if (!hitW) { gDepth = 30.; return vec3(.006, .005, .004); }
+  vec3 p = ro + rd*th; gDepth = th;
+  float h0 = hf(p.xy); float tid = gTid; vec2 lq = gLq; float dmin = gDmin;
+  vec3 n;
+  float e = .00025;
+  n = normalize(vec3(-(hf(p.xy + vec2(e, 0.)) - hf(p.xy - vec2(e, 0.)))/(2.*e), -(hf(p.xy + vec2(0., e)) - hf(p.xy - vec2(0., e)))/(2.*e), 1.));
+  hf(p.xy);
+  vec3 Lv = uLamp - p; float Ld = length(Lv); vec3 L = Lv/Ld;
+  float sh = hfShadow(p + n*.0003, L, Ld);
+  float band = smoothstep(.19, .13, abs(p.y - uCloth.y));                          // the strip the sponge has wiped
+  float haze = 1. - band*smoothstep(uWipe + .02, uWipe - .20, p.x);
+  float ao = clamp(.55 + 300.*(p.z - (-.0009)), .35, 1.);
+  if (tid >= 0.) {
+    int i = int(tid); vec4 c = TT(i, 2);
+    float rough, metal, kind; vec3 alb = matCol(c.x, c.y, rough, metal, kind);
+    // stone grain / glass bubbles / crumpled leaf
+    if (kind < .5) { alb *= (.80 + .30*vnoise(vec3(p.xy*420., c.y*9.)))*(1. - .35*smoothstep(.72, .9, vnoise(vec3(p.xy*1400., c.y*3.))));
+      n = normalize(n + vec3(vnoise(vec3(p.xy*1100., 2.)) - .5, vnoise(vec3(p.xy*1100., 8.)) - .5, 0.)*.22); rough = min(rough + .1, .8); }
+    else if (kind < 1.5) {
+      // smalti: coloured glass with seed bubbles and specks, a little denser at the core
+      float sp1 = smoothstep(.88, .96, vnoise(vec3(p.xy*1500., c.y*7.))), sp2 = smoothstep(.90, .97, vnoise(vec3(p.xy*2300., c.y*3. + 4.)));
+      alb *= (1. - .55*sp1)*(1. + .9*sp2)*(.88 + .2*vnoise(vec3(p.xy*260., c.y*5.)));
+      n = normalize(n + vec3(vnoise(vec3(p.xy*380., 3.)) - .5, vnoise(vec3(p.xy*380., 6.)) - .5, 0.)*.12);
+    } else {
+      // gold leaf under a thin glass skin: the leaf is crackled and slightly crumpled
+      float cr = smoothstep(.035, .0, abs(vnoise(vec3(p.xy*620., c.y*11.)) - .5));
+      alb *= 1. - .45*cr;
+      n = normalize(n + vec3(vnoise(vec3(p.xy*700., 1.)) - .5, vnoise(vec3(p.xy*700., 5.)) - .5, 0.)*.08);
+    }
+    // haze of dried mortar on the faces until the cloth passes
+    alb = mix(alb, vec3(.42, .40, .36), haze*.12*(kind > 1.5 ? .5 : 1.));
+    col = shadeSurf(p, n, v, alb, rough, metal, kind, sh, ao, haze);
+    // after the wipe: a wet film that catches the lamp
+    float wet = (1. - haze)*uWet;
+    vec3 hh = normalize(L + v);
+    vec3 nw = normalize(n*vec3(.35, .35, 1.));                       // the water film smooths the faces
+    col *= 1. - .18*wet*(kind < 1.5 ? 1. : 0.);                       // wet stone and glass go a shade deeper
+    col += wet*D_GGX(max(dot(nw, hh), 0.), .035)*.035*.25*LIGHT_COL*vec3(1., .80, .60)*uLampI/(1. + Ld*Ld*.7);
+    col += wet*env(reflect(-v, nw))*.10;
+  } else if (tid > -1.5) {
+    // lime bedding mortar: wet and dark near the fresh work, dry and pale elsewhere
+    float wetM = max(clamp(1. - length(p.xy - vec2(.375, .175))*2.2, 0., 1.), (1. - haze)*uWet*.8);
+    vec3 alb = mix(vec3(.50, .48, .43), vec3(.25, .24, .22), wetM)*(.72 + .28*vnoise(vec3(p.xy*500., 2.)) + .25*(vnoise(vec3(p.xy*2600., 7.)) - .5));
+    float rough = mix(.85, .25, wetM);
+    col = shadeSurf(p, n, v, alb, rough, 0., 0., sh, ao*.8, 0.);
+    vec3 hh = normalize(L + v);
+    col += wetM*D_GGX(max(dot(n, hh), 0.), .08)*.03*.25*LIGHT_COL*vec3(1., .80, .60)*uLampI/(1. + Ld*Ld*1.4);
+  } else {
+    // plaster wall around the panel
+    vec3 alb = vec3(.30, .26, .21)*(.8 + .3*vnoise(vec3(p.xy*30., 4.)));
+    col = shadeSurf(p, n, v, alb, .9, 0., 0., sh, 1., 0.)*.7;
+  }
+  return col;
+}`,
+});
+
+/* ------------------------------------------------------------------ the design: two peacocks at a kantharos (2D distance fields) */
+const hyp = Math.hypot;
+const sdC = (x, y, cx, cy, r) => hyp(x - cx, y - cy) - r;
+function sdT(x, y, ax, ay, bx, by, ra, rb) { const pax = x - ax, pay = y - ay, bax = bx - ax, bay = by - ay; const h = clamp((pax * bax + pay * bay) / (bax * bax + bay * bay)); return hyp(pax - bax * h, pay - bay * h) - lerp(ra, rb, h); }
+function sdE(x, y, cx, cy, rx, ry, a) { const c = Math.cos(a), s = Math.sin(a); const dx = x - cx, dy = y - cy; const u = c * dx + s * dy, v = -s * dx + c * dy; const k0 = hyp(u / rx, v / ry), k1 = hyp(u / (rx * rx), v / (ry * ry)); return k0 * (k0 - 1) / Math.max(k1, 1e-6); }
+const smin = (a, b, k) => { const h = clamp(0.5 + 0.5 * (b - a) / k); return lerp(b, a, h) - k * h * (1 - h); };
+// Catmull-Rom through [x, y, r] keys -> a dense chain of tapered capsules (smooth, flowing outlines)
+function curve(P, n) { const out = []; for (let k = 0; k <= n; k++) { const u = k / n * (P.length - 1), i = Math.min(P.length - 2, Math.floor(u)), f = u - i; const p0 = P[Math.max(0, i - 1)], p1 = P[i], p2 = P[i + 1], p3 = P[Math.min(P.length - 1, i + 2)];
+  out.push([0, 1, 2].map((j) => 0.5 * (2 * p1[j] + (-p0[j] + p2[j]) * f + (2 * p0[j] - 5 * p1[j] + 4 * p2[j] - p3[j]) * f * f + (-p0[j] + 3 * p1[j] - 3 * p2[j] + p3[j]) * f * f * f))); } return out; }
+function chain(x, y, C) { let d = 1e3; for (let k = 0; k < C.length - 1; k++) { const a = C[k], b = C[k + 1]; d = Math.min(d, sdT(x, y, a[0], a[1], b[0], b[1], a[2], b[2])); } return d; }
+// the right-hand peacock (the left one is its mirror), drinking at the rim of the cup
+const NECK = curve([[0.650, -0.16, 0.055], [0.616, -0.045, 0.048], [0.598, 0.065, 0.042], [0.586, 0.158, 0.037], [0.556, 0.236, 0.033], [0.505, 0.274, 0.030], [0.448, 0.264, 0.029], [0.410, 0.214, 0.028]], 40);
+const TAIL = curve([[0.93, -0.27, 0.075], [1.06, -0.33, 0.105], [1.17, -0.42, 0.125], [1.25, -0.53, 0.126], [1.30, -0.63, 0.100], [1.33, -0.72, 0.062], [1.345, -0.768, 0.030]], 40);
+const OCE = [[1.035, -0.300], [1.145, -0.385], [1.225, -0.495], [1.285, -0.615], [1.095, -0.505]];
+const EYE = [0.374, 0.174];
+function pBody(X, y) { return sdE(X, y, 0.800, -0.222, 0.190, 0.125, -0.34); }
+function pWing(X, y) { return sdE(X, y, 0.822, -0.210, 0.125, 0.070, -0.34); }
+function pHead(X, y) { return sdC(X, y, 0.386, 0.168, 0.043); }
+function pBeak(X, y) { return sdT(X, y, 0.356, 0.150, 0.302, 0.106, 0.017, 0.004); }
+function pCrest(X, y) { let d = 1e3; for (const [ex, ey] of [[0.355, 0.292], [0.388, 0.308], [0.421, 0.292]]) d = Math.min(d, sdT(X, y, 0.388, 0.205, ex, ey, 0.007, 0.007), sdC(X, y, ex, ey, 0.017)); return d; }
+function pLegs(X, y) { return Math.min(sdT(X, y, 0.765, -0.32, 0.755, -0.648, 0.015, 0.012), sdT(X, y, 0.845, -0.325, 0.865, -0.648, 0.015, 0.012), sdT(X, y, 0.755, -0.648, 0.695, -0.66, 0.011, 0.009), sdT(X, y, 0.865, -0.648, 0.805, -0.66, 0.011, 0.009)); }
+function pTail(X, y) {
+  let d = chain(X, y, TAIL);
+  let sc = 1e3; for (let k = 0; k < 7; k++) { const u = k / 6, c = TAIL[Math.round(6 + u * 26)]; const tx = TAIL[Math.round(6 + u * 26) + 1][0] - c[0], ty = TAIL[Math.round(6 + u * 26) + 1][1] - c[1], tl = Math.hypot(tx, ty) || 1; sc = Math.min(sc, sdC(X, y, c[0] + ty / tl * (c[2] + 0.030), c[1] - tx / tl * (c[2] + 0.030), 0.038)); }   // feather tips along the outer edge of the train
+  return Math.max(d, -sc);
+}
+function birdR(X, y) {
+  let d = pBody(X, y);
+  d = smin(d, chain(X, y, NECK), 0.045);
+  d = smin(d, pHead(X, y), 0.025);
+  d = Math.min(d, pBeak(X, y), pCrest(X, y));
+  d = smin(d, pTail(X, y), 0.06);
+  return Math.min(d, pLegs(X, y));
+}
+// the kantharos: foot, stem with a knop, a deep bowl under a rolled rim, two ring handles
+function cup(x, y) {
+  const X = Math.abs(x);
+  const foot = Math.max(X - lerp(0.165, 0.055, clamp((y + 0.66) / 0.07)), Math.max(-0.665 - y, y + 0.59));
+  const stem = sdT(X, y, 0, -0.60, 0, -0.32, 0.030, 0.026);
+  const knop = sdE(X, y, 0, -0.46, 0.062, 0.036, 0);
+  const bowl = Math.max(sdE(X, y, 0, 0.04, 0.27, 0.34, 0), y - 0.062);
+  const rim = sdT(X, y, 0, 0.082, 0.285, 0.082, 0.024, 0.022);
+  const handle = Math.max(Math.abs(sdC(X, y, 0.30, -0.035, 0.085)) - 0.017, 0.272 - X);
+  return Math.min(smin(bowl, stem, 0.04), knop, foot, rim, handle);
+}
+const GROUND = -0.655;
+function fig(x, y) { return Math.min(birdR(x, y), birdR(-x, y), cup(x, y)); }
+const bird = fig;   // (the row layout below works on the whole figure)
+const rect = (x, y) => Math.max(Math.abs(x) - 1.60, Math.abs(y) - 0.90);
+// material of a tessera centred at (x, y) on interior row k (0 lapis, 1 gold, 2 turquoise, 3 black, 4 white, 5 red stone, 6 green, 7 deep blue, 8 red glass, 9 ochre)
+function birdMat(x, y, k) {
+  const X = Math.abs(x);
+  if (cup(x, y) < birdR(X, y)) {
+    if (Math.abs(y - 0.082) < 0.03) return k % 2 ? 4 : 1;                                     // the rolled rim
+    if (k === 2 && y < 0.0 && y > -0.2) { const g = Math.round((x + 0.3) / 0.075); return g % 2 ? 8 : 2; }   // a band of gems round the bowl
+    if (Math.abs(y + 0.46) < 0.03) return k === 0 ? 1 : 4;                                     // the knop
+    return 1;
+  }
+  const de = hyp(X - EYE[0], y - EYE[1]);
+  if (de < 0.013) return 3;
+  if (de < 0.030) return 4;
+  if (pBeak(X, y) < 0.004) return 4;
+  if (pLegs(X, y) < 0.004) return 9;
+  if (pCrest(X, y) < 0.004 && y > 0.21) return hyp(X - 0.388, y - 0.30) < 0.025 || hyp(X - 0.355, y - 0.292) < 0.025 || hyp(X - 0.421, y - 0.292) < 0.025 ? 1 : 2;
+  if (pHead(X, y) < 0.006 || chain(X, y, NECK) < 0.002) return k % 3 === 1 ? 7 : 2;           // iridescent neck: turquoise with deep-blue rows
+  let doc = 1e3; for (const [ox, oy] of OCE) doc = Math.min(doc, hyp(X - ox, y - oy));
+  if (pTail(X, y) < 0.004 && pBody(X, y) > 0) return doc < 0.024 ? 7 : doc < 0.042 ? 2 : doc < 0.060 ? 1 : (k % 2 ? 6 : 1);
+  if (pWing(X, y) < 0) return k % 2 ? 9 : 1;                                                   // gold-and-ochre wing coverts
+  return k % 2 ? 7 : 2;                                                                        // the blue breast and back
+}
+/* ------------------------------------------------------------------ lay the tesserae */
+let TILES = [], tTiles = null, tCells = null;
+function layTesserae() {
+  const R = Reel.rng(5151);
+  const gs = 0.006, x0 = -1.70, y0 = -1.00, nx = Math.round(3.4 / gs) + 1, ny = Math.round(2.0 / gs) + 1;
+  const FB = new Float32Array(nx * ny), FR = new Float32Array(nx * ny);
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) { const x = x0 + i * gs, y = y0 + j * gs; FB[j * nx + i] = bird(x, y); FR[j * nx + i] = rect(x, y); }
+  const tiles = [];
+  // spatial hash for overlap rejection
+  const HS = S * 0.7, hash = new Map();
+  const hk = (x, y) => Math.floor(x / HS) * 100003 + Math.floor(y / HS);
+  const fits = (x, y, minD) => { const cx = Math.floor(x / HS), cy = Math.floor(y / HS); for (let a = -2; a <= 2; a++) for (let b = -2; b <= 2; b++) { const l = hash.get((cx + a) * 100003 + cy + b); if (l) for (const t of l) if (hyp(t.x - x, t.y - y) < minD) return false; } return true; };
+  const put = (t) => { tiles.push(t); const k = hk(t.x, t.y); const l = hash.get(k); if (l) l.push(t); else hash.set(k, [t]); };
+  const addRow = (lines, matFn, k, minD = S * 0.78) => {
+    for (const pts of lines) {
+      const closed = hyp(pts[0][0] - pts[pts.length - 1][0], pts[0][1] - pts[pts.length - 1][1]) < 0.02;
+      for (const c of MS.alongLine(pts, S, R, closed)) {
+        if (rect(c.x, c.y) > -S * 0.5) continue;
+        if (!fits(c.x, c.y, minD)) continue;
+        const m = matFn(c.x, c.y, k);
+        if (m < 0) continue;
+        put({ x: c.x, y: c.y, ang: c.ang + (R() - 0.5) * 0.14, hl: S * (0.37 + 0.10 * R()), hw: S * (0.36 + 0.08 * R()), mat: m });
+      }
+    }
+  };
+  // 1. the border: four rows following the panel edge
+  const BM = [5, 4, 5, 3];
+  for (let k = 0; k < 4; k++) addRow(MS.contours(FR, nx, ny, x0, y0, gs, -S * (k + 0.55)), () => BM[k], k);
+  // legs: a single course of ochre stone each, laid first so the black outline wraps round it
+  for (const sx of [1, -1]) for (const L of [[[0.765, -0.335], [0.757, -0.50], [0.755, -0.648], [0.70, -0.662]], [[0.845, -0.340], [0.858, -0.50], [0.865, -0.648], [0.81, -0.662]]]) {
+    const pts = L.map(([x, y]) => [x * sx, y]);
+    for (const c of MS.alongLine(pts, S, R, false)) if (fits(c.x, c.y, S * 0.7)) put({ x: c.x, y: c.y, ang: c.ang + (R() - 0.5) * 0.12, hl: S * (0.38 + 0.08 * R()), hw: S * (0.34 + 0.06 * R()), mat: 9 });
+  }
+  // 2. the outline row around the bird (black), then three halo rows of lapis
+  addRow(MS.contours(FB, nx, ny, x0, y0, gs, S * 0.5), () => 3, 0);
+  for (let k = 1; k <= 3; k++) addRow(MS.contours(FB, nx, ny, x0, y0, gs, S * (k + 0.5)), (x, y) => (y < GROUND ? 6 : R() < 0.12 ? 7 : 0), k);
+  // 3. inside the bird, row by row toward the middle
+  for (let k = 0; k < 14; k++) { const L = MS.contours(FB, nx, ny, x0, y0, gs, -S * (k + 0.5)); if (!L.length) break; addRow(L, (x, y) => birdMat(x, y, k), k, S * 0.74); }
+  // 4. the ground: straight courses (opus tessellatum), offset every other row
+  for (let j = 0; ; j++) {
+    const y = -0.90 + S * (4.6 + j * 1.0); if (y > 0.90 - S * 4.5) break;
+    for (let x = -1.60 + S * (4.4 + (j % 2) * 0.5 + R() * 0.3); x < 1.60 - S * 4.4; x += S * (0.95 + 0.1 * R())) {
+      if (bird(x, y) < S * 4.0) continue;
+      if (!fits(x, y, S * 0.8)) continue;
+      const fl = Math.sin(x * 9.1) * Math.cos(x * 4.3) > 0.82 && y < GROUND - 0.03;            // a few flowers in the meadow
+      const m = y < GROUND ? (fl ? (R() < 0.5 ? 8 : 4) : 6) : (R() < 0.12 ? 7 : 0);
+      put({ x, y: y + (R() - 0.5) * 0.003, ang: (R() - 0.5) * 0.08, hl: S * (0.37 + 0.10 * R()), hw: S * (0.36 + 0.08 * R()), mat: m });
+    }
+  }
+  // per-tile height and tilt: gold is set at deliberate angles so it sparkles; stone sits flatter
+  for (const t of tiles) {
+    const gold = t.mat === 1;
+    t.h = 0.0030 + (R() - 0.5) * 0.0016;
+    const glass = t.mat === 0 || t.mat === 2 || t.mat === 6 || t.mat === 7 || t.mat === 8;
+    const tl = gold ? 0.32 : glass ? 0.13 : 0.08;
+    t.tx = (R() - 0.5) * tl; t.ty = (R() - 0.5) * tl;
+    t.seed = R(); t.shape = R(); t.tp = -1;
+  }
+  // the last tesserae of the head go in on the beats, the eye last
+  const head = tiles.filter((t) => hyp(t.x - EYE[0], t.y - EYE[1]) < 0.07).sort((a, b) => hyp(b.x - EYE[0], b.y - EYE[1]) - hyp(a.x - EYE[0], a.y - EYE[1]));
+  const last = head.slice(-6);
+  last.forEach((t, i) => { t.tp = 0.5 + i * 0.5; });
+  TILES = tiles;
+  // pack: 3 texels per tile
+  const N = tiles.length, TW = 1024, TH = Math.ceil(N * 3 / TW);
+  const D = new Float32Array(TW * TH * 4);
+  tiles.forEach((t, i) => {
+    D.set([t.x, t.y, t.ang, t.hl], (i * 3) * 4);
+    D.set([t.hw, t.h, t.tx, t.ty], (i * 3 + 1) * 4);
+    D.set([t.mat, t.seed, t.tp, t.shape], (i * 3 + 2) * 4);
+  });
+  // cell lists (8 per cell)
+  const C = new Float32Array(NXC * 2 * NYC * 4).fill(-1), cnt = new Uint8Array(NXC * NYC);
+  tiles.forEach((t, i) => {
+    const rb = hyp(t.hl, t.hw) * 1.12 + 0.0015;
+    const i0 = Math.max(0, Math.floor((t.x - rb - PX0) / CS)), i1 = Math.min(NXC - 1, Math.floor((t.x + rb - PX0) / CS));
+    const j0 = Math.max(0, Math.floor((t.y - rb - PY0) / CS)), j1 = Math.min(NYC - 1, Math.floor((t.y + rb - PY0) / CS));
+    for (let j = j0; j <= j1; j++) for (let ii = i0; ii <= i1; ii++) { const c = j * NXC + ii; if (cnt[c] >= 8) continue; C[(j * NXC * 2 + ii * 2) * 4 + cnt[c]] = i; cnt[c]++; }
+  });
+  const gl = rm.canvas.getContext('webgl2');
+  const mk = (w, h, data) => { const tx = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tx); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, data);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE); return tx; };
+  tTiles = mk(TW, TH, D); tCells = mk(NXC * 2, NYC, C);
+  console.log('tesserae', N);
+}
+
+/* ------------------------------------------------------------------ the tweezers at work (0-3.2 s) */
+function tweezAt(t) {
+  const last = TILES.filter((x) => x.tp > 0).sort((a, b) => a.tp - b.tp);
+  if (!last.length || t > 3.45) return { tw: [-99, 0, 0, 0], fly: [0, 0, 0, -1] };
+  // for each beat: come in from up-right with the tile, press it home on the beat, open, lift away
+  let k = last.findIndex((x) => t < x.tp + 0.2); if (k < 0) k = last.length - 1;
+  const T = last[k], tp = T.tp, idx = TILES.indexOf(T);
+  const slot = [T.x, T.y, T.h + 0.0032];
+  const away = [T.x + 0.07, T.y + 0.055, 0.115];
+  const hover = [T.x + 0.004, T.y + 0.003, 0.022];
+  let pos, open = 0.0, hold = true;
+  if (t < tp - 0.30) { pos = away; }
+  else if (t < tp - 0.10) { const u = E.inOutSine((t - (tp - 0.30)) / 0.20); pos = away.map((a, i) => lerp(a, hover[i], u)); }
+  else if (t < tp) { const u = E.inQuad((t - (tp - 0.10)) / 0.10); pos = hover.map((a, i) => lerp(a, slot[i], u)); }
+  else { hold = false; const u = E.outQuad(clamp((t - tp) / 0.2)); open = 0.006 * clamp((t - tp) / 0.04); pos = slot.map((a, i) => lerp(a, [T.x + 0.07, T.y + 0.055, 0.115][i], u)); }
+  const tip = [pos[0], pos[1], pos[2]];
+  const flyPos = hold ? [tip[0], tip[1], tip[2] - 0.0032 + 0.0] : [0, 0, 0];
+  return { tw: [tip[0], tip[1], tip[2] + 0.0005, hold ? 2 * T.hw : 2 * T.hw + open], fly: hold && t >= tp - 0.30 ? [...flyPos, idx] : [0, 0, 0, -1] };
+}
+
+/* ------------------------------------------------------------------ camera, lamp, cloth */
+const CK = [
+  { t: 0.0, p: [0.50, 0.05, 0.24], a: [0.384, 0.168, 0.0], fov: 26 },
+  { t: 3.0, p: [0.48, 0.05, 0.21], a: [0.376, 0.172, 0.0], fov: 26, stop: true },     // the eye goes in: the lens settles for that beat
+  { t: 3.9, p: [-1.00, 0.02, 1.22], a: [-0.48, -0.10, 0.0], fov: 32 },
+  { t: 5.6, p: [0.85, -0.18, 1.35], a: [0.50, -0.26, 0.0], fov: 34 },
+  { t: 7.2, p: [0.15, 0.02, 2.65], a: [0.0, 0.0, 0.0], fov: 38 },
+  { t: 8.0, p: [0.05, 0.02, 2.80], a: [0.0, 0.0, 0.0], fov: 38, stop: true },   // locked off from 8.0
+  { t: 10.0, p: [0.05, 0.02, 2.80], a: [0.0, 0.0, 0.0], fov: 38 },
+];
+const camT = Track(CK.map((k) => ({ t: k.t, v: [...k.p, ...k.a, k.fov], stop: k.stop })), { easeIn: false, easeOut: true });
+const LK = [
+  { t: 0.0, v: [0.66, 0.56, 0.46, 3.8] },        // a work lamp over the head
+  { t: 3.0, v: [0.62, 0.54, 0.46, 3.8], stop: true },
+  { t: 3.6, v: [-2.20, 0.25, 1.05, 5.0] },       // carried to the left end
+  { t: 5.6, v: [2.20, 0.05, 1.05, 5.0] },        // and along the wall: the gold ignites in a wave
+  { t: 7.4, v: [-0.55, 1.20, 2.10, 7.0] },       // set down high on the left: the whole panel in its light
+  { t: 10.0, v: [-0.55, 1.20, 2.10, 7.0] },
+];
+const lampT = Track(LK);
+function camAt(t) {
+  if (DBG) { const v = DBG.split(',').map(Number); return { p: v.slice(0, 3), a: v.slice(3, 6), fov: v[6] || 30 }; }
+  const v = camT(t); return { p: v.slice(0, 3), a: v.slice(3, 6), fov: v[6] };
+}
+function clothAt(t) {
+  // one pass of the grout sponge along the birds, left to right; it leaves a wet, shining strip
+  const u = (t - 7.45) / 0.80, Y = -0.10;
+  if (u < 0) return { c: [-3, Y, 0, 0], wipe: -3 };
+  if (u > 1) return { c: [3, Y, 0, 0], wipe: 3 };
+  const x = lerp(-2.25, 2.25, E.inOutSine(u));
+  return { c: [x, Y + 0.025 * Math.sin(u * Math.PI * 2), 0.085, 1], wipe: x - 0.19 };
+}
+Reel.scene({
+  duration: 10, fps: 30,
+  cues: [
+    { t: 0.5, sfx: 'tessera_set', gain: 0.8 }, { t: 1.0, sfx: 'tessera_set', gain: 0.75 }, { t: 1.5, sfx: 'tessera_set', gain: 0.8 },
+    { t: 2.0, sfx: 'tessera_set', gain: 0.75 }, { t: 2.5, sfx: 'tessera_set', gain: 0.8 }, { t: 3.0, sfx: 'eye_set', gain: 0.9 },
+    { t: 3.6, sfx: 'whoosh', gain: 0.3 }, { t: 4.0, sfx: 'gold_shimmer', gain: 0.75 }, { t: 7.45, sfx: 'sponge_wipe', gain: 0.8 }, { t: 8.0, sfx: 'chapel_chord', gain: 0.9 },
+  ],
+  async setup() { layTesserae(); },
+  render(t) {
+    const cam = camAt(t);
+    const lv = lampT(t);
+    const tw = tweezAt(t);
+    const cl = clothAt(t);
+    const tanF = Math.tan(cam.fov * Math.PI / 360);
+    const fd = Math.hypot(cam.a[0] - cam.p[0], cam.a[1] - cam.p[1], cam.a[2] - cam.p[2]);
+    const gl = rm.canvas.getContext('webgl2');
+    gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, tTiles);
+    gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, tCells);
+    gl.activeTexture(gl.TEXTURE0);
+    rm.set('uTiles', { __ints: 1, v: 4 }).set('uCells', { __ints: 1, v: 5 })
+      .set('uRo', cam.p).set('uTa', cam.a).set('uTanF', tanF).set('uTm', t)
+      .set('uLamp', lv.slice(0, 3)).set('uLampI', lv[3]).set('uWipe', cl.wipe).set('uFill', lerp(1.0, 1.4, E.inOutSine(clamp((t - 6.4) / 1.4))))
+      .set('uWet', t > 7.45 ? 1 - 0.25 * clamp((t - 8.3) / 1.7) : 0)
+      .set('uTw', tw.tw).set('uFly', tw.fly).set('uCloth', cl.c);
+    const Ra = fd < 0.7 ? 0.010 : 0.022;
+    rm.render(t, { focus: fd, aperture: Reel.Q.get('nodof') ? 0 : Ra * 342 / tanF, maxCoc: 22, expo: 1.45 });
+  },
+});
+</script></body></html>

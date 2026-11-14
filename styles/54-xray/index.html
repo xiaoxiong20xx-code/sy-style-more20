@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>54 X光透视 · X-Ray</title>
+<script src="../../lib/core.js"></script><script src="../../lib/track.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 54 X光透视 · X-RAY (live fluoroscopy) =====
+   Real world: the live image of a flat-panel X-ray (fluoroscope / inspection scanner): grey-blue, dense parts white,
+   wood half-transparent with its grain, edge-enhancement halos, quantum noise that crawls frame to frame.
+   On the table: a wooden music box turning slowly — finger-jointed corners with their glue lines, brass ball feet,
+   hinges and their screws, a folding lid stay, the lock; inside, the pinned brass cylinder with its great wheel, a
+   24-tooth steel comb (screws, lead weights under the bass teeth), the coiled mainspring, the gear train, the governor
+   and the winding key, and a die-cast ballerina folded down beside the movement.
+   0–3.8 the box turns; 3.85 the lid springs open and the stay unfolds; 4.0 the ballerina snaps up and turns, the
+   cylinder runs, pins pluck the comb on the beat (the plucked tooth jumps), the governor blurs — the view pushes in
+   hard. 8.0 the last note: the box stops on its best three-quarter silhouette, the view settles wide.
+   Pass 1: Beer–Lambert line integral (analytic chords through boxes/cylinders, sampled masks for thin and organic
+   parts) into a float texture with mipmaps. Pass 2: edge enhancement, display curve, noise, vignette. */
+const { E, clamp, inv, lerp } = Reel;
+const stage = Reel.makeStage('#06080a');
+Reel.ownJitter = true;
+const C = Reel.cfg({});
+
+const rm = Reel.RM(stage, {
+  bloom: 0.16, th: 0.92, expo: 1.0, vig: 0.3, grain: 0.02, ca: 0.15, contrast: 1.08, sat: 1.0, bands: 2,
+  uniforms: `
+uniform sampler2D uX;
+uniform float uT, uFrame;`,
+  scene: `
+vec3 render(vec2 fc){
+  vec2 uv = fc / uRes;
+  float a0 = textureLod(uX, uv, 0.).r, a1 = textureLod(uX, uv, 1.2).r, a2 = textureLod(uX, uv, 3.).r, a3 = textureLod(uX, uv, 6.).r;
+  // the detector's log curve: air black, wood a faint veil, zinc mid-grey, brass and steel near white
+  float m0 = 1. - exp(-a0 * .8), m1 = 1. - exp(-a1 * .8), m2 = 1. - exp(-a2 * .8);
+  // edge enhancement as on a clinical workstation: a thin bright rim on the dense side of every edge, a dark lip outside
+  float b = m0 + .95 * (m0 - m1) + .35 * (m1 - m2);
+  b += .02 * (1. - exp(-a3 * .5));                                   // scatter: dense parts glow faintly into the air
+  b = max(b, 0.);
+  // quantum mottle: crawls every frame, grainier in the dense (low-dose) parts
+  float q = hash12(floor(fc) + uFrame * 13.17) - .5;
+  float q2 = vnoise2(fc * .45 + uFrame * 3.1) - .5;
+  b += (q * .035 + q2 * .015) * (.35 + .65 * min(b, 1.));
+  vec2 d = uv - .5; b *= 1. - .2 * dot(d * vec2(1.2, 1.), d * vec2(1.2, 1.));
+  vec3 c = mix(vec3(.006, .009, .014), vec3(.84, .92, 1.), clamp(b, 0., 1.)) + vec3(.9, .95, 1.) * max(b - 1., 0.) * .6;
+  gDepth = 1.;
+  return c;
+}`,
+});
+const gl = rm.canvas.getContext('webgl2');
+const G2 = Reel.GL(rm.canvas);
+const XW = rm.W, XH = rm.H;
+
+/* ---------------- pass 1: the X-ray ---------------- */
+const XR = `#version 300 es
+precision highp float; in vec2 uv; out vec4 outA;
+` + Reel.RM_COMMON + `
+uniform float uYaw, uTilt, uCyl, uGov, uSpinB, uT, uAsp;
+uniform vec2 uLidR; uniform int uLidN;   // the lid at the start and end of this exposure slice, samples across it
+uniform vec2 uRiseR;          // spring-up of the ballerina at the start and end of this exposure slice
+uniform int uRiseN;           // time samples across the slice (more while she snaps up)
+uniform vec3 uView;           // pan x, pan y, span (detector height visible)
+uniform vec4 uPl[6];          // comb plucks: tooth, time since
+vec3 O, D;
+float boxL(vec3 o, vec3 d, vec3 c, vec3 h){
+  vec3 iv = 1. / d; vec3 t0 = (c - h - o) * iv, t1 = (c + h - o) * iv;
+  vec3 tn = min(t0, t1), tf = max(t0, t1);
+  return max(min(min(tf.x, tf.y), tf.z) - max(max(tn.x, tn.y), tn.z), 0.);
+}
+vec2 boxT(vec3 o, vec3 d, vec3 c, vec3 h){
+  vec3 iv = 1. / d; vec3 t0 = (c - h - o) * iv, t1 = (c + h - o) * iv;
+  vec3 tn = min(t0, t1), tf = max(t0, t1);
+  return vec2(max(max(tn.x, tn.y), tn.z), min(min(tf.x, tf.y), tf.z));
+}
+vec2 cylT(vec3 o, vec3 d, float r, float hh){          // axis y, centred
+  float a = dot(d.xz, d.xz), b = dot(o.xz, d.xz), c = dot(o.xz, o.xz) - r * r;
+  float disc = b * b - a * c; if (disc < 0. || a < 1e-9) return vec2(1., 0.);
+  float s = sqrt(disc); float t0 = (-b - s) / a, t1 = (-b + s) / a;
+  float y0 = (-hh - o.y) / d.y, y1 = (hh - o.y) / d.y;
+  return vec2(max(t0, min(y0, y1)), min(t1, max(y0, y1)));
+}
+float cylL(vec3 o, vec3 d, float r, float hh){ vec2 t = cylT(o, d, r, hh); return max(t.y - t.x, 0.); }
+float sphL(vec3 o, vec3 d, float r){ float b = dot(o, d), c = dot(o, o) - r * r, h = b * b - c; return h > 0. ? 2. * sqrt(h) : 0.; }
+mat3 FZ = mat3(1., 0., 0., 0., 0., 1., 0., -1., 0.);   // z-axis parts -> local y
+// a rod between two points
+float segL(vec3 o, vec3 d, vec3 a, vec3 b, float r){
+  vec3 ax = normalize(b - a); vec3 t1 = normalize(abs(ax.y) < .9 ? cross(ax, vec3(0., 1., 0.)) : cross(ax, vec3(1., 0., 0.))); vec3 t2 = cross(ax, t1);
+  mat3 M = transpose(mat3(t1, ax, t2));
+  return cylL(M * (o - .5 * (a + b)), M * d, r, .5 * length(b - a));
+}
+float ballerinaSD(vec3 q){
+  float d = sdSphere(q - vec3(0., .29, 0.), .026);
+  d = min(d, sdSphere(q - vec3(0., .315, -.012), .012));                       // bun
+  d = smin(d, sdEllipsoid(q - vec3(0., .215, 0.), vec3(.024, .055, .017)), .012);
+  d = min(d, sdCapsule(q, vec3(.022, .245, 0.), vec3(.06, .3, .01), .0065));      // arms raised in a ring
+  d = min(d, sdCapsule(q, vec3(.06, .3, .01), vec3(.012, .345, .0), .0055));
+  d = min(d, sdCapsule(q, vec3(-.022, .245, 0.), vec3(-.06, .3, .01), .0065));
+  d = min(d, sdCapsule(q, vec3(-.06, .3, .01), vec3(-.012, .345, .0), .0055));
+  d = min(d, sdCapsule(q, vec3(.008, .15, 0.), vec3(.003, .0, .0), .0085));       // standing leg, en pointe
+  d = min(d, sdCapsule(q, vec3(-.008, .15, 0.), vec3(-.01, .2, -.13), .0075));    // arabesque
+  return d;
+}
+float att(){
+  float A = 0.;
+  const float MW = .22, MV = .2, MB = 105., MS = 140., MZ = 42., ML = 240., MG = 9.;   // wood, velvet, brass, steel, zinc, lead, glass
+  // ---- the box: walls (outer minus cavity) with the grain read at mid-chord ----
+  vec2 tO = boxT(O, D, vec3(0., 0., 0.), vec3(.7, .3, .46)), tI = boxT(O, D, vec3(0., .06, 0.), vec3(.65, .31, .41));
+  float Lw = max(tO.y - tO.x, 0.) - max(min(tI.y, tO.y) - max(tI.x, tO.x), 0.);
+  vec3 mid = O + D * (.5 * (tO.x + tO.y));
+  float grain = .85 + .22 * smoothstep(.2, .95, sin(mid.x * 95. + mid.y * 20. + 9. * fbm(mid * 2.5)) * .5 + .5) + .2 * (fbm(mid * 14.) - .5);   // early/late wood
+  A += Lw * MW * grain;
+  A += max(boxL(O, D, vec3(0., -.27, 0.), vec3(.74, .03, .5)) - boxL(O, D, vec3(0., -.27, 0.), vec3(.7, .031, .46)), 0.) * MW;   // base moulding
+  for (int k = 0; k < 4; k++){ vec3 c = vec3((k < 2 ? -1. : 1.) * .67, -.33, (k % 2 == 0 ? -1. : 1.) * .43); A += sphL(O - c, D, .04) * MW * 1.4; A += cylL(O - c - vec3(0., .02, 0.), D, .0035, .035) * MS; }   // turned bun feet, a screw in each
+  // finger joints at the corners: thin glue lines between the fingers
+  for (int k = 0; k < 4; k++){
+    vec3 c = vec3((k < 2 ? -1. : 1.) * .675, 0., (k % 2 == 0 ? -1. : 1.) * .435);
+    for (int j = 0; j < 7; j++) A += boxL(O, D, c + vec3(0., -.255 + .085 * float(j), 0.), vec3(.024, .0018, .024)) * (1.6 + .8 * hash11(float(k * 7 + j)));
+  }
+  A += boxL(O, D, vec3(.03, -.02, 0.), vec3(.012, .22, .41)) * MW;                 // divider
+  A += boxL(O, D, vec3(.34, -.2, 0.), vec3(.3, .05, .4)) * MV;                     // velvet bed
+  // lock plate and keyhole escutcheon on the front
+  A += boxL(O, D, vec3(0., .2, .463), vec3(.05, .055, .0012)) * MB;
+  A -= boxL(O, D, vec3(0., .19, .463), vec3(.007, .02, .0014)) * MB;
+  // hinges, each with three screws
+  for (int k = -1; k <= 1; k += 2){
+    vec3 c = vec3(float(k) * .42, .3, -.465);
+    A += boxL(O, D, c, vec3(.065, .032, .0012)) * MB;
+    A += cylL(FZ * (O - c), FZ * D, .0035, .065) * MS;
+    for (int j = -1; j <= 1; j++){ vec3 s = c + vec3(float(j) * .042, -.016, 0.); A += cylL(FZ * (O - s - vec3(0., 0., .02)), FZ * D, .003, .022) * MS; }
+  }
+  // the lid and its stay, sampled at several moments inside the exposure while the lid springs open
+  float AL = 0.;
+  for (int m = 0; m < 16; m++) { if (m >= uLidN) break;
+    float uLid = mix(uLidR.x, uLidR.y, (float(m) + .5) / float(uLidN));
+    float A = 0.;
+  // ---- the lid: hinged at the back top edge, a raised panel, mirror inside, brass on the corners ----
+  {
+    vec3 hp = vec3(0., .3, -.46);
+    mat3 L = rotX(-uLid);
+    vec3 o = L * (O - hp), d = L * D;
+    A += boxL(o, d, vec3(0., .025, .46), vec3(.7, .025, .46)) * MW;
+    // (no corner caps: the lid is plain)
+    A += boxL(o, d, vec3(0., .02, .917), vec3(.04, .016, .0015)) * MB;             // the catch plate
+    A += cylL(o - vec3(0., .086, .46), d, .13, .0025) * MW * 2.;                      // a burr-wood medallion inlaid in the lid
+    A += max(cylL(o - vec3(0., .086, .46), d, .156, .0012) - cylL(o - vec3(0., .086, .46), d, .151, .002), 0.) * MB;   // its brass ring
+  }
+  // the folding lid stay: box side -> knee -> lid
+  {
+    vec3 a = vec3(.6, .2, -.3);
+    vec3 lb = vec3(.6, -.01, .36);
+    mat3 Li = rotX(uLid);
+    vec3 b = vec3(0., .3, -.46) + Li * lb;
+    vec3 m = .5 * (a + b) + vec3(0., 0., .02) * (1. - smoothstep(.0, 1.6, uLid)) + vec3(0., -.06, .05) * (1. - smoothstep(1., 1.8, uLid));
+    A += segL(O, D, a, m, .0035) * MB + segL(O, D, m, b, .0035) * MB;
+    A += sphL(O - m, D, .006) * MS;
+  }
+    AL += A;
+  }
+  A += AL / float(uLidN);
+  // ---- the movement: laid along the long side (cylinder at the back, comb teeth reaching toward it) ----
+  vec3 O0 = O, D0 = D;
+  { vec3 b = O0 - vec3(-.2, 0., -.08); O = vec3(b.z - .32, b.y, -b.x); D = vec3(D0.z, D0.y, -D0.x); }
+  A += boxL(O, D, vec3(-.32, -.235, 0.), vec3(.3, .004, .32)) * MZ;               // bedplate: thin cast zinc
+  for (int k = 0; k < 3; k++) A -= boxL(O, D, vec3(-.5 + .16 * float(k), -.235, -.17), vec3(.055, .004, .1)) * MZ;   // lightening holes
+  for (int k = 0; k < 2; k++) A -= boxL(O, D, vec3(-.42 + .2 * float(k), -.235, .2), vec3(.07, .004, .07)) * MZ;
+  for (int k = 0; k < 4; k++){ vec3 c = vec3(-.32 + (k < 2 ? -.26 : .26), -.23, (k % 2 == 0 ? -.28 : .28)); A += cylL(O - c, D, .006, .07) * MS; A += cylL(O - c - vec3(0., .02, 0.), D, .011, .003) * MS; }
+  // comb: base, three screws, 24 teeth, lead weights under the bass end; plucked teeth jump
+  A += boxL(O, D, vec3(-.12, -.135, 0.), vec3(.04, .012, .262)) * MS;
+  for (int k = -1; k <= 1; k++){ vec3 s = vec3(-.11, -.13, float(k) * .2); A += cylL(O - s, D, .0045, .04) * MS * .5; A += cylL(O - s - vec3(0., .016, 0.), D, .009, .003) * MS; }
+  for (int k = 0; k < 24; k++){
+    float fk = float(k);
+    float len = mix(.2, .15, fk / 23.);
+    vec3 root = vec3(-.16, -.126, -.24 + fk * .0209);
+    bool ring = false;
+    for (int j = 0; j < 6; j++){ vec4 pl = uPl[j]; if (abs(pl.x - fk) < .5 && pl.y >= 0. && pl.y < 2.) ring = true; }
+    if (!ring) A += boxL(O - root, D, vec3(-len * .5, 0., 0.), vec3(len * .5, .0028, .0062)) * MS;
+    if (k < 7) A += sphL(O - (root + vec3(-len * .75, -.009, 0.)), D, .0065) * ML;   // lead tuning weights under the bass
+  }
+  // the ringing teeth: averaged over the vibration a tooth reads as a fan with brighter edges (it lingers at the extremes)
+  for (int j = 0; j < 6; j++){
+    vec4 pl = uPl[j]; if (pl.y < 0. || pl.y >= 2.) continue;
+    float fk = pl.x, len = mix(.2, .15, fk / 23.);
+    vec3 root = vec3(-.16, -.126, -.24 + fk * .0209);
+    float amp = .32 * exp(-pl.y / .45), lift = .05 * smoothstep(.0, .02, pl.y) * (1. - smoothstep(.02, .05, pl.y));
+    vec3 o = O - root;
+    for (int i = 0; i < 8; i++){
+      float an = amp * cos(3.14159 * (float(i) + .5) / 8.);
+      float aw = an * .7, av = an * .3 + lift;      // the tip swings across its gap and up and down
+      float cw = cos(aw), sw = sin(aw), cv = cos(av), sv = sin(av);
+      mat3 Rz = mat3(cw, 0., sw, 0., 1., 0., -sw, 0., cw) * mat3(cv, sv, 0., -sv, cv, 0., 0., 0., 1.);
+      A += boxL(Rz * o, Rz * D, vec3(-len * .5, 0., 0.), vec3(len * .5, .0028, .0062)) * MS / 8.;
+    }
+  }
+  // brass cylinder along z: shell, end caps, arbor, great wheel, the pins (24 tracks, dense)
+  {
+    vec3 cc = vec3(-.42, -.1, 0.);
+    vec3 o = FZ * (O - cc), d = FZ * D;
+    vec2 t1 = cylT(o, d, .085, .25), t2 = cylT(o, d, .0838, .2488);
+    A += (max(t1.y - t1.x, 0.) - max(min(t2.y, t1.y) - max(t2.x, t1.x), 0.)) * MB;
+    A += cylL(o, d, .006, .33) * MS;
+    vec2 tp = cylT(o, d, .095, .25);
+    if (tp.y > tp.x) {
+      for (int i = 0; i < 24; i++){
+        float tt = mix(tp.x, tp.y, (float(i) + .5) / 24.);
+        vec3 q = o + d * tt; float r = length(q.xz);
+        if (r < .085) continue;
+        float zi = floor((q.y + .25) / .0209);
+        float au = (atan(q.z, q.x) + uCyl) / 6.2832 * 44. + hash11(zi) * 9.;
+        float ai = floor(au);
+        float on = step(.5, hash12(vec2(zi, mod(ai, 44.))));
+        vec2 cp = vec2(fract(au) - .5, fract((q.y + .25) / .0209) - .5);
+        A += on * smoothstep(.0034, .0026, length(cp * vec2(6.2832 * .09 / 44., .0209))) * (tp.y - tp.x) / 24. * MS;
+      }
+    }
+    // the great wheel on the cylinder's end (axis z): toothed, spoked
+    vec3 og = o - vec3(0., .262, 0.);
+    vec2 tg = cylT(og, d, .118, .0025);
+    if (tg.y > tg.x) for (int i = 0; i < 4; i++){
+      float tt = mix(tg.x, tg.y, (float(i) + .5) / 4.); vec3 q = og + d * tt; float r = length(q.xz), a = atan(q.z, q.x) + uCyl;
+      float tooth = step(r, .108 + .01 * step(.5, fract(a * 60. / 6.2832)));
+      float spokes = step(r, .03) + step(.088, r) + step(abs(sin(a * 2.5)), .1);
+      A += tooth * min(spokes, 1.) * (tg.y - tg.x) / 4. * MB;
+    }
+  }
+  // spring barrel, axis y, with the mainspring coiled inside
+  {
+    vec3 o = O - vec3(-.45, -.17, .335);
+    vec2 tb = cylT(o, D, .072, .03), ti = cylT(o, D, .069, .027);
+    A += (max(tb.y - tb.x, 0.) - max(ti.y - ti.x, 0.)) * MB;
+    if (ti.y > ti.x) for (int i = 0; i < 8; i++){
+      float tt = mix(ti.x, ti.y, (float(i) + .5) / 8.); vec3 q = o + D * tt; float r = length(q.xz), a = atan(q.z, q.x) - uCyl * .1;
+      float s = fract((r - a / 6.2832 * .0065) / .0065);
+      A += step(abs(s - .5), .12) * step(r, .062) * step(.012, r) * (ti.y - ti.x) / 8. * MS;
+    }
+    A += cylL(o, D, .006, .06) * MS;
+  }
+  // intermediate wheel and the governor (worm + fan)
+  {
+    vec3 o = FZ * (O - vec3(-.27, -.16, .3)), d = FZ * D;
+    vec2 tg = cylT(o, d, .055, .002);
+    if (tg.y > tg.x) for (int i = 0; i < 3; i++){
+      float tt = mix(tg.x, tg.y, (float(i) + .5) / 3.); vec3 q = o + d * tt; float r = length(q.xz), a = atan(q.z, q.x) - uCyl * 2.2;
+      A += step(r, .049 + .006 * step(.5, fract(a * 32. / 6.2832))) * min(step(r, .015) + step(.04, r) + step(abs(sin(a * 2.)), .12), 1.) * (tg.y - tg.x) / 3. * MB;
+    }
+    A += cylL(o, d, .004, .03) * MS;
+    vec3 og = O - vec3(-.2, -.12, .36);
+    A += cylL(og, D, .0035, .1) * MS;
+    A += cylL(og - vec3(0., -.03, 0.), D, .007, .03) * MS * (.55 + .45 * step(.5, fract((og.y + uGov * .004) * 70.)));   // the worm
+    vec2 tf = boxT(og, D, vec3(0., .065, 0.), vec3(.055, .022, .055));
+    if (tf.y > tf.x) for (int i = 0; i < 4; i++){
+      float tt = mix(tf.x, tf.y, (float(i) + .5) / 4.); vec3 q = og + D * tt;
+      float a = atan(q.z, q.x) - uGov;
+      float blade = smoothstep(.06 + .6 * min(uSpinB > 0. ? 1. : 0., 1.), .0, abs(sin(a))) * step(length(q.xz), .05) * step(.007, length(q.xz));
+      A += blade * (tf.y - tf.x) / 4. * 9.;
+    }
+  }
+  // winding key under the base
+  {
+    vec3 o = O - vec3(-.45, -.36, .335);
+    A += cylL(o, D, .006, .08) * MS;
+    vec3 ok = o - vec3(0., -.09, 0.);
+    A += boxL(ok, D, vec3(0.), vec3(.06, .02, .0025)) * MB;
+    A += max(cylL(FZ * (ok - vec3(-.06, 0., 0.)), FZ * D, .034, .0025) - cylL(FZ * (ok - vec3(-.06, 0., 0.)), FZ * D, .02, .004), 0.) * MB;
+    A += max(cylL(FZ * (ok - vec3(.06, 0., 0.)), FZ * D, .034, .0025) - cylL(FZ * (ok - vec3(.06, 0., 0.)), FZ * D, .02, .004), 0.) * MB;
+  }
+  O = O0; D = D0;
+  // the ballerina: die-cast figure on a turning disc, on a post in a spring
+  // (sampled at several moments inside the exposure while she snaps up: a smooth smear, not stepped copies)
+  float AB = 0.;
+  for (int m = 0; m < 16; m++) { if (m >= uRiseN) break;
+    float uRise = mix(uRiseR.x, uRiseR.y, (float(m) + .5) / float(uRiseN));
+    float A = 0.;
+    vec3 bc = vec3(.34, -.17 + .21 * uRise, 0.);
+    vec3 o = O - bc;
+    A += cylL(o - vec3(0., -.06, 0.), D, .0035, .07) * MS;
+    A += cylL(o - vec3(0., .0, 0.), D, .03, .0015) * MB;                             // the disc she stands on
+    vec2 ts = cylT(o - vec3(0., -.08, 0.), D, .022, .05 * (.4 + .6 * uRise));
+    if (ts.y > ts.x) for (int i = 0; i < 8; i++){
+      float tt = mix(ts.x, ts.y, (float(i) + .5) / 8.); vec3 q = o - vec3(0., -.08, 0.) + D * tt;
+      float r = length(q.xz), a = atan(q.z, q.x);
+      A += step(abs(fract(q.y / (.008 + .008 * uRise) - a / 6.2832) - .5), .1) * step(.018, r) * (ts.y - ts.x) / 8. * MS;
+    }
+    // folded down (lying back) until she springs up
+    mat3 fold = rotX(-1.35 * (1. - uRise));
+    vec2 tf = boxT(o, D, vec3(0., .23, 0.), vec3(.2, .26, .2));
+    if (tf.y > tf.x) {
+      float acc = 0.;
+      float jb = fract(hash12(gl_FragCoord.xy) + float(m) * .618);      // stratified, so the sampling never shows as bands
+      for (int i = 0; i < 28; i++){
+        float tt = mix(tf.x, tf.y, (float(i) + jb) / 28.);
+        vec3 q = fold * rotY(uSpinB) * (o + D * tt) / 1.35;
+        acc += smoothstep(.003, -.003, ballerinaSD(q));
+      }
+      A += acc * (tf.y - tf.x) / 28. * 16.;
+      // her tutu: a thin cast flare, analytic (no sampling bands), rim brighter where it is seen edge-on
+      { mat3 Mf = fold * rotY(uSpinB); vec3 ot = Mf * o - vec3(0., .155, 0.) * 1.35, dt = Mf * D;
+        A += (cylL(ot, dt, .088 * 1.35, .005 * 1.35) - .55 * cylL(ot, dt, .06 * 1.35, .003 * 1.35)) * 16.; }                                       // the zinc casting: grey, thicker = brighter
+      // the steel armature cast inside her: spine, shoulders, arms, legs - thin bright lines through the grey
+      mat3 M = transpose(fold * rotY(uSpinB));
+      vec3 oa = M * vec3(0.), da = M * D;
+      #define BW(a, b) segL(o, D, M * (a) * 1.35, M * (b) * 1.35, .0026) * ML
+      A += BW(vec3(0., .02, 0.), vec3(0., .3, 0.));
+      A += BW(vec3(-.04, .245, 0.), vec3(.04, .245, 0.));
+      A += BW(vec3(.022, .245, 0.), vec3(.06, .3, .01)) + BW(vec3(.06, .3, .01), vec3(.012, .34, 0.));
+      A += BW(vec3(-.022, .245, 0.), vec3(-.06, .3, .01)) + BW(vec3(-.06, .3, .01), vec3(-.012, .34, 0.));
+      A += BW(vec3(-.008, .15, 0.), vec3(-.01, .2, -.125));
+      A += BW(vec3(-.06, .155, 0.), vec3(.06, .155, 0.)) + BW(vec3(0., .155, -.06), vec3(0., .155, .06));   // tutu ribs
+      A += sphL(o - M * vec3(0., .29, 0.) * 1.35, D, .006) * MS;                  // the pin through her head
+    }
+    AB += A;
+  }
+  A += AB / float(uRiseN);
+  return A;
+}
+void main(){
+  vec3 F = vec3(uView.x + (uv.x - .5) * uView.z * uAsp, uView.y + (uv.y - .5) * uView.z, -1.2);
+  mat3 R = rotX(uTilt) * rotY(uYaw);
+  mat3 Ri = transpose(R);
+  // the tube's focal spot has a size: average rays from points across it. Near the detector the shadows stay sharp,
+  // nearer the tube they blur and spread (geometric unsharpness) - the picture gets depth.
+  float acc = 0., rot = hash12(gl_FragCoord.xy) * 6.2832;
+  for (int k = 0; k < 4; k++){
+    float a = rot + float(k) * 2.39996, r = .007 * sqrt((float(k) + .5) / 4.);
+    vec3 S = vec3(cos(a) * r, .05 + sin(a) * r, 6.6);
+    vec3 d = normalize(F - S);
+    O = Ri * S; D = Ri * d;
+    acc += att();
+  }
+  outA = vec4(acc / 4., 0., 0., 1.);
+}`;
+let xprog, xtgt;
+function setupX() {
+  gl.getExtension('EXT_color_buffer_float'); gl.getExtension('OES_texture_float_linear');
+  xprog = G2.program(XR);
+  xtgt = G2.target(XW, XH, { float: true });
+  gl.bindTexture(gl.TEXTURE_2D, xtgt.tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+}
+/* ---------------- timeline ---------------- */
+const BEATS = [4.0, 4.5, 5.0, 5.25, 5.5, 6.0, 6.5, 6.75, 7.0, 7.5, 8.0];
+const NOTES = [4, 9, 13, 9, 16, 18, 13, 16, 20, 16, 23];      // comb teeth (low -> high)
+function yaw(t) { const u = clamp(t / 8); return lerp(-0.5, 0.5, 1 - Math.pow(1 - u, 1.7)); }
+const VIEW = Track([
+  { t: 0.0, v: [0.0, -0.04, 1.2] },
+  { t: 2.0, v: [-0.04, -0.06, 1.12] },
+  { t: 3.6, v: [0.0, 0.0, 1.22] },
+  { t: 4.5, v: [0.22, 0.26, 1.0] },
+  { t: 5.6, v: [-0.12, -0.16, 0.62] },
+  { t: 6.6, v: [-0.02, -0.13, 0.66] },
+  { t: 8.0, v: [0.0, 0.02, 1.2], stop: true },
+  { t: 10.0, v: [0.0, 0.02, 1.198] },
+]);
+const plA = new Float32Array(24);
+
+Reel.scene({
+  duration: 10, fps: 30,
+  async setup() { setupX(); },
+  cues: [
+    { t: 0.0, sfx: 'xray_hum', gain: 0.5 }, { t: 2.0, sfx: 'xray_click', gain: 0.45 },
+    { t: 3.85, sfx: 'lid_open', gain: 0.75 },
+    ...BEATS.map((b, i) => ({ t: b, sfx: 'comb_' + NOTES[i], gain: 0.75 })),
+    { t: 8.0, sfx: 'xray_thunk', gain: 0.6 },
+  ],
+  render(t) {
+    t = Math.min(t, 8.0);          // last-image hold: the operator lifts off the pedal on the last note and the live image freezes
+    const lidAt = (u) => (u < 3.85 ? 0 : 1.85 * (1 - Math.exp(-(u - 3.85) * 10) * Math.cos((u - 3.85) * 15)));
+    const riseAt = (u) => (u < 3.98 ? 0 : clamp(1 - Math.exp(-(u - 3.98) * 5) * Math.cos((u - 3.98) * 7), 0, 1.15));
+    const slice = 0.5 / 30 / 24;                                      // one sub-frame's share of the shutter (--mb 24)
+    const r0 = riseAt(Math.min(t, 8) - slice / 2), r1 = riseAt(Math.min(t, 8) + slice / 2);
+    const riseN = Math.abs(r1 - r0) > 0.0003 ? Math.min(16, Math.ceil(Math.abs(r1 - r0) * 2500)) : 1; 
+    const cyl = t < 4 ? 0 : (Math.min(t, 8.0) - 4.0) * 0.9;
+    const gov = t < 4 ? 0 : (Math.min(t, 8.0) - 4.0) * 60;
+    // she turns while the music plays and stops facing us on 8.0
+    const spinB = t < 4.2 ? 0 : -Math.PI * 2 * 2.5 * E.inOutSine(inv(4.2, 8.0, t));
+    plA.fill(-1);
+    let n = 0;
+    for (let i = BEATS.length - 1; i >= 0 && n < 6; i--) { if (t >= BEATS[i]) { plA.set([NOTES[i], t - BEATS[i], 0, 0], n * 4); n++; } }
+    const v = VIEW(t);
+    gl.disable(gl.SCISSOR_TEST);
+    xprog.use().set('uYaw', yaw(t)).set('uTilt', 0.42).set('uCyl', cyl).set('uGov', gov).set('uSpinB', spinB).set('uT', t)
+      .set('uAsp', XW / XH).set('uView', v);
+    gl.uniform4fv(gl.getUniformLocation(xprog.pr, 'uPl'), plA);
+    gl.uniform2f(gl.getUniformLocation(xprog.pr, 'uRiseR'), r0, r1); gl.uniform1i(gl.getUniformLocation(xprog.pr, 'uRiseN'), riseN);
+    { const l0 = lidAt(Math.min(t, 8) - slice / 2), l1 = lidAt(Math.min(t, 8) + slice / 2);
+      gl.uniform2f(gl.getUniformLocation(xprog.pr, 'uLidR'), l0, l1); gl.uniform1i(gl.getUniformLocation(xprog.pr, 'uLidN'), Math.abs(l1 - l0) > 0.0003 ? 16 : 1); }
+    // the X-ray pass in short bands, each finished before the next: no single GPU submission runs long
+    // (a shared, busy graphics card would otherwise trip the browser's GPU watchdog)
+    gl.enable(gl.SCISSOR_TEST);
+    for (let i = 0, nb = 12; i < nb; i++) {
+      const y0 = Math.floor(XH * i / nb), y1 = Math.floor(XH * (i + 1) / nb);
+      gl.scissor(0, y0, XW, y1 - y0); xprog.draw(xtgt); gl.finish();
+    }
+    gl.disable(gl.SCISSOR_TEST);
+    gl.bindTexture(gl.TEXTURE_2D, xtgt.tex); gl.generateMipmap(gl.TEXTURE_2D);
+    gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, xtgt.tex); gl.activeTexture(gl.TEXTURE0);
+    rm.set('uX', { __ints: 1, v: 5 }).set('uT', t).set('uFrame', Math.floor(t * 30 + 0.5));
+    rm.render(t, { maxCoc: 0 });
+  },
+});
+</script></body></html>

@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>55 声音的形状 · Chladni Plate</title>
+<script src="../../lib/core.js"></script><script src="../../lib/track.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script>
+<script src="table.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 55 声音的形状 · Chladni Plate =====
+   Real world: a square black steel plate bolted at its centre to a vibration driver on a DJ booth in a live house at night, a hard warm
+   lamp raking across it from the left a few degrees above the surface. Fine white sand is sprinkled on. When the
+   plate sings, every point moves with the mode shape's amplitude; where it moves the sand is thrown up and lands
+   somewhere else, where it doesn't (the nodal lines) the sand stays, so it piles up along them. A new frequency
+   is a new mode shape and the sand is thrown off the old lines onto the new ones.
+   140 000 grains are simulated at 60 Hz (amplitude-driven hops + drift down the amplitude gradient), splatted into a
+   height field that is ray-lit with the raking light (ridges, shadows, sparkle); airborne grains are projected to
+   the screen as specks. Picture and sound read the same timetable (table.js): every beat a new tone and shape,
+   hook 4.0–5.0 a glide that morphs the pattern continuously into a more complex flower, 8.0 the last chord, then
+   the drive dies away and the pattern freezes. */
+const { E, clamp, inv, lerp } = Reel;
+const stage = Reel.makeStage('#000000');
+Reel.ownJitter = true;
+const C = Reel.cfg({});
+const TB = window.CHLADNI;
+
+/* ---------------- drive: which modes, how hard ---------------- */
+function modesAt(t) {
+  const g = TB.glide, ch = TB.chord;
+  if (t < TB.beats[0].t) return null;
+  if (t >= ch.t) return ch.modes;
+  if (t >= g.t0 && t < g.t1) {
+    const u = (t - g.t0) / (g.t1 - g.t0) * (g.modes.length - 1), out = [];
+    g.modes.forEach(([n, m, s], k) => { const w = Math.max(0, 1 - Math.abs(u - k)); if (w > 0) out.push([n, m, s, w]); });
+    return out;
+  }
+  let cur = null;
+  for (const b of TB.beats) if (t >= b.t) cur = b.modes;
+  return cur;
+}
+const ONSETS = [...TB.beats.map((b) => b.t), TB.glide.t0];
+function driveAt(t) {
+  if (t < TB.beats[0].t) return 0;
+  if (t >= TB.chord.t) return 1.5 * Math.exp(-(t - TB.chord.t) / 0.11);
+  let tb = 0; for (const o of ONSETS) if (t >= o) tb = o;
+  return 1.0 + 0.9 * Math.exp(-(t - tb) / 0.07);         // the sand jumps hardest the instant a new tone starts
+}
+
+/* ---------------- the sand ---------------- */
+const NG = 300000, HZ = 60, NSTEP = 10 * HZ + 2;
+const R = Reel.rng(55);
+const X0 = new Float32Array(NG), Y0 = new Float32Array(NG), TL = new Float32Array(NG), PH = new Float32Array(NG);
+// sprinkled from a sieve that sweeps a loose circle over the plate; centre-weighted
+for (let i = 0; i < NG; i++) {
+  const tl = TB.sprinkle[0] + (TB.sprinkle[1] - TB.sprinkle[0]) * Math.pow(R(), 0.8);
+  const sa = tl * 5.2, sx = 0.35 * Math.cos(sa), sy = 0.3 * Math.sin(sa * 1.3);
+  const r = 0.55 * Math.sqrt(-2 * Math.log(Math.max(1e-6, R()))) * 0.85, a = R() * 6.283;
+  X0[i] = clamp(sx + Math.cos(a) * r, -0.985, 0.985); Y0[i] = clamp(sy + Math.sin(a) * r, -0.985, 0.985);
+  TL[i] = tl; PH[i] = R() * 6.283;
+}
+// mode-shape grids (A, dA/dx, dA/dy), rebuilt only when the mode mix changes
+const GN = 256;
+const gA = new Float32Array(GN * GN), gX = new Float32Array(GN * GN), gY = new Float32Array(GN * GN);
+let gKey = '';
+function buildGrid(ms) {
+  const key = JSON.stringify(ms); if (key === gKey) return; gKey = key;
+  gA.fill(0); gX.fill(0); gY.fill(0);
+  const cu = new Float32Array(GN), su = new Float32Array(GN);
+  for (const [n, m, s, w] of ms) {
+    const cn = [], sn = [], cm = [], sm = [];
+    for (let i = 0; i < GN; i++) { const u = i / (GN - 1); cn.push(Math.cos(n * Math.PI * u)); sn.push(Math.sin(n * Math.PI * u)); cm.push(Math.cos(m * Math.PI * u)); sm.push(Math.sin(m * Math.PI * u)); }
+    const kn = n * Math.PI / 2, km = m * Math.PI / 2;
+    for (let j = 0; j < GN; j++) for (let i = 0; i < GN; i++) {
+      const k = j * GN + i;
+      gA[k] += w * (cn[i] * cm[j] + s * cm[i] * cn[j]);
+      gX[k] += w * (-kn * sn[i] * cm[j] - s * km * sm[i] * cn[j]);
+      gY[k] += w * (-km * cn[i] * sm[j] - s * kn * cm[i] * sn[j]);
+    }
+  }
+}
+function sample(G, x, y) {
+  const fx = (x + 1) * 0.5 * (GN - 1), fy = (y + 1) * 0.5 * (GN - 1);
+  const i = Math.min(GN - 2, Math.max(0, Math.floor(fx))), j = Math.min(GN - 2, Math.max(0, Math.floor(fy))), u = fx - i, v = fy - j, k = j * GN + i;
+  return (G[k] * (1 - u) + G[k + 1] * u) * (1 - v) + (G[k + GN] * (1 - u) + G[k + GN + 1] * u) * v;
+}
+const K1 = 0.016, K2 = 0.0022, MAXD = 0.016;
+function stepSand(x, y, n) {
+  const t = n / HZ, ms = modesAt(t), D = driveAt(t);
+  if (!ms || D < 0.01) return;
+  buildGrid(ms);
+  for (let i = 0; i < NG; i++) {
+    if (TL[i] > t) continue;
+    const A = sample(gA, x[i], y[i]), amp = Math.abs(A) * D;
+    let h = Math.sin(i * 12.9898 + n * 78.233) * 43758.5453; h -= Math.floor(h);
+    const ang = h * 6.283, sg = K1 * Math.min(amp, 1.5) + 0.0012 * D;
+    let dx = Math.cos(ang) * sg - K2 * D * A * sample(gX, x[i], y[i]);
+    let dy = Math.sin(ang) * sg - K2 * D * A * sample(gY, x[i], y[i]);
+    const mg = Math.hypot(dx, dy); if (mg > MAXD) { dx *= MAXD / mg; dy *= MAXD / mg; }
+    x[i] = clamp(x[i] + dx, -0.99, 0.99); y[i] = clamp(y[i] + dy, -0.99, 0.99);
+  }
+}
+// deterministic state at any step: checkpoints every second + a forward cache
+const CK = {}; let cN = -1, cX = null, cY = null, nX = null, nY = null;
+function stateAt(n) {
+  if (n !== cN) {
+    if (!(cX && n > cN)) {
+      let k = Math.floor(n / HZ) * HZ; while (k > 0 && !CK[k]) k -= HZ;
+      if (CK[k]) { cX = CK[k][0].slice(); cY = CK[k][1].slice(); cN = k; } else { cX = X0.slice(); cY = Y0.slice(); cN = 0; }
+    }
+    while (cN < n) { stepSand(cX, cY, cN); cN++; if (cN % HZ === 0 && !CK[cN]) CK[cN] = [cX.slice(), cY.slice()]; }
+    nX = cX.slice(); nY = cY.slice(); stepSand(nX, nY, cN);
+  }
+  return [cX, cY, nX, nY];
+}
+
+/* ---------------- renderer ---------------- */
+const TW = 1024;
+const rm = Reel.RM(stage, {
+  bloom: 0.2, th: 1.3, expo: 1.15, vig: 0.45, grain: 0.03, ca: 0.5, contrast: 1.06, sat: 0.95, bands: 4,
+  lift: [0.004, 0.004, 0.006],
+  uniforms: `
+uniform sampler2D uSand; uniform sampler2D uAir; uniform float uLights, uSpot;
+uniform vec3 uRo, uTa; uniform float uFL, uT, uHum;`,
+  scene: `
+const vec3 KEY = normalize(vec3(-1., .2, .25));     // the raking lamp, a few degrees above the plate
+const vec3 LIGHT_COL = vec3(1.);                      // colour of the raking key lamp (via KCOL) and the airborne grains it lights; vec3(1.) = original look
+const vec3 KCOL = LIGHT_COL * vec3(1.,.9,.8) * 3.4;
+const vec3 FILL = normalize(vec3(.3, 1., -.4));
+const float PH = .03;                                 // plate thickness
+float sandH(vec2 p, float lod){
+  vec2 uv = p * .5 + .5;
+  if (any(lessThan(uv, vec2(0.))) || any(greaterThan(uv, vec2(1.)))) return 0.;
+  // a ridge of N grains spreads at the angle of repose: the pile is wider than the line the grains sit on
+  return (textureLod(uSand, uv, lod + .3).r * .35 + min(textureLod(uSand, uv, lod + 1.9).r * 3.2, 1.2) * .65) * .011;
+}
+/* ---------- the room: a live house at night. The plate on its driver sits on the DJ booth beside the mixer, a turntable
+   and the corner of a speaker; beyond the booth, thin smoke, coloured beams, neon, a bar's bottles and the crowd
+   moving on the beat, all out of focus. The sand keeps its white raking key; magenta and cyan rims colour the edges. ---------- */
+const float BY = -.42;                                 // booth top
+const vec3 RIM1 = normalize(vec3(.85,.22,-.5));  const vec3 RIM1C = vec3(1.,.12,.55) * 1.5;
+const vec3 RIM2 = normalize(vec3(-.55,.28,-.8)); const vec3 RIM2C = vec3(.1,.75,1.) * 1.3;
+float beatPulse(float t){ return exp(-fract(t * 2.) * 6.) * step(1., t) * (1. - smoothstep(8., 8.15, t)); }   // the kick, every beat while the music plays
+float strobe(float t){ return exp(-pow((t - 4.) / .035, 2.)) + exp(-pow((t - 4.5) / .035, 2.)); }          // two flashes on the hook, 2 per second
+float hookSweep(float t){ return smoothstep(3.9, 4.15, t) * (1. - smoothstep(4.9, 5.3, t)); }
+float bnd(float x, float a, float b, float s){ return smoothstep(a - s, a + s, x) * smoothstep(b + s, b - s, x); }
+vec3 club(vec3 r, float blur){
+  float ph = atan(r.x, -r.z), el = r.y, s = .006 + blur * .05;
+  float T = uT;
+  vec3 c = vec3(.006,.004,.012) * (.6 + .4 * smoothstep(-.3, .5, el));
+  c += vec3(.5,.05,.3) * .07 * smoothstep(.8, -.1, abs(ph + .1)) * smoothstep(.5, -.05, el);          // smoke lit magenta
+  c += vec3(.05,.3,.55) * .07 * smoothstep(.8, -.1, abs(ph + 1.)) * smoothstep(.5, -.05, el);         // smoke lit cyan
+  // the stage glow behind the crowd, kicking on the beat
+  float stage = smoothstep(.9, .1, abs(ph + .45)) * smoothstep(.24, -.04, el) * smoothstep(-.22, -.06, el);
+  vec3 sg = mix(vec3(.9,.1,.6), vec3(.2,.5,1.), .5 + .5 * sin(ph * 3. + T * .5)) * (1. + 1.2 * beatPulse(T));
+  c += sg * stage * .7;
+  // the crowd: heads and shoulders against the stage light, bobbing on the beat; a few hands up
+  float crowd = 0.;
+  for (int k = 0; k < 30; k++) {
+    float fk = float(k);
+    float px = -1.35 + 1.9 * (fk + .6 * hash11(fk * 3.1)) / 30.;
+    float bob = .011 * abs(sin(PI * 2. * T + fk * 1.7)) * step(1., T) * (1. - smoothstep(8., 8.6, T));
+    float hy = -.07 + .03 * hash11(fk * 7.3) + bob;
+    float hr = .02 + .006 * hash11(fk);
+    vec2 d = vec2(ph - px, el - hy);
+    float head = smoothstep(hr + s, hr - s, length(d * vec2(1., .9)));
+    float body = smoothstep(s, -s, max(abs(d.x) - hr * 2.3 - (-(d.y + hr)) * .4, d.y + hr * .7));
+    float arm = hash11(fk * 9.1) > .75 ? smoothstep(s + .004, -s, abs(d.x - hr * 1.6 - (d.y) * .25) - .006) * bnd(d.y, -.01, .07 + bob * 2., s) : 0.;
+    crowd = max(crowd, max(max(head, body), arm));
+  }
+  c = mix(c, vec3(.004,.002,.006), crowd);
+  // the bar on the left: shelves of bottles catching the light, a warm strip under each shelf
+  if (ph > .65 && ph < 1.7 && el > -.14 && el < .22) {
+    vec2 g = vec2(ph * 38., el * 26.); vec2 gi = floor(g), gf = fract(g) - .5;
+    float hh = hash12(gi);
+    vec3 bc = hh > .66 ? vec3(1.,.6,.2) : hh > .33 ? vec3(.3,.9,.4) : vec3(.6,.7,1.);
+    c += bc * smoothstep(.36 + blur * .1, .18, length(gf * vec2(1.7, .7))) * .12 * step(.55, hash12(gi + 2.)) * hash12(gi + 5.);
+    c += vec3(1.,.55,.25) * .35 * (smoothstep(.006 + s, 0., abs(el - .02)) + smoothstep(.006 + s, 0., abs(el - .14)));
+  }
+  // neon: a pink tube along the wall, a cyan upright
+  c += vec3(1.,.15,.6) * 2.2 * smoothstep(.006 + s, 0., abs(el - .27)) * bnd(ph, -1.2, -.2, s);
+  c += vec3(.15,.85,1.) * 2. * smoothstep(.006 + s, 0., abs(ph - .45)) * bnd(el, .02, .4, s);
+  // the lighting rig's lamps
+  for (int k = 0; k < 4; k++) { float sx = -1.15 + .45 * float(k); vec3 sc = mod(float(k), 2.) < .5 ? vec3(1.,.2,.7) : vec3(.2,.8,1.);
+    c += sc * 3. * (.6 + .4 * beatPulse(T + float(k) * .25)) * smoothstep(.02 + s, .005, length(vec2(ph - sx, (el - .44) * 1.3))); }
+  c += vec3(.85,.88,1.) * .3 * strobe(T) * smoothstep(-.3, .3, el);
+  return c * uLights;                                            // the blackout takes the whole room with it
+}
+/* coloured pools from the moving heads, wandering slowly over the booth and the plate, kicking with the bass drum */
+vec3 pools(vec2 q){
+  vec3 acc = vec3(0.);
+  for (int k = 0; k < 3; k++) {
+    float fk = float(k);
+    vec2 c = vec2(1.5 * sin(uT * .55 + fk * 2.1), 1.05 * cos(uT * .43 + fk * 1.3));
+    vec3 col = k == 0 ? vec3(1., .1, .6) : k == 1 ? vec3(.1, .75, 1.) : vec3(.55, .2, 1.);
+    acc += col * exp(-dot(q - c, q - c) / .6);
+  }
+  return acc * (.5 + .6 * beatPulse(uT)) * uLights;
+}
+/* the follow-spot that is left when the house lights are cut */
+const vec3 SPP = vec3(-.35, 3.4, .45);
+const vec3 SPC = vec3(1., .98, .95) * 3.;
+float spotCone(vec3 P){ vec3 sd = normalize(-SPP); vec3 l = normalize(SPP - P); return smoothstep(.925, .955, dot(-l, sd)); }
+vec3 spotSmoke(vec3 ro, vec3 rd, float tmax){
+  if (uSpot <= 0.) return vec3(0.);
+  vec3 dir = normalize(-SPP), w0 = ro - SPP;
+  float b = dot(rd, dir), d = dot(rd, w0), e = dot(dir, w0), den = 1. - b * b;
+  if (den < 1e-4) return vec3(0.);
+  float sc = (b * e - d) / den, tc = (e - b * d) / den;
+  if (sc < 0. || tc < 0.) return vec3(0.);
+  sc = min(sc, tmax);
+  vec3 q = ro + rd * sc;
+  float dist = length(q - SPP - dir * dot(q - SPP, dir));
+  float rad = .38 * max(dot(q - SPP, dir), 0.);
+  float sm = fbm(q * 1.6 + vec3(.0, -uT * .06, uT * .05)) * .7 + fbm(q * 4.1 + vec3(uT * .04, 0., 0.)) * .3;
+  return vec3(.85,.86,.9) * .06 * smoothstep(rad, rad * .3, dist) * smoothstep(.45, .8, sm) * uSpot;
+}
+vec3 env(vec3 r){
+  vec3 c = club(r, .3) * uLights;
+  c += (KCOL * 2.2 * smoothstep(.995, .999, dot(r, KEY)) + vec3(.5,.55,.65) * .12 * smoothstep(.6, .95, dot(r, FILL))
+        + RIM1C * 1.5 * smoothstep(.985, .995, dot(r, RIM1)) + RIM2C * 1.5 * smoothstep(.985, .995, dot(r, RIM2))) * uLights;
+  c += SPC * 2. * smoothstep(.9985, .9995, dot(r, normalize(SPP))) * uSpot;
+  return c;
+}
+/* coloured beams in the smoke: the shortest distance from the camera ray to each beam's axis */
+vec3 beams(vec3 ro, vec3 rd, float tmax){
+  vec3 acc = vec3(0.);
+  float T = uT, hk = hookSweep(T);
+  for (int k = 0; k < 5; k++) {
+    float fk = float(k);
+    vec3 src = vec3(-5.2 + 1.6 * fk, 3.4, -7.);
+    float sw = .45 * sin(T * .7 + fk * 1.9) * (1. - smoothstep(8., 8.6, T)) + .45 * sin(8. * .7 + fk * 1.9) * smoothstep(8., 8.6, T);
+    if (k == 2) sw = mix(sw, -1.4 + 2.8 * smoothstep(4., 5., T), hk);          // the hook: one beam sweeps across
+    vec3 dir = normalize(vec3(sw + (fk - 2.) * .12, -1., .45 + .15 * cos(T * .4 + fk)));
+    vec3 w0 = ro - src; float b = dot(rd, dir), d = dot(rd, w0), e = dot(dir, w0);
+    float den = 1. - b * b; if (den < 1e-4) continue;
+    float sc = (b * e - d) / den, tc = (e - b * d) / den;
+    if (sc < 0. || sc > tmax || tc < 0.) continue;
+    float dist = length(w0 + rd * sc - dir * tc);
+    float wid = .1 + .07 * tc;
+    vec3 col = mod(fk, 2.) < .5 ? vec3(1.,.2,.7) : vec3(.25,.8,1.);
+    float I = .3;
+    if (k == 2) { col = mix(col, vec3(1.,.97,.92), hk); I = mix(I, .5, hk); }
+    acc += col * I * exp(-dist * dist / (wid * wid)) / (1. + tc * .12) * (.8 + .4 * beatPulse(T));
+  }
+  return acc;
+}
+float sdCableC(vec3 p, vec3 a, vec3 b, vec3 c, vec3 d, float r){
+  float m = 1e3; vec3 pr = a;
+  for (int i = 1; i <= 10; i++) { float u = float(i) / 10., v = 1. - u; vec3 q = v*v*v*a + 3.*v*v*u*b + 3.*v*u*u*c + u*u*u*d; m = min(m, sdCapsule(p, pr, q, r)); pr = q; }
+  return m;
+}
+const vec3 TTC = vec3(.9, BY + .175, -2.2);           // the turntable's platter
+float room(vec3 p, out int id){
+  float d = sdBox(p - vec3(0., BY - .3, -.4), vec3(4.4, .3, 2.6)); id = 1;                              // the DJ booth
+  float drv = sdCylinder(p - vec3(0., (BY - PH) * .5, 0.), (-PH - BY) * .5, .3); if (drv < d) { d = drv; id = 8; }
+  float mx = sdRoundBox(p - vec3(-1.95, BY + .07, -.7), vec3(.55, .07, .8), .02); if (mx < d) { d = mx; id = 4; }
+  float tt = sdRoundBox(p - vec3(.9, BY + .08, -2.2), vec3(.72, .08, .6), .02); if (tt < d) { d = tt; id = 5; }
+  float pl = sdCylinder(p - TTC, .015, .5); if (pl < d) { d = pl; id = 6; }
+  float arm = sdCapsule(p, vec3(1.48, BY + .2, -1.75), vec3(1.15, BY + .2, -2.05), .012); if (arm < d) { d = arm; id = 7; }
+  float spk = sdRoundBox(p - vec3(2.05, BY + .85, -3.25), vec3(.55, .85, .45), .03); if (spk < d) { d = spk; id = 9; }
+  float cb = sdCableC(p, vec3(-.27, BY + .12, .08), vec3(-.75, BY + .02, .4), vec3(-1.3, BY + .02, .1), vec3(-1.4, BY + .1, -.1), .02);
+  if (cb < d) { d = cb; id = 3; }
+  return d;
+}
+float roomS(vec3 p){ int i; return room(p, i); }
+vec3 shadeRoom(vec3 p, vec3 rd, int id){
+  vec2 e = vec2(.002, 0.);
+  vec3 n = normalize(vec3(roomS(p + e.xyy) - roomS(p - e.xyy), roomS(p + e.yxy) - roomS(p - e.yxy), roomS(p + e.yyx) - roomS(p - e.yyx)));
+  float sk = 1.;
+  { float tk = (0. - p.y) / KEY.y; vec3 q = p + KEY * tk; if (tk > 0.) sk = mix(1., .3, smoothstep(.08, -.08, max(abs(q.x), abs(q.z)) - 1.)); }
+  vec3 li = (KCOL * .2 * max(dot(n, KEY), 0.) * sk + RIM1C * .3 * max(dot(n, RIM1), 0.) + RIM2C * .3 * max(dot(n, RIM2), 0.)
+          + vec3(.02,.012,.03) * (.5 + .5 * n.y) + vec3(.6,.62,.7) * .08 * strobe(uT) * max(n.y, 0.)) * uLights
+          + pools(p.xz) * .6 * max(n.y, 0.) + SPC * spotCone(p) * uSpot * max(dot(n, normalize(SPP - p)), 0.) * .5;
+  vec3 r = reflect(rd, n);
+  float F = .04 + .96 * pow(1. - max(dot(n, -rd), 0.), 5.);
+  if (id == 1) {                                                                               // black satin booth top
+    vec2 sc = vec2(-3.2 + 6.4 * smoothstep(4., 5., uT), -.2);
+    vec3 pool = mix(vec3(1.,.25,.7), vec3(.9,.9,1.), .4) * .9 * exp(-dot(p.xz - sc, p.xz - sc) / .45) * hookSweep(uT);
+    return vec3(.015) * li + club(r, .6) * F * .5 * uLights + (vec3(.06) * pool + pool * F * .6) * uLights + pools(p.xz) * (.05 + F * .35);
+  }
+  if (id == 3) return vec3(.01) * li + env(r) * .06;
+  if (id == 4) {     // the mixer: knobs, faders and LED level meters jumping with the music (no lettering)
+    vec3 q = p - vec3(-1.95, BY + .07, -.7);
+    vec3 col = vec3(.018) * li + club(r, .4) * F * .4;
+    if (n.y > .7) {
+      vec2 f = q.xz;
+      vec2 kg = fract(f * vec2(5.5, 5.)) - .5; float kn = smoothstep(.22, .18, length(kg)) * step(-.35, f.y);
+      col = mix(col, vec3(.05) * li + env(r) * .25, kn);
+      for (int ch = 0; ch < 4; ch++) {
+        float cx = -.33 + .22 * float(ch);
+        float lvl = (.35 + .55 * beatPulse(uT + float(ch) * .07)) * (.7 + .3 * hash11(floor(uT * 8.) + float(ch))) * step(1., uT) * (1. - smoothstep(8., 8.2, uT));
+        float seg = floor((f.y + .7) / .05);
+        float on = step(seg * .05, lvl * .55) * step(abs(f.x - cx - .07), .018) * step(-.7, f.y) * step(f.y, -.15);
+        vec3 lc = seg < 7. ? vec3(.2,1.,.3) : seg < 10. ? vec3(1.,.85,.2) : vec3(1.,.15,.1);
+        col += lc * 1.6 * on * step(.2, fract((f.y + .7) / .05));
+      }
+    }
+    return col;
+  }
+  if (id == 5) return vec3(.02) * li + club(r, .4) * F * .5;                                   // turntable plinth
+  if (id == 6) {     // the record: black vinyl, the grooves throw a bright sheen, a two-colour label turning
+    vec2 f = p.xz - TTC.xz; float rr = length(f);
+    float a = atan(f.y, f.x) + uT * 3.49;
+    if (rr < .17) return mix(vec3(.6,.08,.35), vec3(.08,.45,.6), step(0., sin(a))) * (li * .5 + .05);
+    vec3 tg = normalize(vec3(-f.y, 0., f.x));
+    float aniso = pow(max(dot(normalize(reflect(-KEY, vec3(0.,1.,0.)) + tg * dot(-rd, tg)), -rd), 0.), 6.);
+    return vec3(.01) * li + KCOL * .08 * aniso * (.7 + .3 * sin(rr * 900.)) + club(r, .3) * .08;
+  }
+  if (id == 7) return vec3(.5) * li * .3 + env(r) * .5;                                        // chrome tone-arm
+  if (id == 9) {     // speaker cabinet with a woofer
+    vec3 q = p - vec3(2.05, BY + .85, -3.25);
+    vec3 col = vec3(.012) * li;
+    if (n.z > .7) { float rr = length(q.xy - vec2(0., -.25)); col = mix(col, vec3(.004), smoothstep(.36, .34, rr)); col += vec3(.3) * li * smoothstep(.02, .0, abs(rr - .36)); }
+    return col + club(r, .5) * F * .3;
+  }
+  return vec3(.012) * li * (.8 + .2 * step(.5, fract(p.y * 30.))) + env(r) * .12;             // the driver
+}
+vec3 render(vec2 fc){
+  vec2 uv = (2. * fc - uRes) / uRes.y;
+  vec3 w = normalize(uTa - uRo), u = normalize(cross(w, vec3(0.,1.,0.))), v = cross(u, w);
+  vec3 rd = mat3(u, v, w) * normalize(vec3(uv, uFL));
+  vec3 ro = uRo;
+  // screen-space airborne grains (sprinkle stream, hopping sand)
+  vec3 air = texture(uAir, fc / uRes).r * LIGHT_COL * vec3(1.,.9,.78) * 2.6;
+  // the plate top (y = 0), its edges, the driver below
+  float t = -ro.y / rd.y;
+  vec3 col = vec3(0.); float dep = 30.;
+  vec3 P = ro + rd * t;
+  if (t > 0. && rd.y < 0. && max(abs(P.x), abs(P.z)) < 1.) {
+    dep = t;
+    vec2 p = P.xz;
+    float h = sandH(p, 0.), hb = sandH(p, 2.2);
+    vec2 e = vec2(2. / 1024., 0.);
+    float hx = sandH(p + e.xy, .6) - sandH(p - e.xy, .6), hy = sandH(p + e.yx, .6) - sandH(p - e.yx, .6);
+    vec2 gsl = vec2(hx, hy) / (2. * e.x); gsl *= min(1., .65 / max(length(gsl), 1e-5));   // sand rests at its angle of repose
+    vec3 n = normalize(vec3(-gsl.x, 1., -gsl.y));
+    // shadow: march the height field toward the lamp
+    float sh = 1.;
+    for (int i = 1; i <= 14; i++) {
+      float s = float(i) * .0025;
+      vec3 q = vec3(p.x, h, p.y) + KEY * s;
+      float hq = sandH(q.xz, .4);
+      sh = min(sh, clamp(1. - (hq - q.y) * 250., 0., 1.));
+    }
+    float sandAmt = smoothstep(.00005, .0012, h);
+    // black satin steel: brushed, a soft sheen of the overhead box and the lamp
+    float br = vnoise2(vec2(p.x * 900., p.y * 6.));
+    vec3 steel = vec3(.012,.012,.013) * (.9 + .2 * br);
+    vec3 r0 = reflect(rd, vec3(0.,1.,0.));
+    vec3 pl = pools(p);
+    vec3 Ls = normalize(SPP - P); float cone = spotCone(P) * uSpot;
+    vec3 cs = steel * (max(dot(vec3(0.,1.,0.), KEY), 0.) * KCOL * sh + .15) * uLights + env(r0) * .1 * (.8 + .4 * br);
+    cs += KCOL * .06 * pow(max(dot(reflect(-KEY, vec3(0.,1.,0.)), -rd), 0.), 30.) * sh * uLights;
+    cs += pl * .07 * (.7 + .6 * br);                                                  // coloured sheen of the moving heads on the black steel
+    cs += steel * SPC * Ls.y * cone * .45 + SPC * .03 * pow(max(dot(reflect(-Ls, vec3(0.,1.,0.)), -rd), 0.), 24.) * cone;
+    // sand: white silica, translucent where thick, a glint on every few grains
+    float ao = clamp(1. - (hb - h) * 300., .45, 1.);
+    vec3 sandA = vec3(.78,.75,.7);
+    float dif = max(dot(n, KEY), 0.);
+    float sss = smoothstep(.0, .006, h) * .25;
+    vec3 csand = sandA * ((dif * KCOL * sh + vec3(.55,.56,.62) * max(dot(n, FILL), 0.) * ao + vec3(.04,.045,.05) * ao + KCOL * sss * sh * .2
+               + RIM1C * .55 * max(dot(n, RIM1), 0.) + RIM2C * .55 * max(dot(n, RIM2), 0.)) * uLights
+               + pl * .3 * (.3 + .7 * clamp((1. - n.y) * 6., 0., 1.))                               // the pools tint the ridges' flanks, the crests stay white
+               + SPC * (max(dot(n, Ls), 0.) * 1.15 + .06) * cone);
+    float gl = step(.985, hash12(floor(p * 1400.))) * sandAmt;
+    vec3 gn = normalize(n + (hash33(vec3(floor(p * 1400.), 1.)) - .5) * .6);
+    csand += KCOL * gl * pow(max(dot(reflect(-KEY, gn), -rd), 0.), 6.) * .9 * sh * uLights + SPC * gl * pow(max(dot(reflect(-Ls, gn), -rd), 0.), 6.) * .7 * cone;
+    // the plate's own shadow from heaps nearby + contact darkening at the foot of each ridge
+    cs *= mix(1., .75, smoothstep(.0, .001, hb)) * (.4 + .6 * sh);
+    col = mix(cs, csand, sandAmt);
+    // the centre bolt: a chrome cap nut
+    float rb = length(p);
+    if (rb < .035) { vec3 nb = normalize(vec3(p.x, .03, p.y)); col = env(reflect(rd, nb)) * .9 + vec3(.04) * (uLights + uSpot) + KCOL * .3 * pow(max(dot(nb, KEY), 0.), 8.) * uLights; }
+    // plate edge bevel catches the lamp
+    float ed = 1. - max(abs(p.x), abs(p.y));
+    col += (KCOL * .25 * max(dot(normalize(vec3(sign(p.x) * step(abs(p.y), abs(p.x)), .6, sign(p.y) * step(abs(p.x), abs(p.y)))), KEY), 0.) + pl * .5) * smoothstep(.006, .0, ed) * uLights;
+  } else {
+    // below / beyond: the club
+    float tr = .02; int rid = 0; bool rh = false;
+    for (int i = 0; i < 120; i++) { vec3 q = ro + rd * tr; float d = room(q, rid); if (d < .0008 * tr) { rh = true; break; } tr += d; if (tr > 25.) break; }
+    if (rh) { dep = tr; col = shadeRoom(ro + rd * tr, rd, rid); }
+    else { dep = 25.; col = club(rd, 1.) * uLights; }
+    col += beams(ro, rd, rh ? tr : 40.) * uLights;
+    col += vec3(.016,.016,.02) * strobe(uT);
+    col += spotSmoke(ro, rd, rh ? tr : 40.);
+    // the plate's thin edge
+    for (int k = 0; k < 4; k++) {
+      vec2 nn = k == 0 ? vec2(1.,0.) : k == 1 ? vec2(-1.,0.) : k == 2 ? vec2(0.,1.) : vec2(0.,-1.);
+      float den = dot(rd.xz, nn); if (den >= 0.) continue;
+      float te = (1. - dot(ro.xz, nn)) / den; vec3 E2 = ro + rd * te;
+      if (te > 0. && te < dep && E2.y < 0. && E2.y > -PH && max(abs(E2.x), abs(E2.z)) < 1.001) {
+        dep = te; vec3 n = vec3(nn.x, 0., nn.y);
+        col = vec3(.02) * (max(dot(n, KEY), 0.) * KCOL) + env(reflect(rd, n)) * .2;
+      }
+    }
+  }
+  gDepth = dep;
+  col += vec3(.003,.003,.004) * strobe(uT);
+  if (dep < 29.) col += spotSmoke(ro, rd, dep) * step(dep, 29.) * (rd.y < 0. && max(abs(P.x), abs(P.z)) < 1. ? 1. : 0.);
+  return col + air;
+}`,
+});
+
+/* sand height texture (plate space) and airborne-grain texture (screen space, half resolution) */
+const gl = rm.canvas.getContext('webgl2');
+const sandTex = gl.createTexture(), airTex = gl.createTexture();
+const AW = Math.round(960 * Reel.RS), AH = Math.round(540 * Reel.RS);
+const acc = new Float32Array(TW * TW), b8 = new Uint8Array(TW * TW), aacc = new Float32Array(AW * AH), a8 = new Uint8Array(AW * AH);
+function setupTex(tex, w, h, mip) {
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, w, h, 0, gl.RED, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mip ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+gl.activeTexture(gl.TEXTURE5); setupTex(sandTex, TW, TW, true);
+gl.activeTexture(gl.TEXTURE6); setupTex(airTex, AW, AH, false);
+gl.activeTexture(gl.TEXTURE0);
+gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+
+/* ---------------- camera ---------------- */
+const CAM = Track([
+  // [pos xyz, target xyz, focal]
+  { t: 0.0, v: [0.9, 0.34, 1.75, -0.05, 0.02, 0.0, 2.3] },
+  { t: 2.0, v: [1.15, 0.62, 1.95, 0.0, 0.0, 0.0, 2.25] },
+  { t: 3.6, v: [0.95, 1.25, 2.05, 0.0, 0.0, 0.0, 2.2] },
+  { t: 4.9, v: [0.0, 2.45, 0.4, 0.0, 0.0, 0.03, 2.1] },
+  { t: 5.5, v: [0.12, 2.3, 0.75, 0.0, 0.0, 0.0, 2.1] },
+  { t: 6.4, v: [1.35, 0.95, 1.95, 0.0, -0.02, 0.0, 2.15] },
+  { t: 7.6, v: [0.55, 0.88, 2.2, 0.0, -0.02, 0.0, 2.2] },
+  { t: 8.4, v: [0.3, 0.98, 2.15, 0.0, -0.02, 0.0, 2.2], stop: true },
+  { t: 10.0, v: [0.3, 0.98, 2.15, 0.0, -0.02, 0.0, 2.2] },          // after the cut: dead still
+], { easeIn: false });
+
+function project(P, ro, ta, fl) {
+  const w = [ta[0] - ro[0], ta[1] - ro[1], ta[2] - ro[2]], wl = Math.hypot(...w); w.forEach((_, k) => (w[k] /= wl));
+  let u = [w[1] * 0 - w[2] * 1, w[2] * 0 - w[0] * 0, w[0] * 1 - w[1] * 0]; const ul = Math.hypot(...u); u = u.map((x) => x / ul);   // cross(w, up)
+  const v = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+  return (Px, Py, Pz) => {
+    const d0 = Px - ro[0], d1 = Py - ro[1], d2 = Pz - ro[2];
+    const z = d0 * w[0] + d1 * w[1] + d2 * w[2]; if (z <= 0.05) return null;
+    const x = (d0 * u[0] + d1 * u[1] + d2 * u[2]) / z * fl, y = (d0 * v[0] + d1 * v[1] + d2 * v[2]) / z * fl;
+    return [(x * AH + AW) / 2, (y * AH + AH) / 2, z];
+  };
+}
+
+Reel.scene({
+  duration: 10, fps: 30,
+  cues: [
+    { t: 0.0, sfx: 'sand_sprinkle', gain: 0.7 },
+    ...TB.beats.map((b) => ({ t: b.t, sfx: 'sand_jump', gain: 0.55 })),
+    { t: TB.glide.t0, sfx: 'sand_rush', gain: 0.7 },
+    { t: TB.chord.t, sfx: 'sand_settle', gain: 0.7 },
+  ],
+  render(t) {
+    const f = t * HZ, n = Math.max(0, Math.min(NSTEP - 2, Math.floor(f))), fr = f - n;
+    const [x0, y0, x1, y1] = stateAt(n);
+    const c = CAM(t), ro = c.slice(0, 3), ta = c.slice(3, 6);
+    const prj = project(null, ro, ta, c[6]);
+    const ms = modesAt(t), D = driveAt(t);
+    if (ms) buildGrid(ms);
+    acc.fill(0); aacc.fill(0);
+    const K = (TW - 1) / 2;
+    for (let i = 0; i < NG; i++) {
+      const tl = TL[i];
+      let x = x0[i] + (x1[i] - x0[i]) * fr, y = y0[i] + (y1[i] - y0[i]) * fr;
+      if (t < tl) {
+        // still falling from the sieve: a streak in the air
+        const dtl = tl - t; if (dtl > 0.55) continue;
+        const hgt = 2.6 * dtl + 4.9 * dtl * dtl;
+        const s = prj(X0[i] - 0.05 * dtl, hgt, Y0[i]);
+        if (s) { const ix = s[0] | 0, iy = s[1] | 0; if (ix >= 0 && iy >= 0 && ix < AW && iy < AH) aacc[iy * AW + ix] += 0.35; }
+        continue;
+      }
+      // hop: grains on moving plate are in the air part of the time
+      let hop = 0;
+      const land = t - tl;
+      if (land < 0.12) hop = 0.02 * Math.abs(Math.sin(land * 26)) * (1 - land / 0.12);
+      if (ms && D > 0.05) {
+        const amp = Math.abs(sample(gA, x, y)) * D;
+        if (amp > 0.25) hop = Math.max(hop, 0.006 * Math.min(amp - 0.25, 1.4) * Math.abs(Math.sin(PH[i] + t * 47.0)));
+      }
+      if (hop > 0.0015) {
+        const s = prj(x, hop, y);
+        if (s) { const ix = s[0] | 0, iy = s[1] | 0; if (ix >= 0 && iy >= 0 && ix < AW && iy < AH) aacc[iy * AW + ix] += 0.06; }   // hopping grains: a light haze of specks, never a solid sheet
+        continue;
+      }
+      const fx = (x + 1) * K, fy = (y + 1) * K, ix = fx | 0, iy = fy | 0, u = fx - ix, v = fy - iy, k = iy * TW + ix;
+      if (ix < 0 || iy < 0 || ix >= TW - 1 || iy >= TW - 1) continue;
+      acc[k] += (1 - u) * (1 - v); acc[k + 1] += u * (1 - v); acc[k + TW] += (1 - u) * v; acc[k + TW + 1] += u * v;
+    }
+    for (let k = 0; k < TW * TW; k++) b8[k] = Math.min(255, acc[k] * 40);
+    for (let k = 0; k < AW * AH; k++) a8[k] = Math.min(255, aacc[k] * 255);
+    gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, sandTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, TW, TW, gl.RED, gl.UNSIGNED_BYTE, b8); gl.generateMipmap(gl.TEXTURE_2D);
+    gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, airTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, AW, AH, gl.RED, gl.UNSIGNED_BYTE, a8);
+    gl.activeTexture(gl.TEXTURE0);
+    const ofr = Math.round(t * 30), cut = ofr >= 240;
+    const lights = cut ? 0 : 1, spot = cut ? 1 : 0;          // a hard cut on the beat frame, like a light desk's blackout + follow-spot
+    rm.set('uLights', lights).set('uSpot', spot);
+    rm.set('uSand', { __ints: 1, v: 5 }).set('uAir', { __ints: 1, v: 6 })
+      .set('uRo', ro).set('uTa', ta).set('uFL', c[6]).set('uT', t).set('uHum', D);
+    const focus = Math.hypot(ro[0] - ta[0], ro[1] - ta[1], ro[2] - ta[2]);
+    rm.render(t, { focus, aperture: lerp(22, 9, clamp((ro[1] - 1.3) / 0.9)), maxCoc: 14 });
+  },
+});
+</script></body></html>

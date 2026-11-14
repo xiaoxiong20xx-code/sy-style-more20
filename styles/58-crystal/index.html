@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>58 偏光显微 · Polarized Microscopy</title>
+<script src="../../lib/core.js"></script><script src="../../lib/track.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 58 偏光显微 · Polarized-light micrograph of crystallising ascorbic acid =====
+   Real world: a drop of vitamin C solution drying on a slide, under a microscope between crossed polarisers. The
+   liquid is isotropic, so the field is black. Crystals are birefringent: each fibre's slow axis turns the light, and
+   the two rays interfere. Intensity per wavelength = sin²(2φ)·sin²(πΓ/λ) (φ: fibre axis vs. polariser, Γ: retardation
+   = birefringence × thickness), integrated over 24 wavelengths against the CIE observer: the Michel-Lévy colours.
+   Spherulites (radial fibres) show a fixed dark Maltese cross; sheaves fan out from a nucleus; every domain grows by
+   arrival time (Johnson–Mehl), so neighbours meet along straight or hyperbolic boundaries, and each point keeps
+   thickening after the front passes: grey → white → gold → magenta → blue → green... as it grows.
+   The film is a time-lapse: nuclei pop on the beat; hook 4.0–5.0 the time-lapse ramps up and the fronts sweep the
+   field; 7.6–8.0 the stage is turned 45°, every fibre's brightness flips, and it holds. */
+const { E, clamp, inv, lerp } = Reel;
+const stage = Reel.makeStage('#000000');
+Reel.ownJitter = true;
+const C = Reel.cfg({});
+
+/* ---------------- nuclei: [x, y, birth (lapse time), speed] [type, axis, Γmax, seed] ---------------- */
+const R = Reel.rng(58);
+const NUC = [];
+const add = (x, y, tb, v, type, ax, g) => NUC.push([x, y, tb, v, type, ax, g, R() * 100]);
+// the opening: one spherulite already growing, then a nucleus on each beat
+add(-0.18, 0.06, -1.4, 0.075, 0, 0, 760);
+[[0.12, -0.2, 0.5], [-0.42, -0.18, 1.0], [0.08, 0.27, 1.5], [-0.5, 0.3, 2.0], [0.42, 0.12, 2.5], [-0.12, -0.55, 3.0], [0.62, -0.42, 3.5]].forEach(([x, y, tb], k) =>
+  add(x, y, tb, 0.06 + 0.035 * R(), k % 3 === 1 ? 0 : 1, R() * Math.PI, 650 + 700 * R()));
+// the hook: a swarm of fast sheaves from everywhere, in and around the field
+for (let k = 0; k < 30; k++) {
+  const a = R() * 6.283, r = 0.6 + 2.2 * Math.sqrt(R());
+  add(Math.cos(a) * r, Math.sin(a) * r, 3.4 + 2.2 * R(), 0.25 + 0.35 * R(), R() < 0.2 ? 0 : 1, a + (R() - 0.5) * 1.2, 380 + 900 * R());
+}
+const NN = NUC.length;
+
+const rm = Reel.RM(stage, {
+  bloom: 0.16, th: 1.1, expo: 1.0, vig: 0.1, grain: 0.035, ca: 0.4, contrast: 1.06, sat: 1.05, bands: 4,
+  uniforms: `
+uniform highp sampler2D uNuc; uniform int uNN;
+uniform float uTau, uRot, uScale; uniform vec2 uPan; uniform float uPol;`,
+  scene: `
+vec4 NU(int i, int r){ return texelFetch(uNuc, ivec2(i, r), 0); }
+float g3(float x, float m, float s1, float s2){ float s = x < m ? s1 : s2; float t = (x - m) / s; return exp(-.5 * t * t); }
+vec3 cmf(float l){
+  float X = 1.056 * g3(l, 599.8, 37.9, 31.) + .362 * g3(l, 442., 16., 26.7) - .065 * g3(l, 501.1, 20.4, 26.2);
+  float Y = .821 * g3(l, 568.8, 46.9, 40.5) + .286 * g3(l, 530.9, 16.3, 31.1);
+  float Z = 1.217 * g3(l, 437., 11.8, 36.) + .681 * g3(l, 459., 26., 13.8);
+  return vec3(3.2406 * X - 1.5372 * Y - .4986 * Z, -.9689 * X + 1.8758 * Y + .0415 * Z, .0557 * X - .204 * Y + 1.057 * Z);
+}
+// crossed polars: I(λ) = sin²(2φ) sin²(πΓ/λ); a halogen lamp through a daylight filter ≈ flat
+vec3 michel(float G, float s2){
+  vec3 acc = vec3(0.), ws = vec3(0.);
+  for (int i = 0; i < 24; i++) {
+    float l = 395. + 320. * (float(i) + .5) / 24.;
+    float sn = sin(PI * G / l);
+    vec3 w = cmf(l);
+    acc += s2 * sn * sn * w; ws += w;
+  }
+  return max(acc / ws, 0.);
+}
+
+/* the slide at point s, lapse time tau: the colour seen through crossed polars */
+float needle(float th, float k, float sd){ return vnoise2(vec2(th * k, sd)); }
+vec3 slide(vec2 s, float tau){
+  float best = 1e9, second = 1e9; int bi = -1;
+  float bAng = 0., bDist = 0.;
+  for (int i = 0; i < 64; i++) {
+    if (i >= uNN) break;
+    vec4 a = NU(i, 0), b = NU(i, 1);
+    if (tau < a.z) continue;
+    vec2 d = s - a.xy; float r = length(d), th = atan(d.y, d.x);
+    float v = a.w;
+    float rel = th;
+    if (b.x > .5) { rel = th - b.y; v *= .25 + .75 * pow(abs(cos(rel)), 4.); }
+    // fibre tips: bundles run a little ahead, every fibre ends at its own length (a feathered front)
+    float lr = log(max(r, .002));
+    float nd = needle(rel, 7.6, b.w) * .3 + needle(rel, 41., b.w + 3.) * .3 + vnoise2(vec2(rel * 900., lr * .35 + b.w)) * .4;
+    // a fresh nucleus pops to a small seed on its beat, then grows steadily
+    float r2 = max(r - a.w * .35 * smoothstep(0., .12, tau - a.z), 0.);
+    float T = a.z + r2 * (1.1 - .2 * nd) / max(v, 1e-3);
+    if (T < best) { second = best; best = T; bi = i; bAng = th; bDist = r; }
+    else if (T < second) second = T;
+  }
+  if (bi < 0 || best > tau) {
+    float sp = smoothstep(.985, 1., vnoise2(s * 40.)) * .03;
+    return vec3(.004,.005,.007) + vec3(.4,.45,.5) * sp;
+  }
+  vec4 a = NU(bi, 0), b = NU(bi, 1);
+  float rel = b.x > .5 ? bAng - b.y : bAng;
+  // fibre direction: radial for spherulites, fanning about the axis for sheaves
+  float ang = bAng;
+  if (b.x > .5) ang = b.y + .5 * sin(rel);
+  ang += .08 * (needle(rel, 60., b.w + 5.) - .5);
+  float phi = ang + uRot - uPol;
+  float s2 = pow(sin(2. * phi), 2.);
+  float age = tau - best;
+  float grow = 1. - exp(-age / .85);
+  // fibres: very fine radial strands that wander and branch slowly along their length; gaps only between the finest
+  float lr = log(max(bDist, .002));
+  // straight strands; their contrast fades where they are finer than a pixel (no moiré near the centre)
+  float pix = uScale / 540.;
+  float aa1 = smoothstep(1.2, 3.5, bDist * 6.283 / 900. / pix), aa2 = smoothstep(1.2, 3.5, bDist * 6.283 / 2600. / pix);
+  float f1 = mix(.5, vnoise2(vec2(rel * 900., lr * .35 + b.w)), aa1);
+  float f2 = mix(.5, vnoise2(vec2(rel * 2600., lr * .6 + b.w + 9.)), aa2);
+  float bundle = needle(rel, 41., b.w + 4.) * .6 + needle(rel, 9., b.w + 5.) * .4;
+  float fib = .72 + .2 * f1 + .14 * f2;
+  float gap = mix(.55 + .45 * smoothstep(.2, .6, f1 * .6 + f2 * .4), 1., grow * .7);
+  // retardation: grows with age behind the front, varies smoothly by bundle, a faint banding; colour runs along each fibre
+  float band = 1. + .05 * sin(bDist * 30. + b.w);
+  float G = b.z * grow * (.7 + .5 * bundle) * (.96 + .08 * f1) * band * (.5 + .5 * smoothstep(0., .5, bDist));
+  vec3 c = michel(G, s2) * 2.0 * gap * fib;
+  c += vec3(.9,.92,1.) * .5 * exp(-(tau - a.z) / .18) * exp(-bDist * 25.) * step(0., tau - a.z);       // the seed catches the light as it forms
+  // the youngest tips are thin and ragged: they fade in rather than stopping at a hard edge
+  c *= smoothstep(0., .25, age) * (.6 + .4 * smoothstep(.3, .7, f2)) + smoothstep(.25, .6, age) * (1. - (.6 + .4 * smoothstep(.3, .7, f2)) * smoothstep(0., .25, age));
+  float gb = smoothstep(.0, .05, second - best);
+  c *= .2 + .8 * gb;
+  return c;
+}
+
+vec3 render(vec2 fc){
+  vec2 uv = (2. * fc - uRes) / uRes.y;
+  float r = length(uv);
+  const float RF = .93;
+  gDepth = 1.;
+  if (r > RF + .01) return vec3(.0012);
+  // slight barrel distortion of the objective; field curvature softens the outer zone a little
+  vec2 q = uv * (1. + .035 * r * r);
+  float c = cos(uRot), s = sin(uRot);
+  vec2 sp = mat2(c, -s, s, c) * (q * uScale) + uPan;
+  vec3 col = slide(sp, uTau);
+  // vignetting falls off smoothly into the field stop; the stop's edge carries a thin lateral-colour fringe
+  float vg = (1. - .3 * r * r) * pow(smoothstep(RF, RF * .8, r), .7);
+  vec3 stop = vec3(smoothstep(RF + .006, RF - .01, r), smoothstep(RF, RF - .016, r), smoothstep(RF - .006, RF - .022, r));
+  col *= vg * stop;
+  col += vec3(.0012) + vec3(.02,.008,.03) * smoothstep(.012, 0., abs(r - RF + .004)) * .15;
+  return col;
+}`,
+});
+
+/* nuclei -> float texture */
+const gl = rm.canvas.getContext('webgl2');
+const NW = 64, nd = new Float32Array(NW * 2 * 4);
+NUC.forEach((n, i) => { nd.set([n[0], n[1], n[2], n[3]], i * 4); nd.set([n[4], n[5], n[6], n[7]], (NW + i) * 4); });
+const nTex = gl.createTexture();
+gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, nTex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, NW, 2, 0, gl.RGBA, gl.FLOAT, nd);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.activeTexture(gl.TEXTURE0);
+
+/* ---------------- timeline ---------------- */
+// time-lapse clock: steady, then the operator ramps the lapse up for the hook, then it eases off
+const lapseRate = (t) => 0.95 + 4.3 * Track.easeRange(t, 3.85, 4.25) * (1 - Track.easeRange(t, 4.9, 5.4)) - 0.55 * Track.easeRange(t, 5.2, 6.0) - 0.4 * Track.easeRange(t, 7.4, 8.4);          // the lapse stops: after 8.4 nothing grows any more
+const TAUT = (() => { const a = new Float64Array(10001); for (let i = 1; i <= 10000; i++) a[i] = a[i - 1] + lapseRate((i - 0.5) / 1000) / 1000; return a; })();
+const TAU = (t) => { const x = clamp(t, 0, 10) * 1000, i = Math.min(9999, Math.floor(x)), f = x - i; return [TAUT[i] + (TAUT[i + 1] - TAUT[i]) * f]; };
+// stage: slow pan and zoom-out as the field fills; the 45° turn lands on 8.0
+const STG = Track([
+  { t: 0, v: [-0.14, 0.04, 0.36] }, { t: 2.0, v: [-0.1, 0.03, 0.5] }, { t: 3.9, v: [0.0, -0.02, 0.72] }, { t: 5.2, v: [0.06, -0.05, 1.05] },
+  { t: 8.0, v: [-0.02, 0.0, 1.0], stop: true }, { t: 10, v: [-0.02, 0.0, 1.0] },
+], { easeIn: false });
+const ROT = (t) => (Math.PI / 4) * Track.ease(inv(7.55, 8.0, t)) + 0.04 * Math.sin(Math.min(t, 8.0) * 0.3);
+
+Reel.scene({
+  duration: 10, fps: 30,
+  cues: [
+    { t: 0.0, sfx: 'scope_hum', gain: 0.5 },
+    { t: 0.5, sfx: 'nucleate', gain: 0.6 }, { t: 1.0, sfx: 'nucleate', gain: 0.6 }, { t: 1.5, sfx: 'nucleate', gain: 0.6 }, { t: 2.0, sfx: 'nucleate', gain: 0.65 },
+    { t: 2.5, sfx: 'nucleate', gain: 0.65 }, { t: 3.0, sfx: 'nucleate', gain: 0.7 }, { t: 3.5, sfx: 'nucleate', gain: 0.7 },
+    { t: 4.0, sfx: 'crystal_rush', gain: 0.95 },
+    { t: 7.55, sfx: 'stage_turn', gain: 0.7 }, { t: 8.0, sfx: 'flip_chime', gain: 0.85 },
+  ],
+  render(t) {
+    const [px, py, sc] = STG(t);
+    rm.set('uNuc', { __ints: 1, v: 5 }).set('uNN', { __ints: 1, v: NN })
+      .set('uTau', TAU(t)[0]).set('uRot', ROT(t)).set('uScale', sc).set('uPan', [px, py]).set('uPol', 0.0);
+    gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, nTex); gl.activeTexture(gl.TEXTURE0);
+    // focus breathes a little; the operator re-focuses during the lapse ramp
+    const fb = 1.0 + 0.03 * Math.sin(t * 1.3) * (1 - Track.easeRange(t, 8.0, 8.6));
+    rm.render(t, { focus: fb, aperture: 1.6, maxCoc: 1.5 });
+  },
+});
+</script></body></html>

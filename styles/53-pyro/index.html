@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>53 烙画 · Pyrography</title>
+<script src="../../lib/core.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script><script src="../../lib/track.js"></script><script src="../../lib/pyro.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 53 烙画 · PYROGRAPHY =====
+   A basswood board on a dark bench in low, raking afternoon light. An electric pyrography pen with a glowing wire
+   nib draws a Huangshan pine on a rock: it touches down on the first beat, a thread of smoke curls up, the outline
+   burns in, branches and fans of needles follow on the beats. The hook: the shading — cross-hatching on the rock,
+   the shaded side of the trunk, the shadows under each needle pad — burns in one sweep and the picture jumps into
+   three dimensions. On 8.0 the pen lifts off its last deep stroke and the last wisp of smoke drifts away.
+   Renderer: strokes generated as real pen lines (lib/pyro.js), each texel's first-burn time and final darkness
+   baked on the CPU; the shader burns them in as the nib passes (an ember glow for a moment, scorch -> brown ->
+   char), the burnt lines sink a little into the wood and catch the raking light; the pen is an SDF (nichrome wire,
+   brass posts, cork grip), smoke is a trail of puffs ray-marched with forward scattering; depth of field. */
+const { E, clamp, inv, lerp } = Reel;
+const stage = Reel.makeStage('#070605');
+Reel.ownJitter = true;
+const DBG = Reel.Q.get('cam');
+const DOM = [-11, -7.5, 22, 15], BW = 4096, BH = Math.round(4096 * 15 / 22);
+const NS = 22;
+
+const rm = Reel.RM(stage, {
+  bloom: 0.34, th: 0.95, expo: 1.0, vig: 0.38, grain: 0.03, ca: 0.4, contrast: 1.05, sat: 1.0, bands: 6,
+  lift: [0.004, 0.003, 0.002], gain: [1.0, 0.985, 0.96],
+  uniforms: `
+uniform sampler2D uBurn; uniform vec4 uDom;
+uniform vec3 uRo, uTa; uniform float uTanF, uTm;
+uniform vec4 uNib; uniform vec3 uPA;
+uniform vec4 uSm[${NS}]; uniform vec4 uSmB[${NS}]; uniform vec4 uSmBound;`,
+  scene: `
+const vec3 LAMPP = vec3(-34., 13., -11.);                  // the desk lamp's bulb: low on the left, raking across the board
+const vec3 LAMPA = vec3(.898, -.324, .299);                  // where its shade points
+const vec3 LK = normalize(vec3(-.86, .30, -.30));
+const vec3 LIGHT_COL = vec3(1.);   // colour of the desk lamp (lit surfaces, warm-wall bounce, metal glints, the bulb, smoke); vec3(1.) = original look
+// ------------------------------------------------------------ the burn
+vec4 burn4(vec2 uv){ vec2 tc = (uv - uDom.xy)/uDom.zw; if (tc.x < 0. || tc.y < 0. || tc.x > 1. || tc.y > 1.) return vec4(20., 0., 20., 0.); return texture(uBurn, tc); }
+vec2 burnAt(vec2 uv){ vec4 b = burn4(uv); return uTm > b.x ? b.xy : b.zw; }
+float darkAt(vec2 uv){ vec4 b = burn4(uv); return max(b.y*smoothstep(b.x, b.x + .08, uTm), b.w*smoothstep(b.z, b.z + .08, uTm)); }
+// ------------------------------------------------------------ the pen
+vec3 penLocal(vec3 p){
+  vec3 A = uPA, B1 = normalize(cross(A, vec3(0., 1., 0.))), B2 = cross(A, B1);
+  vec3 q = p - uNib.xyz; return vec3(dot(q, A), dot(q, B1), dot(q, B2));
+}
+float capA(vec3 q, vec3 a, vec3 b, float r){ return sdCapsule(q, a, b, r); }
+float cylA(vec3 q, float a0, float a1, float r0, float r1){ float u = clamp((q.x - a0)/(a1 - a0), 0., 1.); float r = mix(r0, r1, u); vec2 d = vec2(length(q.yz) - r, max(a0 - q.x, q.x - a1)); return min(max(d.x, d.y), 0.) + length(max(d, 0.)); }
+float gPen;
+float sdPen(vec3 p){
+  vec3 q = penLocal(p);
+  if (q.x > 26. || length(q.yz) > 5.) { gPen = 0.; return max(length(q.yz) - 4.2, q.x - 25.); }
+  float d = min(capA(q, vec3(0.), vec3(1.15, .17, 0.), .034), capA(q, vec3(0.), vec3(1.15, -.17, 0.), .034));   // the bent nichrome wire
+  gPen = 1.;
+  float t1 = min(cylA(q - vec3(0., .19, 0.), 1.1, 2.0, .065, .075), cylA(q - vec3(0., -.19, 0.), 1.1, 2.0, .065, .075));   // brass posts
+  if (t1 < d) { d = t1; gPen = 2.; }
+  float sh = cylA(q, 1.9, 3.4, .26, .40);                          // chrome heat shield
+  sh = min(sh, cylA(q, 3.0, 3.4, .43, .43) - .012*step(.5, fract(atan(q.z, q.y)*9.55)));   // a knurled collar
+  if (sh < d) { d = sh; gPen = 3.; }
+  float gr = cylA(q, 3.4, 9.6, .50, .56) - .03*smoothstep(.4, 1., sin(q.x*6.2))*step(q.x, 5.6);   // cork grip, waisted for the fingers
+  if (gr < d) { d = gr; gPen = 4.; }
+  float rr = cylA(q, 9.6, 15.0, .53, .40);
+  rr = min(rr, cylA(q, 15.0, 16.2, .22, .19));                      // strain relief
+  if (rr < d) { d = rr; gPen = 5.; }
+  // the power cord leaving the tail and falling away
+  float cd = min(capA(q, vec3(16.1, 0., 0.), vec3(19.5, -.6, .4), .16), capA(q, vec3(19.5, -.6, .4), vec3(24., -3.5, 2.2), .16));
+  if (cd < d) { d = cd; gPen = 5.; }
+  return d;
+}
+vec3 penN(vec3 p){ vec2 k = vec2(1., -1.)*.003; return normalize(k.xyy*sdPen(p + k.xyy) + k.yyx*sdPen(p + k.yyx) + k.yxy*sdPen(p + k.yxy) + k.xxx*sdPen(p + k.xxx)); }
+float penShadow(vec3 ro, vec3 rd){ float r = 1., t = .02; for (int i = 0; i < 48; i++){ float h = sdPen(ro + rd*t); if (gPen > 0.) r = min(r, 8.*h/t); t += clamp(h, .02, 1.5); if (r < .01 || t > 45.) break; } return clamp(r, 0., 1.); }
+// ------------------------------------------------------------ wood
+vec3 bass(vec3 p, out float rough){
+  // basswood: pale, creamy, fine and even; the growth rings are faint and wander
+  float w = p.z + .55*sin(p.x*.17 + 1.) + .35*fbm(vec3(p.x*.04, p.z*.25, 1.)) + .12*sin(p.x*.6 + p.z*.3);
+  float ring = fract(w*.75 + .3*fbm(vec3(p.x*.1, p.z*.1, 4.)));
+  float late = smoothstep(.70, .97, ring)*(1. - smoothstep(.985, 1., ring))*(.5 + .5*fbm(vec3(p.x*.2, p.z*.5, 9.)));
+  vec3 c = mix(vec3(.88, .78, .62), vec3(.80, .66, .48), late*.45);
+  c *= .97 + .04*vnoise(vec3(p.x*.5, p.z*45., 3.));
+  c *= .95 + .07*fbm(vec3(p.xz*.25, 7.));
+  c = mix(c, c*vec3(1., .93, .90), smoothstep(.4, .8, fbm(vec3(p.xz*.08, 11.)))*.5);
+  rough = .65;
+  return pow(c, vec3(2.2));
+}
+vec3 burnCol(vec3 wood, float d){
+  vec3 c = mix(wood, pow(vec3(.80, .64, .43), vec3(2.2)), smoothstep(.0, .24, d));     // pale golden scorch
+  c = mix(c, pow(vec3(.55, .37, .21), vec3(2.2)), smoothstep(.20, .46, d));            // tan
+  c = mix(c, pow(vec3(.32, .19, .10), vec3(2.2)), smoothstep(.42, .70, d));            // warm brown
+  c = mix(c, pow(vec3(.15, .085, .045), vec3(2.2)), smoothstep(.66, .88, d));          // dark brown
+  c = mix(c, vec3(.010, .008, .007), smoothstep(.86, 1., d));                          // char
+  return c;
+}
+float D_GGX(float nh, float a){ float a2 = a*a; float d = nh*nh*(a2 - 1.) + 1.; return a2/(PI*d*d); }
+vec3 lampDir(vec3 p, out float att){
+  vec3 Lv = LAMPP - p; float d = length(Lv); vec3 L = Lv/d;
+  float spot = mix(.40, 1., smoothstep(.55, .92, dot(-L, LAMPA)));
+  att = pow(38./max(d, 4.), 1.4)*spot;
+  return L;
+}
+vec3 lightIt(vec3 p, vec3 n, vec3 v, vec3 alb, float rough, float metal, float sh){
+  float att; vec3 L = lampDir(p, att);
+  vec3 Lc = LIGHT_COL*vec3(1., .88, .72)*3.4*att;
+  float ndl = max(dot(n, L), 0.), nv = max(dot(n, v), 1e-3);
+  vec3 h = normalize(L + v); float a = max(rough*rough, .004);
+  vec3 F0 = mix(vec3(.04), alb, metal);
+  vec3 F = F0 + (1. - F0)*pow(1. - max(dot(h, v), 0.), 5.);
+  vec3 col = (alb*(1. - metal)*ndl/PI*2.8 + D_GGX(max(dot(n, h), 0.), a)*F*.25/max(nv, .2)*ndl)*Lc*sh;
+  // the room: warm walls, a little cool dusk from the window behind
+  col += alb*(1. - metal)*LIGHT_COL*vec3(.12, .10, .08)*(.55 + .45*n.y);
+  col += alb*(1. - metal)*vec3(.020, .028, .045)*max(dot(n, normalize(vec3(-.3, .4, -1.))), 0.);
+  col += alb*(1. - metal)*LIGHT_COL*vec3(.04, .028, .018)*max(dot(n, normalize(vec3(.8, .4, .5))), 0.);
+  // the nib's own glow
+  float hot = uNib.w;
+  vec3 dl = uNib.xyz - p; float dd = length(dl);
+  col += alb*vec3(1., .32, .08)*hot*.55*max(dot(n, dl/dd), 0.)/(.06 + dd*dd*2.);
+  vec3 rr = reflect(-v, n);
+  col += F0*metal*(LIGHT_COL*mix(vec3(.04, .035, .03), vec3(.14, .12, .10), smoothstep(-.3, .7, rr.y)) + LIGHT_COL*vec3(1., .85, .6)*1.5*pow(max(dot(rr, L), 0.), 60.));
+  return col;
+}
+// ------------------------------------------------------------ the craftsman's desk around the board
+const float DY = -1.8;
+float gE; float gEk;
+float sdHex(vec2 p, float r){ p = abs(p); return max(p.x*.866 + p.y*.5, p.y) - r; }
+mat2 rot2(float a){ float c = cos(a), s = sin(a); return mat2(c, s, -s, c); }
+float mapE(vec3 p){
+  float d = p.y - DY; gE = 20.;                                      // the oak work desk
+  float w = p.z + 48.; if (w < d) { d = w; gE = 21.; }                // the wall behind
+  // a tool rail on the wall with carving tools hanging from it
+  if (p.z < -44.) {
+    float rail = sdBox(p - vec3(16., 9.5, -47.2), vec3(26., .9, .8)); if (rail < d) { d = rail; gE = 29.; }
+    for (int i = 0; i < 7; i++){ float x = -4. + float(i)*5.6;
+      float hd = sdCapsule(p, vec3(x, 8.4, -46.6), vec3(x, 3.8, -46.6), .65); if (hd < d) { d = hd; gE = 30.; }
+      float bl = sdBox(p - vec3(x, 2.0, -46.6), vec3(.35 + .1*float(i % 3), 1.9, .08)); if (bl < d) { d = bl; gE = 31.; } }
+  }
+  // basswood blanks stacked at the back left
+  if (length(p - vec3(-23., DY + 2., -16.)) < 16.) {
+    for (int i = 0; i < 3; i++){ float fi = float(i); vec3 q = p - vec3(-23. + fi*.6, DY + .65 + fi*1.25, -16. + fi*.5); q.xz = rot2(.06*fi - .05)*q.xz;
+      float b = sdRoundBox(q, vec3(9., .6, 6.), .06); if (b < d) { d = b; gE = 22.; } }
+  }
+  // two sheets of sandpaper, front right, one corner curling up
+  if (length(p - vec3(19., DY, 11.)) < 12.) {
+    vec3 q = p - vec3(20., DY + .03, 10.); q.xz = rot2(.35)*q.xz;
+    float cu = max(q.x - 3.2, 0.); q.y -= cu*cu*.07;
+    float s1 = sdBox(q, vec3(5.5, .025, 7.)); if (s1 < d) { d = s1; gE = 23.; }
+    vec3 q2 = p - vec3(16.8, DY + .08, 13.); q2.xz = rot2(-.2)*q2.xz;
+    float s2 = sdBox(q2, vec3(5.5, .025, 7.)); if (s2 < d) { d = s2; gE = 24.; }
+  }
+  // two pencils, front left
+  for (int i = 0; i < 2; i++){
+    float fi = float(i); vec3 a0 = vec3(-25. + fi*2.6, DY + .34, 11.5 - fi*1.4); vec3 dir = normalize(vec3(1., 0., -.22 - fi*.35));
+    vec3 q = p - a0; float u = dot(q, dir); vec3 pp = q - dir*u;
+    vec3 b2 = normalize(cross(dir, vec3(0., 1., 0.)));
+    vec2 cs = vec2(pp.y, dot(pp, b2));
+    float body = max(sdHex(cs, .31), max(-u, u - 15.));
+    float tip = max(length(cs) - .31*clamp((17.2 - u)/2.2, 0., 1.), max(15. - u, u - 17.2));
+    float era = max(length(cs) - .30, max(-u - 1.3, u));
+    float pd = min(min(body, tip*.7), era);
+    if (pd < d) { d = pd; gE = 25.; gEk = u; }
+  }
+  // the pen stand: a cast-iron foot and a conical coil the pen rests in
+  if (length(p - vec3(18., DY + 3., -5.)) < 9.) {
+    float ft = sdCylinder(p - vec3(18., DY + .55, -5.), .55, 3.1) - .1; if (ft < d) { d = ft; gE = 26.; }
+    vec3 q = p - vec3(18., DY + 1.2, -5.);
+    vec3 ax = normalize(vec3(-.55, .70, .45)), b1 = normalize(cross(ax, vec3(0., 0., 1.))), b2 = cross(ax, b1);
+    vec3 cq = vec3(dot(q, ax), dot(q, b1), dot(q, b2));
+    float rr = length(cq.yz), an = atan(cq.z, cq.y), P = .55, Rr = mix(.75, 1.25, clamp(cq.x/8., 0., 1.));
+    float k = cq.x/P - an/6.2831853; float ph = (fract(k + .5) - .5)*P;
+    float coil = max(length(vec2(rr - Rr, ph)) - .085, max(-cq.x, cq.x - 8.));
+    coil = min(coil, sdCapsule(q, vec3(0.), ax*.6 + b1*.75, .1));
+    if (coil*.8 < d) { d = coil*.8; gE = 27.; }
+  }
+  // a cup of tea on its saucer, back right
+  if (length(p - vec3(24., DY + 3., -16.)) < 9.) {
+    vec3 q = p - vec3(24., DY, -16.);
+    float sc = max(length(q.xz) - 6.4, abs(q.y - .3) - .3); sc = max(sc, -max(length(q.xz) - 4.6, -(q.y - .45))); if (sc < d) { d = sc; gE = 32.; }
+    float y = q.y - .6; float Rc = mix(3.4, 4.1, clamp(y/6.4, 0., 1.));
+    float cup = max(abs(length(q.xz) - Rc) - .18, max(-y, y - 6.4));
+    cup = min(cup, max(length(q.xz) - Rc, max(-y, .35 - y)));                   // its foot / bottom
+    float hd = sdTorus((q - vec3(Rc + 1.1, 3.6, 0.)).xzy, vec2(1.35, .32)); hd = max(hd, -(length(q.xz) - Rc));
+    cup = min(cup, hd);
+    if (cup < d) { d = cup; gE = 32.; }
+    float tea = max(length(q.xz) - (Rc - .2), abs(y - 5.2) - .02); if (tea < d) { d = tea; gE = 33.; }
+  }
+  // the burner's control box behind the board: a dial and a red pilot light
+  if (length(p - vec3(3., DY + 3., -19.)) < 9.) {
+    vec3 q = p - vec3(3., DY + 2.6, -19.);
+    float bx = sdRoundBox(q, vec3(5.6, 2.6, 3.6), .35); if (bx < d) { d = bx; gE = 34.; }
+    float dial = max(length(q.xy - vec2(2.2, .2)) - 1.25, abs(q.z - 3.95) - .5); dial -= .05*step(.6, fract(atan(q.y - .2, q.x - 2.2)*3.)); if (dial < d) { d = dial; gE = 35.; }
+    float led = length(q - vec3(-2.6, 1.1, 3.62)) - .28; if (led < d) { d = led; gE = 36.; }
+  }
+  // a few shavings and curls left on the desk
+  for (int i = 0; i < 7; i++){
+    float fi = float(i); vec3 c = vec3(13.5*cos(fi*2.2 + .4) + 1.5*sin(fi*5.), DY + .45, 9.5*sin(fi*2.2 + .4) + 1.2*cos(fi*3.));
+    if (abs(c.x) < 13.4 && abs(c.z) < 9.4) c.x += 13.4*sign(c.x + .001) - c.x*.0;
+    vec3 q = p - c; q.xz = rot2(fi*1.3)*q.xz; q.yz = rot2(1.2 + fi*.4)*q.yz;
+    float sv = max(sdTorus(q, vec2(.42 + .1*mod(fi, 3.), .05)), q.x - .2); if (sv < d) { d = sv; gE = 28.; }
+  }
+  // the desk lamp, far left: foot, arm and shade with its warm bulb
+  if (length(p - vec3(-35., 6., -14.)) < 22.) {
+    float lb = sdCylinder(p - vec3(-38., DY + .5, -18.), .5, 5.5) - .1; if (lb < d) { d = lb; gE = 37.; }
+    float ar = min(sdCapsule(p, vec3(-38., DY + 1., -18.), vec3(-39., 17., -15.), .35), sdCapsule(p, vec3(-39., 17., -15.), vec3(-35.8, 14., -11.6), .3));
+    if (ar < d) { d = ar; gE = 37.; }
+    vec3 q = p - (LAMPP - LAMPA*1.8); float u = dot(q, LAMPA); float rr = length(q - LAMPA*u);
+    float sh = max(abs(rr - mix(1.2, 4.2, clamp(u/5., 0., 1.))) - .12, max(-u, u - 5.)); if (sh < d) { d = sh; gE = 37.; }
+    float bulb = length(p - LAMPP) - 1.1; if (bulb < d) { d = bulb; gE = 38.; }
+  }
+  return d;
+}
+vec3 nE(vec3 p){ vec2 k = vec2(1., -1.)*.01; return normalize(k.xyy*mapE(p + k.xyy) + k.yyx*mapE(p + k.yyx) + k.yxy*mapE(p + k.yxy) + k.xxx*mapE(p + k.xxx)); }
+float shE(vec3 ro, vec3 rd, float tmax){ float r = 1., t = .08; for (int i = 0; i < 40; i++){ float h = mapE(ro + rd*t); r = min(r, 10.*h/t); t += clamp(h, .05, 4.); if (r < .01 || t > tmax) break; } return clamp(r, 0., 1.); }
+// the board's own shadow on whatever lies under it toward the lamp
+float boardShadow(vec3 p, vec3 L){
+  vec3 bmin = vec3(-12.5, -1.8, -8.5), bmax = vec3(12.5, 0., 8.5);
+  vec3 iv = 1./L, t0 = (bmin - p)*iv, t1 = (bmax - p)*iv; vec3 tmn = min(t0, t1), tmx = max(t0, t1);
+  float tn = max(max(tmn.x, tmn.y), tmn.z), tf = min(min(tmx.x, tmx.y), tmx.z);
+  return tf > max(tn, 0.) ? 1. - smoothstep(0., 1.2, tf - max(tn, 0.)) : 1.;
+}
+// ------------------------------------------------------------ smoke
+float smokeD(vec3 p){
+  float d = 0.;
+  for (int i = 0; i < ${NS}; i++){ vec4 s = uSm[i]; float a = uSmB[i].x; if (a <= 0.) continue; vec3 q = p - s.xyz; q.y *= .42; d += a*exp(-dot(q, q)/(s.w*s.w)); }
+  return d;
+}
+// ------------------------------------------------------------ render
+vec3 render(vec2 fc){
+  vec2 uvn = (2.*fc - uRes)/uRes.y;
+  vec3 ww = normalize(uTa - uRo), uu = normalize(cross(ww, vec3(0., 1., 0.))), vv = cross(uu, ww);
+  vec3 rd = normalize(ww + (uu*uvn.x + vv*uvn.y)*uTanF), ro = uRo;
+  // pen
+  float tp = 0.; bool hitP = false;
+  for (int i = 0; i < 140; i++){ float h = sdPen(ro + rd*tp); if (h < .0015*(1. + tp*.05)) { hitP = true; break; } tp += h; if (tp > 120.) break; }
+  // the board's top, its sides, and the desk world around it
+  float tb = -ro.y/rd.y; vec3 pb = ro + rd*tb;
+  bool onBoard = rd.y < 0. && tb > 0. && abs(pb.x) < 12.5 && abs(pb.z) < 8.5;
+  vec3 bmin = vec3(-12.5, -1.8, -8.5), bmax = vec3(12.5, 0., 8.5);
+  vec3 iv = 1./rd, b0 = (bmin - ro)*iv, b1 = (bmax - ro)*iv; vec3 tmn = min(b0, b1), tmx = max(b0, b1);
+  float tn = max(max(tmn.x, tmn.y), tmn.z), tf = min(min(tmx.x, tmx.y), tmx.z);
+  bool side = tn < tf && tn > 0. && (ro + rd*tn).y < -.001;
+  float te = 0.; bool hitE = false;
+  for (int i = 0; i < 170; i++){ float h = mapE(ro + rd*te); if (h < .002*(1. + te*.03)) { hitE = true; break; } te += h; if (te > 600.) break; }
+  float best = 1e9; int kind = 0;
+  if (hitP) { best = tp; kind = 1; }
+  if (onBoard && tb < best) { best = tb; kind = 2; }
+  if (side && tn < best) { best = tn; kind = 3; }
+  if (hitE && te < best) { best = te; kind = 4; }
+  vec3 col; float depth = best;
+  vec3 v = -rd;
+  if (kind == 1) {
+    vec3 p = ro + rd*tp; vec3 n = penN(p);
+    vec3 q = penLocal(p);
+    sdPen(p); float id = gPen;
+    float sh = 1.;
+    if (id == 1.) {
+      float glow = uNib.w*exp(-q.x/.42);
+      col = lightIt(p, n, v, vec3(.55, .54, .52), .35, 1., sh)*(1. - glow) + vec3(1., .30, .06)*glow*7. + vec3(1., .7, .3)*pow(glow, 3.)*6.;
+    } else if (id == 2.) col = lightIt(p, n, v, vec3(.95, .72, .40), .25, 1., sh);
+    else if (id == 3.) col = lightIt(p, n, v, vec3(.82, .83, .85), .12, 1., sh) + vec3(.82, .83, .85)*.25*smoothstep(-.2, .8, reflect(-v, n).y);
+    else if (id == 4.) { float ck = (.80 + .30*vnoise(p*22.))*(1. - .45*smoothstep(.72, .9, vnoise(p*60.)))*(1. - .3*smoothstep(.8, .95, vnoise(p*140. + 3.))); col = lightIt(p, n, v, pow(vec3(.70, .52, .33)*ck, vec3(2.2)), .85, 0., sh); }
+    else col = lightIt(p, n, v, vec3(.02, .02, .022), .4, 0., sh);
+  } else if (kind == 2) {
+    vec3 p = pb;
+    vec2 uv = vec2(p.x, -p.z);
+    float rough; vec3 wood = bass(p, rough);
+    float d0 = darkAt(uv);
+    float e = .012;
+    float dx = darkAt(uv + vec2(e, 0.)) - darkAt(uv - vec2(e, 0.)), dz = darkAt(uv + vec2(0., e)) - darkAt(uv - vec2(0., e));
+    float dep = .016;
+    float gx = .0025*(vnoise(vec3(p.x*.6 + .1, p.z*60., 3.)) - vnoise(vec3(p.x*.6 - .1, p.z*60., 3.)))/.2;
+    vec3 n = normalize(vec3(dx*dep/(2.*e) - gx, 1., -dz*dep/(2.*e)));
+    float ed = min(12.5 - abs(p.x), 8.5 - abs(p.z));
+    if (ed < .03) n = normalize(n + vec3(sign(p.x)*step(12.5 - abs(p.x), 8.5 - abs(p.z)), 0., sign(p.z)*step(8.5 - abs(p.z), 12.5 - abs(p.x)))*(1. - ed/.03)*.6);
+    vec3 alb = burnCol(wood, d0);
+    rough = mix(rough, .92, smoothstep(.55, 1., d0));
+    float att; vec3 L = lampDir(p, att);
+    float sh = penShadow(p + vec3(0., .01, 0.), L);
+    col = lightIt(p, n, v, alb, rough, 0., sh);
+    vec2 bb = burnAt(uv); float age = uTm - bb.x;
+    if (age > 0. && age < .25) col += vec3(1., .42, .12)*bb.y*exp(-age/.05)*1.4;
+  } else if (kind == 3) {
+    vec3 p = ro + rd*tn; vec3 n = abs(p.x) > 12.49 ? vec3(sign(p.x), 0., 0.) : vec3(0., 0., sign(p.z));
+    float rough; vec3 wood;
+    if (abs(n.x) > .5) {
+      float ring = fract(length(vec2(p.z + 23., p.y + 9.))*.75 + .2*fbm(vec3(p.zy*.4, 2.)));
+      wood = pow(mix(vec3(.74, .61, .44), vec3(.62, .48, .32), smoothstep(.7, .95, ring)*.6), vec3(2.2))*(.85 + .15*vnoise(vec3(p.zy*30., 1.)));
+    } else wood = bass(vec3(p.x, p.y, p.y*4. + p.z), rough)*.9;
+    col = lightIt(p, n, v, wood, .75, 0., 1.);
+  } else if (kind == 4) {
+    vec3 p = ro + rd*te; float id; { mapE(p); id = gE; }
+    vec3 n = id == 20. ? vec3(0., 1., 0.) : id == 21. ? vec3(0., 0., 1.) : nE(p);
+    float att; vec3 L = lampDir(p, att);
+    float sh = boardShadow(p + n*.02, L)*shE(p + n*.05, L, 60.);
+    if (length(p.xz - uNib.xz) < 30.) sh *= penShadow(p + n*.02, L);
+    vec3 alb = vec3(.5); float rough = .6, metal = 0.;
+    if (id == 20.) {          // oak desk: grain along x, old scorch marks, pencil lines, sawdust round the board
+      float g = fract(p.z*.32 + .4*fbm(vec3(p.x*.02, p.z*.12, 1.)));
+      alb = mix(vec3(.66, .50, .33), vec3(.54, .39, .24), smoothstep(.6, .95, g)*.7)*(.92 + .10*vnoise(vec3(p.x*.15, p.z*8., 2.)));
+      // a few old scorch rings and stains from years of work, soft-edged
+      float st = fbm(vec3(p.xz*.05, 7.)) + .3*fbm(vec3(p.xz*.2, 2.));
+      alb *= 1. - .30*smoothstep(.78, .95, st)*smoothstep(12., 30., length(p.xz));
+      float dust = smoothstep(.50, .80, fbm(vec3(p.xz*.9, 3.)))*smoothstep(22., 13., length(p.xz*vec2(.7, 1.)));
+      alb = mix(alb, vec3(.88, .78, .60), dust*.5);
+      alb = pow(alb, vec3(2.2)); rough = .5;
+    } else if (id == 21.) {   // plaster wall; a window onto the dusk on the left
+      alb = pow(vec3(.72, .66, .58), vec3(2.2))*(.9 + .15*fbm(vec3(p.xy*.05, 1.)));
+      vec2 wq = p.xy - vec2(-26., 26.);
+      if (abs(wq.x) < 18. && abs(wq.y) < 20.) {
+        vec2 m = abs(fract(wq/vec2(9., 10.) + .5) - .5)*vec2(9., 10.);
+        float bar = step(min(m.x, m.y), .35) + step(17.3, abs(wq.x)) + step(19.3, abs(wq.y));
+        vec3 sky = mix(vec3(.10, .14, .26), vec3(.28, .22, .30), smoothstep(-20., 20., wq.y))*1.4;
+        col = bar > 0. ? lightIt(p, n, v, pow(vec3(.30, .20, .13), vec3(2.2)), .6, 0., sh) : sky;
+        depth = te; kind = 9;
+      }
+    } else if (id == 22.) { float r0; alb = bass(p*vec3(1., 1., 1.) + vec3(0., 0., 7.), r0); rough = .65; }
+    else if (id == 23.) { alb = pow(vec3(.62, .30, .18), vec3(2.2))*(.7 + .5*vnoise(p*60.)); rough = .95; }
+    else if (id == 24.) { alb = pow(vec3(.86, .82, .74), vec3(2.2))*(.9 + .2*vnoise(p*40.)); rough = .9; }
+    else if (id == 25.) {
+      float u = gEk;
+      alb = u > 16.2 ? vec3(.03) : u > 15. ? pow(vec3(.86, .70, .50), vec3(2.2)) : u > 0. ? pow(vec3(.95, .74, .12), vec3(2.2)) : u > -.5 ? vec3(.7, .68, .6) : pow(vec3(.92, .45, .45), vec3(2.2));
+      metal = u < 0. && u > -.5 ? 1. : 0.; rough = .35;
+    }
+    else if (id == 26.) { alb = vec3(.02); rough = .6; }
+    else if (id == 27.) { alb = vec3(.62, .62, .64); rough = .25; metal = 1.; }
+    else if (id == 28.) { alb = pow(vec3(.90, .80, .62), vec3(2.2)); rough = .7; }
+    else if (id == 29.) { alb = pow(vec3(.45, .30, .18), vec3(2.2)); rough = .6; }
+    else if (id == 30.) { alb = pow(vec3(.62, .42, .24), vec3(2.2))*(.8 + .3*vnoise(p*3.)); rough = .5; }
+    else if (id == 31.) { alb = vec3(.55, .56, .58); rough = .25; metal = 1.; }
+    else if (id == 32.) { alb = pow(vec3(.70, .80, .74), vec3(2.2)); rough = .08; }             // celadon glaze
+    else if (id == 33.) { alb = pow(vec3(.55, .30, .08), vec3(2.2)); rough = .02; }             // tea
+    else if (id == 34.) { alb = vec3(.035, .036, .04); rough = .5; }
+    else if (id == 35.) { alb = vec3(.015); rough = .4; }
+    else if (id == 37.) { alb = vec3(.025); rough = .4; }
+    if (kind == 4) {
+      if (id == 36.) col = vec3(1., .12, .05)*6.;
+      else if (id == 38.) col = LIGHT_COL*vec3(1., .85, .6)*14.;
+      else col = lightIt(p, n, v, alb, rough, metal, sh);
+    }
+  } else { col = vec3(.05, .04, .03); depth = 600.; }
+  gDepth = depth;
+  // smoke: march the column above the nib
+  {
+    vec3 c = uSmBound.xyz; float R = uSmBound.w;
+    vec3 oc = ro - c; float b = dot(oc, rd), cc = dot(oc, oc) - R*R, hh = b*b - cc;
+    if (hh > 0.) {
+      float s0 = max(-b - sqrt(hh), 0.), s1 = min(-b + sqrt(hh), depth);
+      if (s1 > s0) {
+        float T = 1.; vec3 acc = vec3(0.);
+        float dt = (s1 - s0)/64.; float j = hash12(fc + fract(uTm*13.)*91.);
+        for (int i = 0; i < 64; i++){
+          vec3 p = ro + rd*(s0 + (float(i) + j)*dt);
+          float den = smokeD(p);
+          if (den < .002) continue;
+          vec3 wq = p*vec3(2.6, 1.1, 2.6) + vec3(sin(p.y*1.7 + uTm)*.6, -uTm*1.8, cos(p.y*1.3 - uTm)*.6);
+          float fil = 1. - abs(2.*vnoise(wq) - 1.);                  // thin threads, not blobs
+          den *= smoothstep(.45, .95, fil)*1.6 + .08;
+          float sig = den*5.5;
+          float mu = dot(rd, normalize(LAMPP - p));
+          float ph = .3 + 1.6*pow(max(mu, 0.), 3.) + .4*pow(max(-mu, 0.), 2.);
+          vec3 Ls = LIGHT_COL*vec3(.66, .68, .72)*ph*1.1 + vec3(1., .35, .1)*uNib.w*.6*exp(-length(p - uNib.xyz)*1.2);
+          acc += T*sig*dt*Ls;
+          T *= exp(-sig*dt);
+          if (T < .02) break;
+        }
+        col = col*T + acc;
+      }
+    }
+  }
+  return col;
+}`,
+});
+
+/* ------------------------------------------------------------------ the drawing */
+let STROKES = [], tBurn = null;
+const PLAN = [['trunkL', 0.5, 1.42], ['trunkR', 1.5, 1.95], ['branch', 2.0, 2.92], ['rock', 3.0, 3.45], ['padsA', 3.5, 3.98],
+  ['hatch', 4.0, 4.95], ['padsB', 5.0, 5.9], ['bark', 6.0, 6.9], ['far', 7.0, 7.6], ['final', 7.72, 8.0]];
+function setupDrawing() {
+  const S = PY.build(5353);
+  STROKES = PY.schedule(S, PLAN);
+  const t0 = performance.now();
+  const D = PY.bake(STROKES, BW, BH, ...DOM);
+  console.log('strokes', STROKES.length, 'bake ms', Math.round(performance.now() - t0));
+  const gl = rm.canvas.getContext('webgl2');
+  gl.getExtension('OES_texture_float_linear');
+  tBurn = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tBurn);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, BW, BH, 0, gl.RGBA, gl.FLOAT, D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+const PA = (() => { const v = [0.50, 0.82, -0.18]; const l = Math.hypot(...v); return v.map((x) => x / l); })();
+// the dense phases (needles, shading, bark, far hills) are a time-lapse: hundreds of tiny strokes a second. There the
+// nib glides along a smoothed path instead of jumping stroke to stroke (which would ghost under motion blur).
+const DENSE = [[3.5, 4.0], [4.0, 4.95], [5.0, 5.9], [6.0, 6.9], [7.0, 7.6]];
+function rawPen(t) { return PY.penAt(STROKES, t); }
+function smoothPen(t) {
+  let u = 0, v = 0, w = 0;
+  for (let k = -12; k <= 12; k++) { const tt = t + k * 0.014, g = Math.exp(-(k * k) / 50); const p = rawPen(tt); u += p.u * g; v += p.v * g; w += g; }
+  return { u: u / w, v: v / w, h: 0.05, down: 1 };
+}
+function penAtSmooth(t) {
+  let wgt = 0;
+  for (const [a, b] of DENSE) wgt = Math.max(wgt, clamp((t - a + 0.06) / 0.12) * clamp((b - t + 0.06) / 0.12));
+  const r = rawPen(t);
+  if (wgt <= 0) return r;
+  const s = smoothPen(t);
+  return { u: lerp(r.u, s.u, wgt), v: lerp(r.v, s.v, wgt), h: lerp(r.h, s.h, wgt), down: wgt > 0.5 ? 1 : r.down };
+}
+function nibAt(t) {
+  // after the last stroke (8.0) the pen lifts straight up and away to the upper right
+  const p = penAtSmooth(Math.min(t, 8.0));
+  let x = p.u, y = p.h, z = -p.v;
+  if (t > 8.0) { const k = E.inOutCubic(clamp((t - 8.0) / 0.5)); y += 19 * k; x += 9 * k; z += -3 * k; }   // fully out of frame by 8.5
+  const hot = t > 8.0 ? Math.max(0, 1 - (t - 8.0) / 0.9) : 1;
+  return { pos: [x, y + 0.0, z], down: t <= 8.0 ? p.down : 0, hot };
+}
+function smokeAt(t) {
+  // a puff every 0.08 s while the nib is on the wood; each rises, drifts and spreads
+  const S = new Float32Array(NS * 4), A = new Float32Array(NS * 4);
+  const base = Math.floor(t / 0.05) * 0.05;
+  for (let k = 0; k < NS; k++) {
+    const te = base - 0.05 * k, age = t - te;
+    if (te < -0.6) continue;
+    const n = nibAt(Math.max(te, 0));
+    // a nib that lingers smokes; one racing across the wood hardly does
+    const na = nibAt(Math.max(te - 0.02, 0)).pos, nb2 = nibAt(te + 0.02).pos;
+    const speed = Math.hypot(nb2[0] - na[0], nb2[2] - na[2]) / 0.04;
+    const amp = (n.down ? 1 : (te < 0.5 ? 0.3 : 0.0)) / (1 + speed * 0.3) * Math.pow(Math.max(0, 1 - age / 1.15), 1.4);
+    const sw = Math.sin(age * 3.1 + te * 7) * 0.45 * age, sz = Math.cos(age * 2.3 + te * 5) * 0.35 * age;
+    S.set([n.pos[0] + sw + 0.35 * age, n.pos[1] + 0.10 + age * 2.6, n.pos[2] + sz, 0.07 + age * 0.50], k * 4);
+    A[k * 4] = amp * 0.9;
+  }
+  let mn = [1e9, 1e9, 1e9], mx = [-1e9, -1e9, -1e9];
+  for (let k = 0; k < NS; k++) { if (A[k * 4] <= 0) continue; for (let i = 0; i < 3; i++) { mn[i] = Math.min(mn[i], S[k * 4 + i] - S[k * 4 + 3] * 2.2); mx[i] = Math.max(mx[i], S[k * 4 + i] + S[k * 4 + 3] * 2.2); } }
+  const B = mn[0] > 1e8 ? [0, -100, 0, 0.01] : [(mn[0] + mx[0]) / 2, (mn[1] + mx[1]) / 2, (mn[2] + mx[2]) / 2, Math.hypot(mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]) / 2];
+  return { S, A, B };
+}
+
+/* ------------------------------------------------------------------ camera */
+// macro: follow the nib (smoothed) for the first beats, then pull back to the whole board
+// a wide, triangular-weighted average of the nib: the camera drifts after the drawing instead of chasing every stroke
+function smoothNib(t) { let a = [0, 0, 0], W = 0; const n = 25; for (let k = 0; k < n; k++) { const w = 1 - Math.abs(k - 12) / 13, p = nibAt(Math.max(0, t - 0.75 + k * 0.05)).pos; a = a.map((x, i) => x + p[i] * w); W += w; } return a.map((x) => x / W); }
+const CK = [
+  { t: 0.0, off: [3.2, 2.2, 4.6], fov: 30, w: 0 },
+  { t: 1.5, off: [4.2, 3.0, 4.2], fov: 30, w: 0.25 },
+  { t: 3.0, off: [7.5, 6.5, 8.0], fov: 32, w: 0.5 },   // the camera only half-follows the fast branch strokes
+  { t: 4.0, off: [6.0, 12.5, 15.0], fov: 32, w: 0.7 },
+  { t: 5.2, off: [6.5, 19.5, 22.0], fov: 32, w: 1 },
+  { t: 8.0, off: [7.0, 27.0, 30.0], fov: 32, w: 1, stop: true },   // locked off from 8.0
+  { t: 10.0, off: [7.0, 27.0, 30.0], fov: 32, w: 1 },
+];
+const camT = Track(CK.map((k) => ({ t: k.t, v: [...k.off, k.fov, k.w], stop: k.stop })), { easeIn: false, easeOut: true });
+function camAt(t) {
+  if (DBG) { const v = DBG.split(',').map(Number); return { p: v.slice(0, 3), a: v.slice(3, 6), fov: v[6] || 30 }; }
+  const v = camT(t);
+  const nb = smoothNib(Math.min(t, 7.9));
+  const w = clamp(v[4]);
+  const tgt = [lerp(nb[0], 0.4, w), lerp(nb[1] * 0.4 + 0.15, -0.6, w), lerp(nb[2], -1.2, w)];
+  return { p: [tgt[0] + v[0], tgt[1] + v[1], tgt[2] + v[2]], a: tgt, fov: v[3] };
+}
+
+Reel.scene({
+  duration: 10, fps: 30,
+  cues: [
+    { t: 0.0, sfx: 'pen_hum', gain: 0.5 },
+    { t: 0.5, sfx: 'nib_touch', gain: 0.8 }, { t: 0.5, sfx: 'burn_line', gain: 0.75 },
+    { t: 1.5, sfx: 'nib_touch', gain: 0.6 }, { t: 1.5, sfx: 'burn_short', gain: 0.65 },
+    { t: 2.0, sfx: 'nib_touch', gain: 0.6 }, { t: 2.0, sfx: 'burn_line', gain: 0.65 },
+    { t: 3.0, sfx: 'nib_touch', gain: 0.6 }, { t: 3.0, sfx: 'burn_short', gain: 0.6 },
+    { t: 3.5, sfx: 'nib_touch', gain: 0.5 }, { t: 3.5, sfx: 'burn_short', gain: 0.55 },
+    { t: 4.0, sfx: 'hatch_rush', gain: 0.85 },
+    { t: 5.0, sfx: 'nib_touch', gain: 0.5 }, { t: 5.0, sfx: 'burn_line', gain: 0.55 },
+    { t: 6.0, sfx: 'nib_touch', gain: 0.5 }, { t: 6.0, sfx: 'burn_line', gain: 0.5 },
+    { t: 7.0, sfx: 'nib_touch', gain: 0.45 }, { t: 7.0, sfx: 'burn_short', gain: 0.45 },
+    { t: 7.72, sfx: 'burn_final', gain: 0.8 }, { t: 8.0, sfx: 'pen_lift', gain: 0.9 },
+  ],
+  async setup() { setupDrawing(); },
+  render(t) {
+    const cam = camAt(t);
+    const nb = nibAt(t);
+    const sm = smokeAt(t);
+    const tanF = Math.tan(cam.fov * Math.PI / 360);
+    const fd = Math.hypot(cam.a[0] - cam.p[0], cam.a[1] - cam.p[1], cam.a[2] - cam.p[2]);
+    const gl = rm.canvas.getContext('webgl2');
+    gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, tBurn); gl.activeTexture(gl.TEXTURE0);
+    rm.set('uBurn', { __ints: 1, v: 4 }).set('uDom', DOM)
+      .set('uRo', cam.p).set('uTa', cam.a).set('uTanF', tanF).set('uTm', t)
+      .set('uNib', [...nb.pos, nb.hot]).set('uPA', PA);
+    rm.set('uSm', sm.S).set('uSmB', sm.A).set('uSmBound', sm.B);
+    const Ra = fd < 12 ? 0.28 : lerp(0.6, 1.3, clamp((fd - 12) / 25));     // the desk around stays soft
+    rm.render(t, { focus: fd, aperture: Reel.Q.get('nodof') ? 0 : Ra * 342 / tanF, maxCoc: 26, expo: 1.15 });
+  },
+});
+</script></body></html>

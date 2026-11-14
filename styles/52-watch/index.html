@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>52 机械表芯 · Watch Movement</title>
+<script src="../../lib/core.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script><script src="../../lib/track.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 52 机械表芯 · WATCH MOVEMENT, SHOT THROUGH A MACRO LENS =====
+   An open caseback: rhodium-plated bridges with Côtes de Genève stripes and mirror-polished bevels, perlage on the
+   plate, ruby jewels in polished sinks, flame-blued screws, a gilt wheel train with circular graining, a glucydur
+   balance with timing screws and a breathing hairspring, a steel escape wheel and a pallet fork with red stones.
+   Timing: the balance runs at 2 Hz (14,400 vph): it passes its centre — and the escapement ticks — on every eighth
+   note of 120 BPM, so every tick on the soundtrack is an escape-wheel step on screen. On 8.0 the stop lever touches
+   the rim and the balance rests at the top of its swing.
+   Renderer: layered SDF (2D outlines extruded with chamfered top edges), studio softbox environment for the metals,
+   anisotropic stripe / perlage / sunburst finishes as normal fields, soft shadows, AO, macro depth of field. */
+const { E, clamp, inv, lerp } = Reel;
+const stage = Reel.makeStage('#08090b');
+Reel.ownJitter = true;
+const DBG = Reel.Q.get('cam');
+
+const rm = Reel.RM(stage, {
+  bloom: 0.34, th: 0.85, expo: 1.0, vig: 0.30, grain: 0.022, ca: 0.45, contrast: 1.03, sat: 1.0, bands: 6,
+  lift: [0.004, 0.004, 0.006], gain: [1.0, 1.0, 1.01],
+  uniforms: `
+uniform vec3 uRo, uTa; uniform float uTanF, uTm;
+uniform vec2 uB, uE, uF, uT, uC, uBa, uPv;
+uniform float aB, aE, aF, aT, aC, aP, uStop, uGlint;`,
+  scene: `
+const vec3 LIGHT_COL = vec3(1.);   // colour of the whole studio light (every softbox via env(), key sheen, bevel line, 8 s glint); vec3(1.) = original look
+// ------------------------------------------------------------ 2D helpers
+mat2 R2(float a){ float c = cos(a), s = sin(a); return mat2(c, s, -s, c); }
+float seg2(vec2 p, vec2 a, vec2 b){ vec2 pa = p - a, ba = b - a; float h = clamp(dot(pa, ba)/dot(ba, ba), 0., 1.); return length(pa - ba*h); }
+float taper2(vec2 p, vec2 a, vec2 b, float ra, float rb){ vec2 pa = p - a, ba = b - a; float h = clamp(dot(pa, ba)/dot(ba, ba), 0., 1.); return length(pa - ba*h) - mix(ra, rb, h); }
+float smin2(float a, float b, float k){ float h = clamp(.5 + .5*(b - a)/k, 0., 1.); return mix(b, a, h) - k*h*(1. - h); }
+// a wheel: toothed rim, N teeth, straight spokes, hub. ang = rotation
+float gear2(vec2 p, float R, float N, float th, float rim, float ns, float sw, float hubR, float ang, float saw){
+  p = R2(ang)*p;
+  float r = length(p), a = atan(p.y, p.x);
+  float sg = 6.2831853/N;
+  float u = mod(a, sg)/sg;                                   // 0..1 across one tooth pitch
+  float prof = saw > .5 ? (u < .72 ? u/.72 : (1. - u)/.28*0.) : smoothstep(.0, .22, u)*smoothstep(.62, .40, u);
+  if (saw > .5) prof = smoothstep(0., .85, u)*step(u, .86) + 0.;        // escape / ratchet: a sloped back and a sheer face
+  float rOut = R + th*prof;
+  // the tooth flanks are steep: r - rOut over-estimates the true distance there by up to ~4x (6x on the sheer face of
+  // the escape teeth), so rays slipped through the flanks at grazing angles and smeared the teeth. Inside the tooth
+  // band the distance is divided by its Lipschitz bound.
+  float band = step(R - .004, r)*step(r, R + th + .004);
+  float Lp = saw > .5 ? 7. : sqrt(1. + pow(th*7./(r*sg), 2.));
+  float dRim = max(r - rOut, (R - rim) - r)*mix(.8, .85/Lp, band);
+  float ss = 6.2831853/ns;
+  float aa = mod(a + ss*.5, ss) - ss*.5;
+  vec2 q = r*vec2(cos(aa), sin(aa));
+  float dSp = max(abs(q.y) - sw, max(q.x - (R - rim*.5), hubR*.5 - q.x));
+  float dHub = r - hubR;
+  return min(dRim, min(dSp, dHub));
+}
+float pinion2(vec2 p, float R, float N, float ang){
+  p = R2(ang)*p; float r = length(p), a = atan(p.y, p.x); float sg = 6.2831853/N;
+  float u = abs(mod(a, sg)/sg - .5)*2.;
+  return (r - R*(.78 + .22*smoothstep(.75, .25, u)))*.45;   // steep leaves: Lipschitz ~2
+}
+float ext(float d2, float y, float y0, float y1){ vec2 w = vec2(d2, max(y0 - y, y - y1)); return min(max(w.x, w.y), 0.) + length(max(w, 0.)); }
+// an extruded outline with a 45-degree polished bevel on its top edge
+float extB(float d2, float y, float y0, float y1, float bv){ float d = max(d2 + max(y - (y1 - bv), 0.), max(y0 - y, y - y1)); return d*.75; }
+// ------------------------------------------------------------ layout (heights)
+const float PLT = 0.;                       // top of the main plate
+const float BR0 = .078, BR1 = .132;         // train / barrel bridges
+const float CK0 = .108, CK1 = .162;         // balance cock (taller)
+// bridges' 2D outlines (shared by geometry and finish)
+float cock2(vec2 p){ return max(smin2(taper2(p, vec2(-.80, .86), uB, .20, .088), length(p - uB) - .098, .05), length(p) - 1.12); }
+float train2(vec2 p){
+  // one long curved bridge over the escape, fourth and third pivots, feet at the rim on both ends
+  float d = taper2(p, vec2(-.12, -.62), uE, .12, .075);
+  d = smin2(d, taper2(p, uE, uF, .075, .085), .04);
+  d = smin2(d, taper2(p, uF, uT, .085, .080), .04);
+  d = smin2(d, taper2(p, uT, vec2(.66, .78), .080, .13), .05);
+  return max(d, length(p) - 1.12);
+}
+float barrel2(vec2 p){
+  float d = smin2(length(p - uBa) - .47, length(p - uC) - .135, .12);
+  d = smin2(d, taper2(p, uC, vec2(1.10, .15), .13, .18), .06);
+  return max(d, length(p) - 1.12);
+}
+float pallet2(vec2 p){ return smin2(taper2(p, vec2(-.78, .02), uPv, .085, .045), length(p - uPv) - .05, .02); }
+// screws (x, z) on the bridges: x,z,top height
+const int NSC = 7;
+vec3 screwAt(int i){
+  if (i == 0) return vec3(-.74, .80, CK1);
+  if (i == 1) return vec3(-.11, -.56, BR1);
+  if (i == 2) return vec3(.60, .70, BR1);
+  if (i == 3) return vec3(-.70, .02, BR1);
+  if (i == 4) return vec3(.80, -.40, BR1);
+  if (i == 5) return vec3(.98, .16, BR1);
+  return vec3(.05, -.62, BR1);
+}
+// jewels in the bridges (pivot holes)
+vec3 jewelAt(int i){
+  if (i == 0) return vec3(uE.x, BR1, uE.y);
+  if (i == 1) return vec3(uF.x, BR1, uF.y);
+  if (i == 2) return vec3(uT.x, BR1, uT.y);
+  if (i == 3) return vec3(uPv.x, BR1, uPv.y);
+  return vec3(uB.x, CK1, uB.y);
+}
+// ------------------------------------------------------------ the map
+// ids: 1 plate, 2 bridge, 3 cock, 4 gilt wheel, 5 steel (escape, pallet, staff), 6 balance (glucydur), 7 hairspring,
+//      8 blued screw, 9 ruby, 10 jewel sink (polished), 11 ratchet (sunburst), 12 stop lever
+float gId;
+float sdScrew(vec3 p, vec3 s){
+  vec3 q = p - vec3(s.x, s.z, s.y);           // s = (x, z, top)
+  q = vec3(q.x, q.y, q.z);
+  float r = length(q.xz);
+  float dome = q.y - .014 + r*r*7.;          // a polished domed head
+  float d = max(r - .032, max(dome, -q.y - .012));
+  float sl = max(abs(dot(q.xz, vec2(.8, .6))) - .0040, .0075 - q.y);  // the slot
+  return max(d, -sl);
+}
+vec2 map(vec3 p){
+  float d = 1e3, id = 0.;
+  vec2 x = p.xz;
+  // plate
+  float dp = max(p.y - PLT, length(x) - 1.12); d = dp; id = 1.;
+  float cs = max(max(abs(length(x) - 1.30) - .17, p.y - .11 + max(length(x) - 1.40, 0.)), -p.y - .3);
+  if (cs < d) { d = cs; id = 13.; }
+  if (p.y > .30) return vec2(min(d, p.y - .2), 0.);
+  // ---- bridges
+  float b = extB(train2(x), p.y, BR0, BR1, .010);
+  b = min(b, extB(barrel2(x), p.y, BR0, BR1, .010));
+  b = min(b, extB(pallet2(x), p.y, BR0, BR1, .009));
+  // jewel holes / sinks in the bridges
+  for (int i = 0; i < 4; i++){ vec3 j = jewelAt(i); float r = length(p.xz - j.xz); b = max(b, -(max(r - .028 - max(p.y - (j.y - .012), 0.)*1.2, j.y - .012 - p.y))); }
+  for (int i = 0; i < NSC; i++){ vec3 sc = screwAt(i); if (sc.z > BR1 + .01) continue; float r = length(p.xz - sc.xy); b = max(b, -(max(r - .034 - max(p.y - (sc.z - .006), 0.)*1.0, sc.z - .006 - p.y))); }
+  if (b < d) { d = b; id = 2.; }
+  float ck = extB(cock2(x), p.y, CK0, CK1, .011);
+  for (int i = 0; i < NSC; i++){ vec3 sc = screwAt(i); if (sc.z < CK1 - .01) continue; float r = length(p.xz - sc.xy); ck = max(ck, -(max(r - .034 - max(p.y - (sc.z - .006), 0.)*1.0, sc.z - .006 - p.y))); }
+  { vec3 j = jewelAt(4); float r = length(p.xz - j.xz); ck = max(ck, -(max(r - .030 - max(p.y - (j.y - .012), 0.)*1.2, j.y - .012 - p.y))); }
+  if (ck < d) { d = ck; id = 3.; }
+  // jewels: ruby domes sitting in the sinks
+  for (int i = 0; i < 5; i++){ vec3 j = jewelAt(i); float rr = length(p.xz - j.xz); float jr = i == 4 ? .029 : .027;
+    float top = j.y - .0105 - rr*rr*1.5;                        // a flat, barely domed top
+    float r = max(rr - jr, max(p.y - top, j.y - .03 - p.y)); if (r < d) { d = r; id = 9.; } }
+  // ---- wheels (gilt), between plate and bridges
+  float g = ext(gear2(x - uF, .245, 72., .012, .028, 5., .016, .045, aF, 0.), p.y, .040, .052);
+  g = min(g, ext(gear2(x - uT, .215, 64., .011, .026, 5., .015, .040, aT, 0.), p.y, .024, .036));
+  g = min(g, ext(gear2(x - uC, .285, 80., .012, .030, 4., .018, .050, aC, 0.), p.y, .056, .068));
+  g = min(g, ext(gear2(x - uBa, .40, 90., .014, .04, 6., .02, .06, aC*.1, 0.), p.y, .012, .026));
+  // pinions + arbors
+  g = min(g, ext(pinion2(x - uE, .036, 7., aE), p.y, .040, .056));
+  g = min(g, ext(pinion2(x - uF, .040, 8., aF), p.y, .022, .040));
+  g = min(g, ext(pinion2(x - uT, .040, 8., aT), p.y, .052, .070));
+  g = min(g, ext(length(x - uF) - .010, p.y, 0., BR0));
+  g = min(g, ext(length(x - uT) - .010, p.y, 0., BR0));
+  g = min(g, ext(length(x - uC) - .012, p.y, 0., .09));
+  if (g < d) { d = g; id = 4.; }
+  // ---- ratchet wheel on the barrel bridge (sunburst steel)
+  float rt = ext(gear2(x - uBa, .27, 60., .014, .27, 1., .0, .0, .3, 1.), p.y, BR1, BR1 + .016);
+  rt = max(rt, -(length(x - uBa) - .035 + 0.*p.y));
+  if (rt < d) { d = rt; id = 11.; }
+  // ---- escape wheel + pallet fork (steel)
+  float es = ext(gear2(x - uE, .140, 15., .022, .020, 5., .009, .028, aE, 1.), p.y, .062, .070);
+  es = min(es, ext(length(x - uE) - .009, p.y, 0., BR0));
+  vec2 pq = R2(aP)*(x - uPv);
+  vec2 dirB = normalize(uB - uPv); vec2 ax = vec2(dirB.x, dirB.y);
+  // pallet frame: in pallet space, +u toward the balance
+  vec2 pu = vec2(dot(pq, ax), dot(pq, vec2(-ax.y, ax.x)));
+  float fork = taper2(pu, vec2(-.02, 0.), vec2(.30, 0.), .016, .010);
+  fork = min(fork, max(abs(pu.y) - .028, abs(pu.x - .325) - .022));
+  fork = max(fork, -max(abs(pu.y) - .010, abs(pu.x - .345) - .03));          // the notch of the fork
+  float arms = min(taper2(pu, vec2(0.), vec2(-.17, .11), .018, .012), taper2(pu, vec2(0.), vec2(-.17, -.11), .018, .012));
+  float pf = min(fork, arms);
+  pf = min(pf, length(pu) - .022);
+  float plv = ext(pf, p.y, .064, .072);
+  plv = min(plv, ext(length(x - uPv) - .008, p.y, 0., BR0));
+  es = min(es, plv);
+  if (es < d) { d = es; id = 5.; }
+  // pallet stones (ruby)
+  float stn = min(ext(max(abs(pu.x + .175) - .010, abs(pu.y - .118) - .016), p.y, .062, .074), ext(max(abs(pu.x + .175) - .010, abs(pu.y + .118) - .016), p.y, .062, .074));
+  if (stn < d) { d = stn; id = 9.; }
+  // ---- balance: rim with timing screws, three arms, staff, roller; under the cock
+  vec2 bq = R2(aB)*(x - uB);
+  float br = length(bq), ba = atan(bq.y, bq.x);
+  float rim = ext(abs(br - .285) - .016, p.y, .046, .074);
+  float sa = 6.2831853/3.; float a3 = mod(ba + sa*.5, sa) - sa*.5; vec2 q3 = br*vec2(cos(a3), sin(a3));
+  float arm = ext(max(abs(q3.y) - .012, max(q3.x - .28, .02 - q3.x)), p.y, .052, .064);
+  float ss = 6.2831853/16.; float a16 = mod(ba + ss*.5, ss) - ss*.5; vec2 q16 = br*vec2(cos(a16), sin(a16));
+  float scr = length(vec2(max(abs(q16.x - .304) - .005, 0.), length(vec2(q16.y, p.y - .060)))) - .0105;     // timing screws on the rim
+  float bal = min(rim, min(arm, scr));
+  bal = min(bal, ext(br - .011, p.y, .0, CK0));                                 // staff
+  bal = min(bal, ext(br - .052, p.y, .028, .036));                              // roller table
+  if (bal < d) { d = bal; id = 6.; }
+  // impulse jewel on the roller
+  { vec2 ij = bq - vec2(.044, 0.); float dj = ext(length(ij) - .008, p.y, .018, .036); if (dj < d) { d = dj; id = 9.; } }
+  // hairspring: a flat spiral that breathes with the balance (inner end turns with it, outer end held at the stud)
+  {
+    vec2 hq = x - uB; float hr = length(hq), ha = atan(hq.y, hq.x);
+    float r0 = .045, r1 = .215, pitch = .0135;
+    float w = clamp((hr - r0)/(r1 - r0), 0., 1.);
+    float ang = ha + aB*(1. - w);
+    float k = (hr - r0)/pitch - ang/6.2831853;
+    float dd = abs(fract(k) - .5)*pitch - .0021;
+    dd = max(dd, max(r0 - hr, hr - r1));
+    float hs = ext(dd, p.y, .084, .095);
+    if (hs < d) { d = hs; id = 7.; }
+  }
+  // stop lever (comes in on 8.0 and touches the rim)
+  {
+    vec2 sp = vec2(.02, .98); vec2 tip = mix(vec2(-.213, .758), vec2(-.272, .683), uStop);
+    float sl = ext(taper2(x, sp, tip, .03, .012), p.y, .050, .062);
+    if (sl < d) { d = sl; id = 12.; }
+  }
+  // blued screws
+  for (int i = 0; i < NSC; i++){ float s = sdScrew(p, screwAt(i)); if (s < d) { d = s; id = 8.; } }
+  gId = id;
+  return vec2(d, id);
+}
+vec3 calcN(vec3 p){ vec2 k = vec2(1., -1.)*.0003; return normalize(k.xyy*map(p + k.xyy).x + k.yyx*map(p + k.yyx).x + k.yxy*map(p + k.yxy).x + k.xxx*map(p + k.xxx).x); }
+float calcAO(vec3 p, vec3 n){ float o = 0., s = 1.; for (int i = 0; i < 5; i++){ float h = .004 + .022*float(i); o += (h - map(p + n*h).x)*s; s *= .75; } return clamp(1. - 3.*o, 0., 1.); }
+float shadow(vec3 ro, vec3 rd){ float r = 1., t = .002; for (int i = 0; i < 40; i++){ float h = map(ro + rd*t).x; r = min(r, 10.*h/t); t += clamp(h, .002, .05); if (r < .01 || t > .8) break; } return clamp(r, 0., 1.); }
+// ------------------------------------------------------------ studio environment: softboxes
+float box(vec3 rd, vec3 c, vec3 up, vec2 hs, float soft){
+  float k = dot(rd, c); if (k <= 0.) return 0.;
+  vec3 u = normalize(cross(c, up)), v = cross(u, c);
+  vec2 q = vec2(dot(rd, u), dot(rd, v))/k;
+  vec2 e = smoothstep(hs + soft, hs - soft, abs(q));
+  return e.x*e.y;
+}
+vec3 env(vec3 rd, float rough){
+  float s = .05 + rough*.8;
+  float up = smoothstep(-.10, .9, rd.y);
+  vec3 c = mix(vec3(.010, .011, .014), vec3(.16, .165, .175), up);                       // a white tent
+  c *= .75 + .25*smoothstep(-.4, .8, dot(rd, normalize(vec3(-.3, .5, -.8))));
+  vec3 bc = normalize(vec3(-.22, .78, -.58));
+  c += vec3(1., .985, .965)*1.5*box(rd, bc, vec3(0., 1., 0.), vec2(1.2, .45), s*1.4)*(.6 + .4*smoothstep(.6, 1., dot(rd, bc)));   // the big diffuser
+  c += vec3(.94, .97, 1.)*1.0*box(rd, normalize(vec3(.88, .40, .22)), vec3(0., 1., 0.), vec2(.18, .90), s*1.6);
+  c += vec3(1., .90, .76)*.7*box(rd, normalize(vec3(-.90, .35, .30)), vec3(0., 1., 0.), vec2(.14, .65), s*1.6);
+  c += vec3(1.)*.6*smoothstep(.08, .0, abs(rd.y - .42))*(.6 + .4*smoothstep(-1., 1., rd.z));                             // a ring light round the lens
+  c *= 1. - .62*box(rd, normalize(vec3(.05, .95, .30)), vec3(0., 0., 1.), vec2(.34, .30), s*1.5);
+  c += vec3(1., .82, .62)*.55*box(rd, normalize(vec3(-.55, .22, .80)), vec3(0., 1., 0.), vec2(.45, .12), s*1.4);          // a warm low card, front left
+  c += vec3(.85, .9, 1.)*.35*box(rd, normalize(vec3(.40, .55, -.73)), vec3(0., 1., 0.), vec2(.25, .35), s*1.4);           // a second diffuser behind right
+  for (int i = 0; i < 4; i++){ vec3 pd = normalize(vec3(sin(float(i)*2.4 + .5), .45 + .12*float(i), cos(float(i)*2.4 + .5))); c += vec3(1., .93, .85)*3.0*smoothstep(.9990 - rough*.02, 1., dot(rd, pd)); }   // small practicals                              // a soft dark card for depth in the metal
+  return LIGHT_COL*c;
+}
+vec3 metal(vec3 p, vec3 n, vec3 v, vec3 F0, float rough, float ao, float sh){
+  vec3 r = reflect(-v, n);
+  float nv = max(dot(n, v), 0.);
+  vec3 F = F0 + (1. - F0)*pow(1. - nv, 5.)*(1. - rough);
+  vec3 col = env(r, rough)*F*ao;
+  // the key softbox as a light for a little diffuse-ish sheen in rough metals
+  vec3 L = normalize(vec3(-.22, .78, -.58));
+  col += F0*LIGHT_COL*vec3(1., .98, .95)*.35*max(dot(n, L), 0.)*rough*sh;
+  return col;
+}
+vec3 dielec(vec3 p, vec3 n, vec3 v, vec3 alb, float rough, float ao, float sh, float f0){
+  vec3 L = normalize(vec3(-.22, .78, -.58));
+  float nv = max(dot(n, v), 0.);
+  float F = f0 + (1. - f0)*pow(1. - nv, 5.);
+  vec3 col = alb*(LIGHT_COL*vec3(1., .98, .95)*1.2*max(dot(n, L), 0.)*sh + vec3(.05, .052, .056)*ao);
+  col += env(reflect(-v, n), rough)*F*ao;
+  return col;
+}
+// ------------------------------------------------------------ finishes (normal fields)
+vec3 genevaN(vec2 x, out float g){
+  vec2 dir = normalize(vec2(1., .38)), pr = vec2(-dir.y, dir.x);
+  float W = .052;
+  float u = dot(x, pr)/W; float fu = fract(u) - .5; float id = floor(u);
+  float along = dot(x, dir);
+  // each stripe is a run of overlapping arcs from a rotating wheel
+  float ac = along/(W*.55); float ai = floor(ac + .5);
+  vec2 cen = (ai*W*.55)*dir + (id + .5)*W*pr - dir*W*.9;
+  float rr = length(x - cen);
+  float arcs = sin(rr*4200. + id*7.)*.5 + .5;
+  g = arcs;
+  vec2 tilt = pr*(-fu*.30) + normalize(x - cen)*(arcs - .5)*.03;
+  return normalize(vec3(tilt.x, 1., tilt.y));
+}
+vec3 perlageN(vec2 x){
+  float S = .022;
+  vec2 c = floor(x/S + .5); vec2 bc = c; float bd = 1e3;
+  // overlapping spots laid row by row: the latest spot that covers x wins
+  for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++){
+    vec2 cc = c + vec2(i, j); vec2 ctr = (cc + (vec2(hash12(cc), hash12(cc + 5.)) - .5)*.25)*S;
+    float dd = length(x - ctr);
+    if (dd < S*.78) { float ord = cc.y*100. + cc.x; if (bd > 1e2 || ord > bd) { bd = ord; bc = ctr; } }
+  }
+  vec2 dv = x - bc; float r = length(dv);
+  float rip = cos(r*3800.)*.028;
+  vec2 t = normalize(dv + 1e-5)*rip;
+  return normalize(vec3(t.x, 1., t.y));
+}
+// ------------------------------------------------------------ render
+vec3 render(vec2 fc){
+  vec2 uvn = (2.*fc - uRes)/uRes.y;
+  vec3 ww = normalize(uTa - uRo), uu = normalize(cross(ww, vec3(0., 1., 0.))), vv = cross(uu, ww);
+  vec3 rd = normalize(ww + (uu*uvn.x + vv*uvn.y)*uTanF), ro = uRo;
+  float t = 0.;
+  // jump to the top of the movement
+  if (ro.y > .2 && rd.y < 0.) t = (ro.y - .2)/(-rd.y);
+  vec2 h = vec2(1e3, 0.); bool hit = false;
+  for (int i = 0; i < 260; i++){
+    vec3 p = ro + rd*t;
+    h = map(p);
+    if (h.x < .00012*(1. + t)) { hit = true; break; }
+    t += h.x*.85;
+    if (t > 20. || p.y < -.05) break;
+  }
+  if (!hit) { gDepth = 20.; return env(rd, .5)*.2; }
+  vec3 p = ro + rd*t; gDepth = t;
+  vec3 n = calcN(p); vec3 v = -rd;
+  float id = h.y;
+  float ao = calcAO(p, n);
+  vec3 L = normalize(vec3(-.22, .78, -.58));
+  float sh = shadow(p + n*.002, L);
+  vec3 col;
+  float top = step(.92, n.y);
+  if (id == 1.) {                                    // plate: perlage, rhodium
+    vec3 nn = perlageN(p.xz);
+    col = metal(p, nn, v, vec3(.70, .71, .73), .30, ao*.85, sh);
+  } else if (id == 2. || id == 3.) {                 // bridges: rhodium, Geneva stripes, polished bevels and sinks
+    float g; vec3 nn = n;
+    float rough = .16;
+    float yTop = id == 3. ? CK1 : BR1;
+    // is this point inside a polished sink (a jewel's olive or a screw's countersink)?
+    float sink = 0.;
+    for (int i = 0; i < 5; i++){ vec3 j = jewelAt(i); if (length(p.xz - j.xz) < .046 && p.y < yTop - .0004) sink = 1.; }
+    for (int i = 0; i < NSC; i++){ vec3 sc = screwAt(i); if (length(p.xz - sc.xy) < .050 && p.y < yTop - .0004) sink = 1.; }
+    if (sink > .5) { rough = .025; }
+    else if (top > .5) { nn = genevaN(p.xz, g); rough = .09 + .07*g; }
+    else if (abs(n.y) < .3) { rough = .26; nn = normalize(n + vec3(0., (vnoise(vec3(p.xz*260., p.y*40.)) - .5)*.035, 0.)); }   // straight-grained flanks (fine enough to read, coarse enough not to alias into streaks)
+    else {
+      // the anglage: a rounded, mirror-polished chamfer; its normal rolls from the flank to the top across its width
+      float u = clamp((yTop - p.y)/.011, 0., 1.);
+      vec3 hn = normalize(vec3(n.x, 0., n.z));
+      nn = normalize(mix(vec3(0., 1., 0.), hn, .15 + .8*u));
+      rough = .02;
+    }
+    col = metal(p, nn, v, vec3(.86, .87, .89), rough, ao, sh);
+    if (top > .5 && sink < .5) col *= .96 + .06*vnoise2(p.xz*40.);
+    if (sink < .5) {
+      vec2 sq = mat2(.8, .6, -.6, .8)*p.xz;
+      float scr = smoothstep(.993, 1., vnoise(vec3(sq.x*3., sq.y*900., 4.))) + smoothstep(.994, 1., vnoise(vec3(p.xz.yx*vec2(5., 700.), 9.)));
+      col *= 1. + .55*scr;                                                       // fine hairline scratches catch the light
+      float dust = smoothstep(.985, 1., hash12(floor(p.xz*900.)));
+      col = mix(col, vec3(.55, .52, .48)*.6, dust*.5);
+    }
+    if (top < .5 && abs(n.y) >= .3 && sink < .5) col += LIGHT_COL*vec3(.55, .56, .58)*.35;       // the bevel always carries a bright line
+    // the closing glint: a light band runs across the stripes on 8.0
+    col += LIGHT_COL*vec3(1.)*uGlint*top*smoothstep(.06, 0., abs(dot(p.xz, normalize(vec2(1., .5))) - mix(-1.4, 1.4, clamp((uTm - 8.0)/.5, 0., 1.))))*.45;
+  } else if (id == 4.) {                             // gilt wheels: circular graining
+    vec2 c = uF; float dm = length(p.xz - uF);
+    if (length(p.xz - uT) < dm) { c = uT; dm = length(p.xz - uT); }
+    if (length(p.xz - uC) < dm) { c = uC; dm = length(p.xz - uC); }
+    if (length(p.xz - uBa) < dm*.6) { c = uBa; dm = length(p.xz - uBa); }
+    vec2 rv = normalize(p.xz - c + 1e-5);
+    vec3 nn = top > .5 ? normalize(vec3(rv.x*sin(dm*3000.)*.05, 1., rv.y*sin(dm*3000.)*.05)) : n;
+    col = metal(p, nn, v, vec3(1., .80, .48), .20, ao, sh);
+  } else if (id == 5.) {
+    col = metal(p, n, v, vec3(.60, .61, .62), .10, ao, sh);
+  } else if (id == 6.) {
+    col = metal(p, n, v, vec3(.98, .82, .58), .14, ao, sh);
+  } else if (id == 7.) {
+    col = metal(p, n, v, vec3(.38, .44, .62), .14, ao, sh);
+  } else if (id == 8.) {                             // flame-blued screws
+    float nv = max(dot(n, v), 0.);
+    vec3 F0 = mix(vec3(.30, .16, .62), vec3(.07, .20, .78), smoothstep(.15, .85, nv));
+    F0 = mix(F0, vec3(.30, .52, .90), smoothstep(.55, .95, n.y)*.35);
+    col = metal(p, n, v, F0, .035, ao, sh);
+  } else if (id == 9.) {                             // rubies: red glass with an inner glow
+    float nv = max(dot(n, v), 0.);
+    float F = .077 + (1. - .077)*pow(1. - nv, 5.);
+    vec3 tint = vec3(.86, .12, .28);
+    // through the stone: the polished sink below glows rose; the pivot hole is a dark pin-point in the oil cup
+    float jd = 1e3; vec3 jc = vec3(0.);
+    for (int i = 0; i < 5; i++){ vec3 j = jewelAt(i); float dd = length(p.xz - j.xz); if (dd < jd) { jd = dd; jc = j; } }
+    vec3 below = env(normalize(vec3(-v.x, abs(v.y) + .4, -v.z)), .25)*.42 + .05;
+    // the polished cone of the sink, seen through the stone, lights its rim; the body of the stone is deeper
+    float rimL = smoothstep(.014, .025, jd);
+    float cup = smoothstep(.0012, .0, abs(jd - .0085));                 // the oil cup's edge
+    vec3 thru = tint*tint*below*(.30 + 1.1*rimL + .5*cup);
+    thru *= mix(.15, 1., smoothstep(.0026, .0042, jd));                 // the pivot hole
+    col = thru*(1. - F)*ao + env(reflect(-v, n), .02)*F*ao;
+    if (p.y < .10) col = tint*tint*.25*(env(reflect(-v, n), .1)*.5 + .1) + env(reflect(-v, n), .05)*F;   // pallet stones / impulse pin
+  } else if (id == 11.) {                            // ratchet: sunburst
+    vec2 dv = p.xz - uBa; float a = atan(dv.y, dv.x);
+    vec2 tg = vec2(-dv.y, dv.x)/max(length(dv), 1e-4);
+    float sb = sin(a*900.)*.5 + .5;
+    vec3 nn = top > .5 ? normalize(vec3(tg.x*(sb - .5)*.08, 1., tg.y*(sb - .5)*.08)) : n;
+    col = metal(p, nn, v, vec3(.66, .67, .69), .10 + .08*sb, ao, sh);
+  } else if (id == 13.) {                           // the case: polished steel
+    col = metal(p, n, v, vec3(.55, .56, .57), .08, ao, sh)*.8;
+  } else {
+    col = metal(p, n, v, vec3(.60, .61, .62), .2, ao, sh);
+  }
+  return col;
+}`,
+});
+
+/* ------------------------------------------------------------------ the gear train, ticking on the eighth notes */
+const P2 = (x, y) => [x, y];
+const L = {};
+L.B = P2(-0.48, 0.42); L.E = P2(-0.05, 0.18);
+{ const d = [L.B[0] - L.E[0], L.B[1] - L.E[1]], l = Math.hypot(...d); L.Pv = [L.E[0] + d[0] / l * 0.215, L.E[1] + d[1] / l * 0.215]; }
+L.F = [L.E[0] + 0.29 * 0.85, L.E[1] - 0.29 * 0.53];
+L.T = [L.F[0] + 0.27 * 0.55, L.F[1] + 0.27 * 0.83];
+L.C = [L.T[0] + 0.33 * 0.6, L.T[1] - 0.33 * 0.8];
+L.Ba = [L.C[0] - 0.47 * 0.35, L.C[1] - 0.47 * 0.94];
+const TICK = 0.25, AMP = 2.9, STOP = 8.0;     // ~165 deg either side: a calm, legible swing (and no jumps between motion-blur sub-frames)
+function balanceAngle(t) {
+  // 2 Hz: through the centre (a tick) on every eighth note; caught by the stop lever at the top of the swing after 8.0
+  const tt = Math.min(t, STOP + TICK / 2);
+  return AMP * Math.sin(2 * Math.PI * 2 * tt) + 0.35;
+}
+function ticks(t) {
+  // escapement steps: n completed ticks with a quick, slightly recoiling transition (~22 ms) at each tick
+  const tc = Math.min(t, STOP);
+  const k = Math.floor(tc / TICK + 1e-6), f = (tc - k * TICK) / 0.022;
+  const s = f >= 1 ? 1 : 1 - Math.pow(1 - clamp(f), 3) + 0.08 * Math.sin(Math.PI * clamp(f)) ;
+  return k - 1 + Math.min(1.04, s) - (f >= 1 && f < 2.5 ? 0.04 * (1 - (f - 1) / 1.5) : 0);
+}
+function trainAt(t) {
+  const n = ticks(t);
+  const aE = -n * (2 * Math.PI / 30);                 // half a tooth per tick (15 teeth)
+  const aF = n * (2 * Math.PI / 30) / 8.0;
+  const aT = -aF / 4.5, aC = aT / 6;
+  const k = Math.floor(Math.min(t, STOP) / TICK + 1e-6);
+  const f = clamp((Math.min(t, STOP) - k * TICK) / 0.02);
+  const side = (k % 2 ? 1 : -1);
+  const aP = side * 0.13 * (2 * E.outQuad(f) - 1);    // the fork snaps from one banking pin to the other
+  return { aE, aF, aT, aC, aP };
+}
+
+/* ------------------------------------------------------------------ camera */
+const V = (a) => a;
+const CK = [
+  { t: 0.0, p: [-0.86, 0.29, 1.06], a: [-0.74, 0.165, 0.80], fov: 24 },          // nose on a blued screw at the cock's foot
+  { t: 1.0, p: [-0.93, 0.40, 1.10], a: [-0.55, 0.08, 0.50], fov: 27 },
+  { t: 2.4, p: [-0.90, 0.60, 1.02], a: [-0.45, 0.06, 0.36], fov: 28 },
+  { t: 3.6, p: [-0.28, 0.56, 1.02], a: [-0.28, 0.06, 0.30], fov: 28 },
+  { t: 4.3, p: [-0.20, 0.25, 0.64], a: [0.02, 0.05, 0.12], fov: 34 },
+  { t: 4.8, p: [0.08, 0.23, 0.62], a: [0.22, 0.045, 0.03], fov: 34 },
+  { t: 5.3, p: [0.42, 0.22, 0.72], a: [0.36, 0.03, 0.22], fov: 34 },
+  { t: 5.9, p: [0.88, 0.32, 0.50], a: [0.50, 0.05, 0.0], fov: 32 },
+  { t: 7.0, p: [0.78, 0.86, 0.95], a: [-0.20, 0.05, 0.28], fov: 30 },
+  { t: 8.0, p: [0.45, 0.70, 1.10], a: [-0.30, 0.05, 0.35], fov: 30, stop: true },   // locked off from 8.0
+  { t: 10.0, p: [0.45, 0.70, 1.10], a: [-0.30, 0.05, 0.35], fov: 30 },
+];
+const camT = Track(CK.map((k) => ({ t: k.t, v: [...k.p, ...k.a, k.fov], stop: k.stop })), { easeIn: false, easeOut: true });
+// focus relay: screw -> balance -> escape wheel -> fourth wheel -> third wheel -> balance; each rack lands on a beat
+const FP = [[-0.74, 0.17, 0.80], [L.B[0], 0.07, L.B[1]], [L.E[0], 0.066, L.E[1]], [L.F[0], 0.05, L.F[1]], [L.T[0], 0.03, L.T[1]]];
+const RACKS = [[0.0, 0], [0.6, 0], [1.0, 1], [3.9, 1], [4.25, 2], [4.75, 2], [5.0, 3], [5.25, 3], [5.5, 4], [6.4, 4], [7.0, 1]];
+function focusPoint(t) {
+  let i = 0; while (i < RACKS.length - 1 && t > RACKS[i + 1][0]) i++;
+  if (i >= RACKS.length - 1) return FP[RACKS[RACKS.length - 1][1]];
+  const [t0, a] = RACKS[i], [t1, b] = RACKS[i + 1];
+  const u = E.inOutCubic(clamp((t - t0) / (t1 - t0)));
+  return FP[a].map((x, j) => lerp(x, FP[b][j], u));
+}
+function camAt(t) {
+  if (DBG) { const v = DBG.split(',').map(Number); return { p: v.slice(0, 3), a: v.slice(3, 6), fov: v[6] || 30 }; }
+  const v = camT(t); return { p: v.slice(0, 3), a: v.slice(3, 6), fov: v[6] };
+}
+
+const cues = [];
+for (let k = 1; k <= 32; k++) cues.push({ t: k * TICK, sfx: k % 2 ? 'tick_hi' : 'tick_lo', gain: 0.75 });
+cues.push({ t: 0.0, sfx: 'macro_air', gain: 0.5 }, { t: 1.0, sfx: 'focus_pull', gain: 0.45 }, { t: 4.0, sfx: 'train_glide', gain: 0.55 }, { t: 8.0, sfx: 'stop_click', gain: 0.95 });
+
+Reel.scene({
+  duration: 10, fps: 30,
+  cues,
+  render(t) {
+    const cam = camAt(t);
+    const tr = trainAt(t);
+    const fp = focusPoint(t);
+    const fd = Math.hypot(fp[0] - cam.p[0], fp[1] - cam.p[1], fp[2] - cam.p[2]);
+    const tanF = Math.tan(cam.fov * Math.PI / 360);
+    const stop = E.outCubic(clamp((t - 7.75) / 0.25));
+    rm.set('uRo', cam.p).set('uTa', cam.a).set('uTanF', tanF).set('uTm', t)
+      .set('uB', L.B).set('uE', L.E).set('uF', L.F).set('uT', L.T).set('uC', L.C).set('uBa', L.Ba).set('uPv', L.Pv)
+      .set('aB', balanceAngle(t)).set('aE', tr.aE).set('aF', tr.aF).set('aT', tr.aT).set('aC', tr.aC).set('aP', tr.aP)
+      .set('uStop', stop).set('uGlint', t >= 8.0 && t < 8.5 ? 1 : 0);
+    const Ra = 0.010;                     // macro: a tiny depth of field
+    rm.render(t, { focus: fd, aperture: Reel.Q.get('nodof') ? 0 : Ra * 342 / tanF, maxCoc: 24, expo: 1.0 });
+  },
+});
+</script></body></html>

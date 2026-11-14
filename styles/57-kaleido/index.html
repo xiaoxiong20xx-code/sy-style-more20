@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>57 万花筒 · Kaleidoscope</title>
+<script src="../../lib/core.js"></script><script src="../../lib/track.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 57 万花筒 · Kaleidoscope (oil-cell) =====
+   Real world: a hand-made brass kaleidoscope lying on a varnished walnut table, its far end pointed at a window. Inside,
+   three first-surface mirrors at 60°; at the far end an oil cell: a sealed glass chamber of clear mineral oil holding
+   chunky slumped glass (rounded, bevelled edges, deeper colour where thicker, seeds of air inside), clear glass marbles
+   and crumpled gold leaf, back-lit through frosted glass by the warm window. Turning the cell makes the charge drift and
+   sink slowly through the oil; the mirrors fold the triangle the prism frames into a round field, each bounce a little
+   darker, the joints only a hair. The eyepiece shows the field soft and dark at its edge, with a trace of colour fringe.
+   The charge is a 2-D simulation (gravity in a turning cell, oil drag, contacts, slow tumbling), pre-computed once.
+   0–3.5 s: the eyepiece view, the cell notched round on every beat, the charge drifting into a new flower. Hook 4.0:
+   the camera pulls out of the eyepiece and reveals the instrument on the table against the window, the flower still
+   turning in its little hole; it circles and dives back in. 8.0: the last notch; the charge settles; it holds. */
+const { E, clamp, inv, lerp } = Reel;
+const stage = Reel.makeStage('#000000');
+Reel.ownJitter = true;
+const C = Reel.cfg({});
+
+/* ---------------- the charge ---------------- */
+const R = Reel.rng(57);
+const PAL = [[0.82, 0.06, 0.08], [0.08, 0.22, 0.85], [0.95, 0.55, 0.06], [0.05, 0.58, 0.26], [0.5, 0.12, 0.72], [0.12, 0.66, 0.78],
+  [0.95, 0.38, 0.5], [0.95, 0.85, 0.2], [0.93, 0.93, 0.9]];
+const NP = 64;
+const P = [];
+for (let i = 0; i < NP; i++) {
+  const type = i < 46 ? 0 : i < 57 ? 1 : 2;            // 0 slumped glass, 1 glass marble, 2 gold leaf
+  const r = type === 0 ? 0.17 + 0.15 * R() : type === 1 ? 0.08 + 0.05 * R() : 0.08 + 0.05 * R();
+  P.push({ type, r, col: type === 2 ? [1.0, 0.72, 0.3] : PAL[Math.floor(R() * PAL.length)], seed: R() * 100 });
+}
+// the cell turns a notch on every beat 0.5–3.5, turns slowly while we are outside, the last notch lands on 8.0
+function cellAngle(t) {
+  let a = 0.1 * Math.min(t, 8.0);
+  for (let k = 1; k <= 7; k++) a += 0.62 * Track.easeRange(t, k * 0.5 - 0.08, k * 0.5 + 0.2);
+  a += 0.5 * Track.easeRange(t, 4.0, 7.6);
+  a += 0.7 * Track.easeRange(t, 7.85, 8.15);
+  return a;
+}
+// oil: low effective gravity, heavy drag; the pieces drift, sink, and tumble slowly
+const SIMHZ = 240, RECHZ = 120, NREC = 10 * RECHZ + 2;
+const REC = new Float32Array(NREC * NP * 4);
+(function simulate() {
+  const x = new Float64Array(NP), y = new Float64Array(NP), px = new Float64Array(NP), py = new Float64Array(NP), an = new Float64Array(NP), fl = new Float64Array(NP);
+  for (let i = 0; i < NP; i++) { const a = R() * 6.283, rr = 0.85 * Math.sqrt(R()); x[i] = px[i] = Math.cos(a) * rr * 0.9; y[i] = py[i] = Math.sin(a) * rr * 0.9; an[i] = R() * 6.283; fl[i] = R() * 6.283; }
+  const RC = 1.0, dt = 1 / SIMHZ;
+  const step = (t, sub) => {
+    const th = cellAngle(t), om = (cellAngle(t + 0.002) - cellAngle(t - 0.002)) / 0.004;
+    const g = 2.2, gx = Math.sin(th) * -g, gy = -Math.cos(th) * g;
+    const h = dt / sub;
+    for (let s = 0; s < sub; s++) {
+      for (let i = 0; i < NP; i++) {
+        // viscous oil: strong drag; the oil itself is dragged round by the turning cell
+        const swirl = -om * 0.35 * h, sx = -y[i] * swirl, sy = x[i] * swirl;
+        const dmp = 0.984 - 0.1 * Track.easeRange(t, 8.12, 8.45);                 // after the last notch the charge comes to rest
+        const vx = (x[i] - px[i]) * dmp + sx * 0.02, vy = (y[i] - py[i]) * dmp + sy * 0.02;
+        px[i] = x[i]; py[i] = y[i];
+        const gm = P[i].type === 1 ? 1.3 : P[i].type === 2 ? 0.5 : 1.0;
+        x[i] += vx + gx * gm * h * h; y[i] += vy + gy * gm * h * h;
+      }
+      for (let i = 0; i < NP; i++) for (let j = i + 1; j < NP; j++) {
+        const dx = x[j] - x[i], dy = y[j] - y[i], d = Math.hypot(dx, dy), m = (P[i].r + P[j].r) * 0.55;
+        if (d < m && d > 1e-9) { const k = (m - d) / d * 0.5; x[i] -= dx * k; y[i] -= dy * k; x[j] += dx * k; y[j] += dy * k; }
+      }
+      for (let i = 0; i < NP; i++) {
+        const d = Math.hypot(x[i], y[i]), m = RC - P[i].r * 0.6;
+        if (d > m) { x[i] *= m / d; y[i] *= m / d; const tx = -y[i] / d, ty = x[i] / d, wv = om * d * h; px[i] -= tx * wv * 0.25; py[i] -= ty * wv * 0.25; }
+      }
+      for (let i = 0; i < NP; i++) {
+        const vx = x[i] - px[i], vy = y[i] - py[i], sp = Math.hypot(vx, vy) / h;
+        an[i] += (vx - vy * 0.5) / Math.max(P[i].r, 0.05) * 0.5;
+        fl[i] += sp * h * (2.0 + 2.0 * Math.sin(P[i].seed)) ;        // tumbling while it drifts
+      }
+    }
+  };
+  for (let k = 0; k < 900; k++) step(0, 2);
+  for (let n = 0; n < NREC; n++) {
+    const t = n / RECHZ;
+    for (let i = 0; i < NP; i++) REC.set([x[i], y[i], an[i], fl[i]], (n * NP + i) * 4);
+    for (let k = 0; k < SIMHZ / RECHZ; k++) step(t + k / SIMHZ, 2);
+  }
+})();
+function piecesAt(t) {
+  const f = clamp(t, 0, 8.5) * RECHZ, n = Math.min(NREC - 2, Math.floor(f)), u = f - n;      // held from 8.5
+  const out = new Float32Array(64 * 4);
+  for (let i = 0; i < NP; i++) { const a = (n * NP + i) * 4, b = ((n + 1) * NP + i) * 4; for (let k = 0; k < 4; k++) out[i * 4 + k] = lerp(REC[a + k], REC[b + k], u); }
+  return out;
+}
+
+const rm = Reel.RM(stage, {
+  bloom: 0.14, th: 1.3, expo: 1.0, vig: 0.32, grain: 0.028, ca: 0.6, contrast: 1.05, sat: 1.02, bands: 4,
+  lift: [0.004, 0.003, 0.002],
+  uniforms: `
+uniform highp sampler2D uPc; uniform int uNP;
+uniform vec3 uRo, uTa; uniform float uFL, uT, uCell;`,
+  scene: `
+vec4 PC(int i, int r){ return texelFetch(uPc, ivec2(i, r), 0); }
+const float APR = .17;          // eyepiece aperture radius
+const float TR = .52;           // tube radius
+const float TL = 7.;            // tube length
+const float TY = .54;           // tube axis height above the table
+const vec3 WIN = normalize(vec3(.12,.32,-1.));
+const vec3 LIGHT_COL = vec3(1.);   // window light colour: frosted backlight, caustics, sparkles, window in env, table pool
+
+/* ---------- the oil cell, back-lit through frosted glass: what comes through at cell point c ---------- */
+vec2 hash22b(vec2 p){ return vec2(hash12(p), hash12(p + 17.3)); }
+float poly(vec2 q, float sd0){
+  // a slumped chunk: five or six cuts, corners melted round (soft max), a slightly wavy edge
+  float nk = 5. + floor(hash11(sd0 * 1.3) * 2.);
+  float acc = 0., k = .09;
+  for (int j = 0; j < 6; j++) {
+    if (float(j) >= nk) break;
+    float ang = 6.283 * (float(j) + .65 * hash11(sd0 * 10. + float(j))) / nk;
+    float off = .5 + .4 * hash11(sd0 * 7. + float(j) * 3.1);
+    acc += exp((dot(q, vec2(cos(ang), sin(ang))) - off) / k);
+  }
+  return k * log(acc) + .025 * (vnoise2(q * 7. + sd0) - .5);
+}
+vec3 backlight(vec2 c){
+  // frosted glass with the warm window behind it: brighter in the middle, a soft mottle and a fine frosted grain
+  float r = length(c);
+  vec3 b = LIGHT_COL * mix(vec3(.85,.42,.16), vec3(1.,.74,.42), smoothstep(1.1, .1, r)) * (.5 + .4 * smoothstep(1.15, 0., r));
+  b *= .78 + .22 * fbm2(c * 2.3 + 3.);
+  b *= .82 + .2 * fbm2(c * 14. + 7.);                          // the frosting's texture: what the glass bends
+  b *= .97 + .06 * hash12(floor(c * 260.));                   // grain of the ground glass
+  return b;
+}
+/* Every piece is a light filter in front of the frosted glow: transmissions multiply where pieces overlap, each piece
+   bends the light it lets through (so the frosting behind it shifts), and its bevel throws a dark refraction line with a
+   bright caustic just inside. Gold leaf is opaque. */
+vec3 cellCol(vec2 c){
+  vec3 Tr = vec3(.98,.95,.88);                                 // the oil: a pale amber
+  vec3 add = vec3(0.);
+  vec2 off = vec2(0.);
+  vec3 gold = vec3(0.); float gcov = 0.;
+  for (int i = 0; i < 64; i++) {
+    if (i >= uNP) break;
+    vec4 a = PC(i, 0), b = PC(i, 1), e = PC(i, 2);
+    float r = e.y;
+    vec2 d = c - a.xy;
+    if (dot(d, d) > r * r * 2.) continue;
+    float ca = cos(a.z), sa = sin(a.z);
+    vec2 q = mat2(ca, -sa, sa, ca) * d / r;
+    float cf = max(abs(cos(a.w)), .3);
+    vec3 gc = vec3(b.y, b.z, e.x);
+    float px = .005 / r;
+    if (b.w < .5) {
+      vec2 qf = vec2(q.x / cf, q.y);
+      float sd = poly(qf, b.x);
+      float cov = smoothstep(px, -px, sd);
+      if (cov <= 0.) continue;
+      float inner = -sd;
+      // a slumped chunk: thin at the rounded rim, domed and uneven in the body
+      float th = smoothstep(0., .34, inner);
+      float body = .9 + .7 * (fbm2(qf * 2.2 + b.x) - .5) + .3 * (vnoise2(qf * 6. + b.x) - .5);
+      float tk = (.06 + 1.35 * pow(th, .8) * body) / cf;
+      vec3 sigma = -log(max(gc, vec3(.03))) * 1.1;
+      vec3 tr = exp(-sigma * tk);
+      // surface slope: refraction shifts the frosting behind (stronger toward the rim)
+      vec2 g = vec2(poly(qf + vec2(.01, 0.), b.x) - sd, poly(qf + vec2(0., .01), b.x) - sd) / .01;
+      vec2 gn = normalize(g + 1e-4);
+      vec2 slope = gn * (1. - th) * .9 + (vec2(vnoise2(qf * 4. + b.x), vnoise2(qf * 4. + b.x + 9.)) - .5) * .5;
+      off += slope * r * .2 * cov;
+      // bevel: total internal reflection makes a dark line at the edge, a bright caustic line just inside
+      float darkLine = smoothstep(.0, .03, inner) * smoothstep(.09, .03, inner);
+      float lit = .4 + .6 * max(dot(gn, normalize(vec2(.55, .8))), 0.);
+      float caustic = smoothstep(.035, 0., abs(inner - .1)) * lit;
+      tr *= 1. - .5 * darkLine;
+      // seeds: tiny air bubbles, each a dark ring with a bright pinpoint
+      vec2 bc = qf * 7. + b.x; vec2 fi = floor(bc), fr = fract(bc) - .5;
+      float hb = hash12(fi);
+      if (hb > .84 && inner > .06) {
+        vec2 o = (hash22b(fi) - .5) * .4; float rb = .04 + .07 * hash11(hb * 9.); float db = length(fr - o) / rb;
+        if (db < 1.) { tr *= mix(1., .35, smoothstep(.55, .95, db)); add += LIGHT_COL * vec3(.9) * smoothstep(.35, .0, length(fr - o - vec2(-.25, .25) * rb) / rb) * .25 * cov; }
+      }
+      tr *= .94 + .1 * vnoise2(qf * 30. + b.x);              // striae and grain in the glass
+      Tr *= mix(vec3(1.), tr, cov);
+      add += LIGHT_COL * (gc * .6 + .06) * caustic * .4 * cov * (1. - gcov);
+    } else if (b.w < 1.5) {
+      // a clear marble: a ball lens. Its rim refracts light away (dark), its centre focuses the frosting inverted and
+      // brighter, a crisp specular highlight and a softer secondary one opposite
+      float sd = length(q) - .92;
+      float cov = smoothstep(px, -px, sd);
+      if (cov <= 0.) continue;
+      float rr = length(q) / .92;
+      vec3 tint = mix(vec3(1.), gc, .55);
+      vec3 tr = tint * (1. - .92 * smoothstep(.55, .98, rr));
+      off -= q * r * .9 * (1. - rr * rr) * cov;               // inverted, magnified frosting through the ball
+      Tr *= mix(vec3(1.), tr * 1.25, cov);
+      vec2 h1 = q - vec2(-.32, .36), h2 = q - vec2(.36, -.4);
+      add += LIGHT_COL * (vec3(2.4) * exp(-dot(h1, h1) / .004) + vec3(.6) * exp(-dot(h2, h2) / .03) + tint * .9 * smoothstep(.35, .0, rr) * .5) * cov;
+    } else {
+      float sd = poly(q * 1.15, b.x) + .07 * (vnoise2(q * 13. + b.x) - .5);
+      float cov = smoothstep(px, -px, sd);
+      if (cov <= 0.) continue;
+      float cr = vnoise2(q * 8. + b.x * 3.) * .6 + vnoise2(q * 22. + b.x) * .4;
+      float spark = pow(smoothstep(.45, .85, cr), 2.);
+      vec3 gl = vec3(1.,.68,.25) * (.08 + 1.3 * spark) + vec3(.35,.2,.05) * .15;
+      gold = mix(gold, LIGHT_COL * gl * .9, cov); gcov = max(gcov, cov);
+    }
+  }
+  vec3 col = backlight(c + off) * Tr + add;
+  col = mix(col, gold, gcov);
+  // a few gold flecks suspended in the oil, drifting
+  vec2 gq = (c + vec2(0., min(uT, 8.5) * .02)) * 26.; vec2 gi = floor(gq);
+  float gh = hash12(gi);
+  if (gh > .965) { vec2 o = hash22b(gi) * .6 + .2; float dg = length(fract(gq) - o); col += LIGHT_COL * vec3(1.,.75,.35) * smoothstep(.06, .0, dg) * 1.2; }
+  return col;
+}
+
+/* ---------- the view through the eyepiece: fold into the mirror triangle ---------- */
+vec3 kaleido(vec2 p){
+  const float RI = .19;
+  int nref = 0;
+  for (int it = 0; it < 24; it++) {
+    bool moved = false;
+    for (int k = 0; k < 3; k++) {
+      float a = -1.5708 + 2.0944 * float(k);
+      vec2 n = vec2(cos(a), sin(a));
+      float d = dot(p, n) - RI;
+      if (d > 0.) { p -= 2. * d * n; nref++; moved = true; }
+    }
+    if (!moved) break;
+  }
+  float seam = 1e3;
+  for (int k = 0; k < 3; k++) { float a = -1.5708 + 2.0944 * float(k); seam = min(seam, abs(dot(p, vec2(cos(a), sin(a))) - RI)); }
+  float ca = cos(uCell), sa = sin(uCell);
+  vec2 c = mat2(ca, sa, -sa, ca) * (p * 1.5 + vec2(.0, -.32));
+  vec3 col = cellCol(c);
+  col *= pow(.92, float(nref));
+  col *= 1. - .14 * exp(-seam * 3000.);                                     // the mirror joints: a hair, barely there
+  return col;
+}
+vec3 eyepiece(vec2 uv){
+  float r = length(uv);
+  vec3 col = kaleido(uv * 1.02);
+  // lateral colour toward the rim of the eye lens
+  if (r > .72) {
+    float k = smoothstep(.72, 1., r);
+    col.r = mix(col.r, kaleido(uv * 1.02 * (1. + .014 * k)).r, k);
+    col.b = mix(col.b, kaleido(uv * 1.02 * (1. - .014 * k)).b, k);
+  }
+  float field = smoothstep(1., .955, r);
+  col *= field * pow(smoothstep(1.02, .45, r), .55);                     // the field darkens softly into the stop
+  return col * 1.35;
+}
+
+/* ---------- the room, the table, the instrument ---------- */
+vec3 env(vec3 r){
+  // warm plaster walls in shade, a tall window with the garden outside, a lamp, a bookshelf's dim spines
+  vec3 c = vec3(.07,.05,.035) * (.55 + .45 * smoothstep(-.3, .6, r.y));
+  vec3 Wc = normalize(vec3(.1,.36,-1.));
+  float cz = dot(r, Wc);
+  if (cz > 0.) {
+    vec3 u = normalize(cross(vec3(0.,1.,0.), Wc)), v = cross(Wc, u);
+    vec2 q = vec2(dot(r, u), dot(r, v)) / cz;
+    vec2 e = smoothstep(vec2(.19, .23) + .02, vec2(.19, .23) - .02, abs(q));
+    float bars = smoothstep(.007, .014, abs(q.x)) * smoothstep(.007, .014, abs(q.y - .05)) * smoothstep(.007, .014, abs(q.y + .12));
+    float leaf = smoothstep(.48, .7, fbm(vec3(q * 5., 2.)));
+    vec3 outside = mix(vec3(1.,.92,.78) * 2.5, vec3(.3,.42,.16) * 1.1, leaf * smoothstep(.1, -.2, q.y));
+    c = mix(c, LIGHT_COL * outside * (.3 + .7 * bars), e.x * e.y);
+    c += LIGHT_COL * vec3(.5,.4,.3) * .25 * e.x * smoothstep(.29, .23, abs(q.y + .26)) * step(q.y, -.22);   // the sill catches light
+  }
+  c *= 1. - .5 * smoothstep(.05, -.15, r.y);                     // the wall below the window is in shade
+  float lamp = smoothstep(.9985, .9996, dot(r, normalize(vec3(-.62,.1,-1.))));
+  c += vec3(1.,.62,.3) * 4. * lamp;
+  c += vec3(.55,.36,.2) * .55 * smoothstep(.1, .9, dot(r, normalize(vec3(-.2,.25,1.))));          // a warm lit wall behind the camera
+  c += vec3(.05,.03,.02) * smoothstep(.2, .8, r.x) * (.7 + .6 * vnoise2(vec2(atan(r.x, -r.z) * 30., r.y * 12.)));
+  return c;
+}
+float sdTube(vec3 p, out int id){
+  vec2 rz = vec2(length(p.xy - vec2(0., TY)), p.z);
+  float th = atan(p.y - TY, p.x);
+  id = 1;
+  float body = max(rz.x - TR - .002 * sin(rz.y * 3.1 + 1.) , max(rz.y, -TL - rz.y));
+  // hand knurling: a diamond pattern, peaks worn smooth
+  float kn = sin(th * 48. + rz.y * 90.) * sin(th * 48. - rz.y * 90.);
+  float ring1 = max(rz.x - TR - .04 - .01 * smoothstep(-.2, .8, kn), abs(rz.y + 5.6) - .3);
+  float ring0 = length(vec2(rz.x - TR + .01, rz.y + .05)) - .06;
+  ring0 = min(ring0, max(rz.x - TR - .025, abs(rz.y + .2) - .06));
+  float ring2 = max(rz.x - TR - .05, abs(rz.y + 6.35) - .06);
+  float d = body;
+  if (ring1 < d) { d = ring1; id = 2; }
+  if (ring0 < d) { d = ring0; id = 3; }
+  if (ring2 < d) { d = ring2; id = 3; }
+  float knB = sin(th * 36. + rz.y * 70.) * sin(th * 36. - rz.y * 70.);
+  float grip = max(rz.x - TR - .03 - .012 * smoothstep(-.1, .7, knB), abs(rz.y + .5) - .2);
+  if (grip < d) { d = grip; id = 2; }
+  float hole = rz.x - (APR + max(rz.y + .06, 0.) * 2.2);
+  d = max(d, -max(hole, -rz.y - .3));
+  float cell = max(rz.x - TR + .04, abs(rz.y + 6.7) - .3);
+  if (cell < d) { d = cell; id = 4; }
+  return d * .9;
+}
+float mapS(vec3 p){ int i; return sdTube(p, i); }
+vec3 nrm(vec3 p){ vec2 e = vec2(.0015, 0.); return normalize(vec3(mapS(p+e.xyy)-mapS(p-e.xyy), mapS(p+e.yxy)-mapS(p-e.yxy), mapS(p+e.yyx)-mapS(p-e.yyx))); }
+float softShadow(vec3 p, vec3 L, float k){
+  float res = 1., t = .02;
+  for (int i = 0; i < 40; i++) { float h = mapS(p + L * t); res = min(res, k * h / t); t += clamp(h, .02, .3); if (res < .001 || t > 10.) break; }
+  return clamp(res, 0., 1.);
+}
+vec3 brass(vec3 p, vec3 n, vec3 rd, int id){
+  float th = atan(p.y - TY, p.x);
+  bool face = abs(n.z) > .7;
+  vec2 pf = p.xy - vec2(0., TY);
+  vec2 sc = face ? pf * 1.6 : vec2(th * TR, p.z);
+  // aged brass: warm, patina in patches and in the recesses, fine scratches every which way, smudges where it is handled
+  vec3 tint = vec3(.86,.55,.26);
+  float pat = fbm(vec3(sc * 2.5, 1.));
+  tint = mix(tint, vec3(.36,.27,.15), .6 * smoothstep(.5, .78, pat));
+  float sc1 = smoothstep(.9, .985, vnoise2(vec2(dot(sc, vec2(.8, .6)) * 380., dot(sc, vec2(-.6, .8)) * 2.)));
+  float sc2 = smoothstep(.92, .99, vnoise2(vec2(dot(sc, vec2(.3, -.95)) * 460., dot(sc, vec2(.95, .3)) * 3.)));
+  float sc3 = smoothstep(.95, .995, vnoise2(vec2(dot(sc, vec2(-.9, .4)) * 300., dot(sc, vec2(.4, .9)) * 1.5)));
+  float smudge = smoothstep(.45, .72, fbm(vec3(sc * 5., 4.)));
+  // little dents bend the reflection
+  vec3 dn = (vec3(fbm(p * 7.), fbm(p * 7. + 3.), fbm(p * 7. + 6.)) - .5) * .06;
+  vec3 nn = normalize(n + dn);
+  float rough = mix(.035, .18, smudge) + (id == 2 ? .1 : 0.);
+  vec3 r = reflect(rd, nn);
+  vec3 ax = face ? normalize(vec3(-pf.y, pf.x, 0.) + 1e-4) : vec3(0., 0., 1.);       // lathe marks smear the face's reflections round
+  vec3 e0 = env(r), e1 = env(normalize(r + ax * rough * 1.5)), e2 = env(normalize(r - ax * rough * 1.5)), e3 = env(normalize(r + vec3(0., rough, 0.)));
+  float F = .6 + .4 * pow(1. - max(dot(nn, -rd), 0.), 5.);
+  vec3 c = (e0 * .4 + (e1 + e2 + e3) * .2) * tint * F;
+  if (face) c *= .85 + .15 * sin(length(pf) * 1400.);                                  // the turned rings
+  c *= 1. - .3 * smudge;
+  c += (sc1 + sc2 + sc3) * tint * .45 * (env(r) * .3 + .2);
+  if (id == 2) {   // knurling: the diamond peaks worn bright, the valleys dark with old polish
+    float kn = abs(p.z + .5) < .21 ? sin(th * 36. + p.z * 70.) * sin(th * 36. - p.z * 70.) : sin(th * 48. + p.z * 90.) * sin(th * 48. - p.z * 90.);
+    c *= .45 + .8 * smoothstep(.1, .85, kn);
+  }
+  return c;
+}
+vec3 walnut(vec2 q){
+  float g = fbm2(vec2(q.x * 9., q.y * .25) + fbm2(q * vec2(3., .25)) * 1.2);
+  float rings = .5 + .5 * sin(q.x * 60. + g * 8.);
+  vec3 c = mix(vec3(.1,.05,.022), vec3(.2,.11,.05), smoothstep(.25, .8, g * .75 + rings * .25));
+  c *= .9 + .1 * vnoise2(q * vec2(170., 4.));
+  return c;
+}
+
+vec3 render(vec2 fc){
+  vec2 uv = (2. * fc - uRes) / uRes.y;
+  vec3 w = normalize(uTa - uRo), u = normalize(cross(w, vec3(0.,1.,0.))), v = cross(u, w);
+  vec3 rd = mat3(u, v, w) * normalize(vec3(uv, uFL));
+  vec3 ro = uRo;
+  float tA = (-.06 - ro.z) / rd.z;
+  vec3 PA = ro + rd * tA;
+  vec2 aq = PA.xy - vec2(0., TY);
+  float tD = rd.y < 0. ? -ro.y / rd.y : 1e9;
+  if (tD < 1e8 && (ro + rd * tD).z < -9.) tD = 1e9;                 // past the far edge of the table: the room
+  float t = .01; int id = 0; bool hit = false;
+  float tmax = min(tD, 40.);
+  for (int i = 0; i < 200; i++) {
+    vec3 p = ro + rd * t; float d = sdTube(p, id);
+    if (abs(d) < .0005 * max(t, .3)) { hit = true; break; }
+    t += d * .85; if (t > tmax) break;
+  }
+  if (tA > 0. && length(aq) < APR && (!hit || tA < t)) {
+    float ar = length(aq) / APR;
+    gDepth = tA * (1. + .7 * smoothstep(.7, 1., ar));              // the field's edge is out of focus
+    vec3 col = eyepiece(aq / APR);
+    col += env(reflect(rd, vec3(0., 0., 1.))) * .015;
+    return col;
+  }
+  if (hit && t < tmax) {
+    vec3 p = ro + rd * t; gDepth = t;
+    vec3 n = nrm(p);
+    if (id == 4) {
+      vec2 c = vec2(atan(p.y - TY, p.x) * .5, (p.z + 6.7) * 2.);
+      return cellCol(c * .9) * .6 + env(reflect(rd, n)) * .05;
+    }
+    if (length(p.xy - vec2(0., TY)) < APR + .03 && p.z < -.01) return vec3(.004) + env(reflect(rd, n)) * .01;
+    if (length(p.xy - vec2(0., TY)) < TR * .52 && p.z > -.12) {
+      vec3 r = reflect(rd, n); float F = .04 + .96 * pow(1. - max(dot(n, -rd), 0.), 5.);
+      return vec3(.006,.005,.004) + env(r) * F * .35 * (.8 + .2 * vnoise2(p.xy * 60.));
+    }
+    float sh = softShadow(p + n * .004, WIN, 8.);
+    return brass(p, n, rd, id) * (.55 + .45 * sh);
+  }
+  if (tD < 1e8) {
+    vec3 p = ro + rd * tD; gDepth = tD;
+    vec3 alb = walnut(p.xz * .5);
+    float sh = softShadow(p + vec3(0., .003, 0.), WIN, 10.);
+    vec3 col = alb * (max(WIN.y, 0.) * LIGHT_COL * vec3(1.,.9,.75) * 2.4 * sh + vec3(.12,.09,.06));
+    // varnish: the window and the brass mirrored in the table, a little blurred
+    vec3 nn = normalize(vec3((fbm2(p.xz * 2.) - .5) * .02, 1., (fbm2(p.xz * 2. + 5.) - .5) * .02));
+    vec3 r = reflect(rd, nn);
+    float F = .04 + .96 * pow(1. - max(dot(nn, -rd), 0.), 5.);
+    vec3 rc = (env(r) + env(normalize(r + vec3(.05, .02, 0.))) + env(normalize(r - vec3(.05, -.02, 0.))) + env(normalize(r + vec3(0., .05, 0.)))) / 4.;
+    float tr = .5; int i2; float tt = .02; bool h2 = false;
+    for (int k = 0; k < 90; k++) { float dd = sdTube(p + r * tt, i2); if (dd < .003) { h2 = true; break; } tt += dd * .9; if (tt > 8.) break; }
+    if (h2) rc = LIGHT_COL * vec3(.32,.2,.08) * (.6 + .4 * sh);                 // the brass tube reflected in the varnish
+    col += rc * F * .32 * (.5 + .5 * sh);
+    // light through the glass cell, thrown on the table as a coloured glow
+    vec2 cp = p.xz - vec2(0., -6.9);
+    col += vec3(1.,.55,.3) * .08 * exp(-dot(cp, cp) * 1.5) * cellCol(cp * .7);
+    return col;
+  }
+  gDepth = 40.;
+  return env(rd);
+}`,
+});
+
+/* static piece props + per-frame positions -> float texture (rows: 0 pos/angle/tumble, 1 seed/colour/type, 2 colour.b/radius) */
+const gl = rm.canvas.getContext('webgl2');
+const PW = 64, pd = new Float32Array(PW * 3 * 4);
+P.forEach((p, i) => { pd.set([p.seed, p.col[0], p.col[1], p.type], (PW + i) * 4); pd.set([p.col[2], p.r, 0, 0], (2 * PW + i) * 4); });
+const pTex = gl.createTexture();
+gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, pTex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, PW, 3, 0, gl.RGBA, gl.FLOAT, pd);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.activeTexture(gl.TEXTURE0);
+
+/* ---------------- camera ---------------- */
+const INSIDE = 0.17 * 2.05 / 0.93;   // distance at which the field stop fills 93% of the frame height
+const CAM = Track([
+  { t: 0.0, v: [0.0, 0.54, INSIDE * 1.03, 0.0, 0.54, -2.0, 2.05] },
+  { t: 3.9, v: [0.0, 0.54, INSIDE * 0.99, 0.0, 0.54, -2.0, 2.05], stop: true },
+  { t: 4.7, v: [0.4, 0.75, 1.85, 0.0, 0.54, -1.4, 2.05] },
+  { t: 5.7, v: [2.3, 1.45, 2.7, -0.15, 0.5, -3.0, 2.1] },
+  { t: 6.7, v: [0.85, 0.9, 1.65, 0.0, 0.54, -1.8, 2.1] },
+  { t: 7.6, v: [0.0, 0.54, INSIDE * 1.0, 0.0, 0.54, -2.0, 2.05], stop: true },
+  { t: 10.0, v: [0.0, 0.54, INSIDE * 0.99, 0.0, 0.54, -2.0, 2.05] },
+]);
+
+Reel.scene({
+  duration: 10, fps: 30,
+  cues: [
+    { t: 0.5, sfx: 'tumble', gain: 0.7 }, { t: 1.0, sfx: 'tumble', gain: 0.7 }, { t: 1.5, sfx: 'tumble', gain: 0.7 }, { t: 2.0, sfx: 'tumble', gain: 0.75 },
+    { t: 2.5, sfx: 'tumble', gain: 0.75 }, { t: 3.0, sfx: 'tumble', gain: 0.75 }, { t: 3.5, sfx: 'tumble', gain: 0.8 },
+    { t: 4.0, sfx: 'reveal_pull', gain: 0.85 }, { t: 7.6, sfx: 'dive_in', gain: 0.6 }, { t: 8.0, sfx: 'tumble_last', gain: 0.9 },
+  ],
+  render(t) {
+    const c = CAM(t);
+    gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, pTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, PW, 1, gl.RGBA, gl.FLOAT, piecesAt(t));
+    gl.activeTexture(gl.TEXTURE0);
+    rm.set('uPc', { __ints: 1, v: 5 }).set('uNP', { __ints: 1, v: NP })
+      .set('uRo', c.slice(0, 3)).set('uTa', c.slice(3, 6)).set('uFL', c[6]).set('uT', t).set('uCell', cellAngle(t));
+    const focus = Math.hypot(c[0], c[1] - 0.54, c[2] + 0.06);
+    rm.render(t, { focus, aperture: 6, maxCoc: 9 });
+  },
+});
+</script></body></html>

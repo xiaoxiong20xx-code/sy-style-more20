@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>43 吹制玻璃 · Glassblowing</title>
+<script src="../../lib/core.js"></script><script src="../../lib/track.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 43 吹制玻璃 · GLASSBLOWING =====
+   Real world: a hot shop. The blowpipe lies across the two steel arms of the gaffer's bench and is rolled back and
+   forth along them, the glass riding at its end over a polished steel marver; the glory hole roars orange behind, a
+   window gives a little cool light, the floor and the furnace face are lit by the fire.
+   0–1.0 a wet cherry-wood block cups the glowing gather (steam); 1.0 / 1.5 / 2.0 three breaths blow it into a bubble;
+   2.5 the jacks pinch a neck; 3.0–3.7 the jacks go into the end and flare it open — a trumpet vase. On 4.0 the reheat
+   stops: the thin lip clears first, then the neck, then the belly, until the whole vase is clear and full of fire.
+   The camera circles; on 8.0 the pipe stops rolling and a glint runs once round the lip.
+   Lathe SDF built from 2D pieces in (radius, axis) — a belly shell, a cut where it opens, a stroked Bézier for the
+   neck and lip — whose control points morph (no shell blending). Refraction through up to seven interfaces;
+   while hot the glass is opaque and glowing, emission integrated inside, hotter where thicker; Beer absorption; a
+   steel marver that mirrors it; steam as a short volume march. */
+const { E, clamp, inv, lerp } = Reel;
+const stage = Reel.makeStage('#0a0604');
+Reel.ownJitter = true;
+const C = Reel.cfg({});
+
+const rm = Reel.RM(stage, {
+  bloom: 0.5, th: 1.1, expo: 1.0, vig: 0.42, grain: 0.03, ca: 0.5, contrast: 1.04, sat: 1.0, bands: 6,
+  lift: [0.006, 0.004, 0.003],
+  uniforms: `
+uniform vec3 uRo, uTa; uniform float uF, uT;
+uniform float uZp, uRoll;
+uniform vec4 uBel;     // belly: centre s, radius along, radius radial, wall
+uniform vec4 uCut;     // opening: on, hole radius, from s, -
+uniform vec4 uLipA;    // neck/lip Bezier: P0 (rho,s), P1 (rho,s)
+uniform vec4 uLipB;    // P2 (rho,s), half thickness, on
+uniform vec4 uHeat;    // base temperature, sag, glint angle, glint gain
+uniform vec4 uBlk;     // block: x, y, on, steam
+uniform vec3 uJT, uJD, uJA; uniform float uJO, uJOn;   // jacks: tip, direction to handle, opening axis, opening, on`,
+  scene: `
+float sdEl2(vec2 p, vec2 r){ float k0 = length(p / r), k1 = length(p / (r * r)); return k0 * (k0 - 1.) / max(k1, 1e-5); }
+float sdRBox2(vec2 p, vec2 b, float r){ vec2 q = abs(p) - b + r; return length(max(q, 0.)) + min(max(q.x, q.y), 0.) - r; }
+float dot2(vec2 v){ return dot(v, v); }
+vec2 bez(vec2 pos, vec2 A, vec2 B, vec2 C){
+  vec2 a = B - A, b = A - 2. * B + C, c = a * 2., d = A - pos;
+  float kk = 1. / max(dot(b, b), 1e-8), kx = kk * dot(a, b), ky = kk * (2. * dot(a, a) + dot(d, b)) / 3., kz = kk * dot(d, a);
+  float p = ky - kx * kx, p3 = p * p * p, q = kx * (2. * kx * kx - 3. * ky) + kz, h = q * q + 4. * p3;
+  float res, tt;
+  if (h >= 0.) { h = sqrt(h); vec2 x = (vec2(h, -h) - q) / 2.; vec2 uv2 = sign(x) * pow(abs(x), vec2(1. / 3.));
+    tt = clamp(uv2.x + uv2.y - kx, 0., 1.); res = dot2(d + (c + b * tt) * tt); }
+  else { float z = sqrt(-p), v = acos(q / (p * z * 2.)) / 3., m = cos(v), n = sin(v) * 1.732050808;
+    vec3 t3 = clamp(vec3(m + m, -n - m, n - m) * z - kx, 0., 1.);
+    float r1 = dot2(d + (c + b * t3.x) * t3.x), r2 = dot2(d + (c + b * t3.y) * t3.y);
+    if (r1 < r2) { res = r1; tt = t3.x; } else { res = r2; tt = t3.y; } }
+  return vec2(sqrt(res), tt);
+}
+// the glass in (rho, s): s along the pipe axis from the pipe end
+float prof(vec2 q){
+  float d = sdRBox2(q - vec2(0., .01), vec2(.095, .07), .045);           // the collar on the pipe end
+  vec2 bq = vec2(q.x, q.y - uBel.x);
+  float dO = sdEl2(bq, vec2(uBel.z, uBel.y));
+  float w = uBel.w;
+  float dI = w < min(uBel.y, uBel.z) * .9 ? sdEl2(bq, vec2(uBel.z - w, uBel.y - w * 1.1)) : 1e3;
+  float dB = max(dO, -dI);
+  if (uCut.x > .5) dB = max(dB, -max(q.x - uCut.y, uCut.z - q.y));
+  d = smin(d, dB, .07);
+  if (uLipB.w > .5) {
+    vec2 b = bez(q, uLipA.xy, uLipA.zw, uLipB.xy);
+    d = smin(d, b.x - uLipB.z * (1. - .25 * b.y), .04);
+  }
+  return d;
+}
+vec3 toG(vec3 p){ return p - vec3(0., 0., uZp); }
+float glassSD(vec3 p){
+  vec3 q = toG(p);
+  q.y += uHeat.y * max(q.x, 0.) * max(q.x, 0.);           // the soft glass droops a little
+  return prof(vec2(length(q.yz), q.x));
+}
+float sdBoxs(vec3 p, vec3 b){ vec3 q = abs(p) - b; return length(max(q, 0.)) + min(max(q.x, max(q.y, q.z)), 0.); }
+float pipeSD(vec3 p){
+  vec3 q = toG(p);
+  float h = clamp(q.x, -6., -.01);
+  float r = .058 + .012 * smoothstep(-.12, -.01, q.x);
+  return length(vec2(length(q.yz), q.x - h)) - r;
+}
+float railSD(vec3 p){
+  float d = sdRoundBox(p - vec3(-.78, -.088, 0.), vec3(.03, .028, 2.), .006);
+  return min(d, sdRoundBox(p - vec3(-1.75, -.088, 0.), vec3(.03, .028, 2.), .006));
+}
+float marverSD(vec3 p){ return sdRoundBox(p - vec3(1.0, -.69, 0.), vec3(1.25, .05, 1.0), .01); }
+float blockSD(vec3 p){
+  if (uBlk.z < .5) return 1e3;
+  vec3 c = vec3(uBlk.x, uBlk.y, uZp);
+  float d = sdRoundBox(p - c, vec3(.3, .14, .22), .05);
+  d = max(d, -(length(p - (c + vec3(0., .33, 0.))) - .31));          // the cupped hollow
+  d = min(d, sdCapsule(p, c + vec3(.05, -.02, .2), c + vec3(.2, -.25, 1.6), .035));   // handle
+  return d;
+}
+float jackSD(vec3 p){
+  if (uJOn < .5) return 1e3;
+  float d = 1e3;
+  vec3 D = normalize(uJD), A = normalize(uJA);
+  vec3 S = normalize(cross(D, A));
+  for (int k = -1; k <= 1; k += 2){
+    vec3 tip = uJT + A * uJO * float(k);
+    vec3 dir = normalize(D + A * float(k) * .1);
+    vec3 q = p - tip; float along = clamp(dot(q, dir), 0., 1.3);
+    vec3 c = q - dir * along;
+    float hw = mix(.012, .03, along / 1.3);
+    vec3 l = vec3(dot(c, S), dot(c, A), 0.);
+    float db = length(max(vec2(abs(l.x) - hw, abs(l.y) - .006), 0.)) + min(max(abs(l.x) - hw, abs(l.y) - .006), 0.);
+    d = min(d, max(db, -dot(q, dir)) - .002);
+  }
+  return d;
+}
+float opaqueSD(vec3 p, out int m){
+  float d = pipeSD(p); m = 1;
+  float r = railSD(p); if (r < d) { d = r; m = 2; }
+  float b = blockSD(p); if (b < d) { d = b; m = 3; }
+  float j = jackSD(p); if (j < d) { d = j; m = 4; }
+  float mv = marverSD(p); if (mv < d) { d = mv; m = 5; }
+  return d;
+}
+float opSD(vec3 p){ int m; return opaqueSD(p, m); }
+vec3 gN(vec3 p){ vec2 e = vec2(.0006, 0.); return normalize(vec3(glassSD(p + e.xyy) - glassSD(p - e.xyy), glassSD(p + e.yxy) - glassSD(p - e.yxy), glassSD(p + e.yyx) - glassSD(p - e.yyx))); }
+vec3 oN(vec3 p){ vec2 e = vec2(.0006, 0.); return normalize(vec3(opSD(p + e.xyy) - opSD(p - e.xyy), opSD(p + e.yxy) - opSD(p - e.yxy), opSD(p + e.yyx) - opSD(p - e.yyx))); }
+// ---- the hot shop ----
+const vec3 GH = vec3(.3, -.22, -4.5); const float GR = .8;
+const vec3 LIGHT_COL = vec3(1.);   // glory-hole fire colour (the fire itself, its glow on the furnace face, floor and on everything lit); vec3(1.) = original
+vec3 fire(vec2 q){
+  float r = length(q) / GR;
+  vec2 fq = q / GR;
+  float tongues = fbm2(vec2(fq.x * 3.5 + sin(fq.y * 2. + uT * 1.7) * .4, fq.y * 1.6 - uT * 2.6));
+  tongues = smoothstep(.35, .8, tongues + .25 * fbm2(fq * 7. + vec2(0., -uT * 4.)));
+  vec3 chamber = mix(vec3(2.6, .9, .2), vec3(6., 3.4, 1.2), tongues);
+  vec3 wall = mix(vec3(1.5, .4, .07), vec3(.5, .12, .02), smoothstep(.75, 1., r));
+  return LIGHT_COL * mix(chamber, wall, smoothstep(.62, .95, r)) * (1. + .04 * sin(uT * 31.));
+}
+const vec3 WIN = normalize(vec3(-.55, .62, .55));
+vec3 shop(vec3 ro, vec3 rd){
+  vec3 c = vec3(.02, .014, .01);
+  float tf = rd.y < 0. ? (-1.45 - ro.y) / rd.y : 1e9;           // floor
+  float tw = rd.z < 0. ? (-4.5 - ro.z) / rd.z : 1e9;            // furnace face / back wall
+  if (tw < tf) {
+    vec3 P = ro + rd * tw; vec2 q = P.xy - GH.xy; float r = length(q);
+    if (r < GR) return fire(q);
+    float lip = smoothstep(GR + .16, GR, r);
+    float drum = smoothstep(2.4, 2.3, length((P.xy - GH.xy) * vec2(.8, 1.)));
+    vec3 face = mix(vec3(.09, .065, .05), vec3(.05, .035, .028), drum) * (.6 + .7 * fbm2(P.xy * 2.5));
+    // brick wall beyond the furnace
+    vec2 bk = P.xy * vec2(3., 6.); bk.x += .5 * step(1., mod(floor(bk.y), 2.));
+    float mortar = smoothstep(.04, .0, min(abs(fract(bk.x) - .5) - .45, abs(fract(bk.y) - .5) - .42) + .05);
+    vec3 brick = vec3(.06, .028, .017) * (.7 + .5 * hash12(floor(bk))) * (1. - .5 * mortar);
+    float rimD = smoothstep(.06, .0, abs(length((P.xy - GH.xy) * vec2(.8, 1.)) - 2.35));
+    c = mix(brick * 1.7, face * .6, drum) * (.45 + LIGHT_COL * 2.2 * exp(-(r - GR) * 1.3)) + vec3(.05, .025, .012) * rimD;
+    c += LIGHT_COL * vec3(1.3, .38, .07) * lip * lip;
+    c *= smoothstep(-1.45, -1.1, P.y);
+  } else if (tf < 1e8) {
+    vec3 P = ro + rd * tf;
+    vec3 conc = vec3(.12, .1, .085) * (.7 + .4 * fbm2(P.xz * 2.) + .2 * vnoise2(P.xz * 30.));
+    float fl = exp(-length(P.xz - vec2(.3, -3.6)) * .55);
+    c = conc * (.25 + LIGHT_COL * vec3(1.6, .6, .2) * fl * 2.5 + vec3(.3, .35, .45) * .5);
+  } else {
+    // up and behind the camera: the window, rafters in the dark
+    float z = dot(rd, WIN);
+    if (z > 0.) { vec3 r1 = normalize(cross(vec3(0., 1., 0.), WIN)), u1 = cross(WIN, r1); vec2 q = vec2(dot(rd, r1), dot(rd, u1)) / z;
+      c += vec3(.55, .65, .85) * 1.6 * step(abs(q.x), .25) * step(abs(q.y), .4) * (1. - .8 * step(abs(q.x), .01)) * (1. - .8 * step(abs(q.y), .01)); }
+    c += vec3(.03, .02, .012) * (.5 + .5 * rd.y);
+  }
+  // the closing glint
+  vec3 gd = normalize(vec3(cos(uHeat.z) * .3, .55 + .3 * sin(uHeat.z), .7 + .3 * sin(uHeat.z)));
+  c += vec3(1., .95, .9) * 260. * uHeat.w * smoothstep(.9993, .99995, dot(rd, gd));
+  return c;
+}
+float tempAt(float depth, vec3 ql){ return clamp(uHeat.x + .3 * (depth / .1 - .3) + .35 * (.55 - ql.x), 0., 1.2); }   // thin and far from the pipe: cooler
+vec3 emis(float depth, vec3 ql){
+  float T = tempAt(depth, ql);
+  vec3 c = mix(vec3(.55, .04, .003), vec3(1., .34, .045), smoothstep(.15, .8, T));
+  c = mix(c, vec3(1., .6, .2), smoothstep(.95, 1.25, T) * .5);
+  // the surface flows as it turns
+  float a = atan(ql.z, ql.y) + uRoll;
+  float fl = fbm(vec3(ql.x * 7., cos(a) * 1.6, sin(a) * 1.6) + vec3(-uT * .4, 0., 0.));
+  return c * T * T * 21. * (.65 + .7 * fl);
+}
+vec3 lightAt(vec3 P, vec3 n){
+  vec3 Lg = vec3(.6, 0., uZp) - P; float dg = length(Lg);
+  vec3 c = vec3(1., .42, .1) * clamp(uHeat.x, 0., 1.) * 1.6 * max(dot(n, Lg / dg), 0.) / (1. + dg * dg * 3.);
+  vec3 Lf = normalize(GH - P);
+  c += LIGHT_COL * vec3(1., .45, .12) * .55 * max(dot(n, Lf), 0.);
+  c += vec3(.55, .65, .85) * .35 * max(dot(n, WIN), 0.);
+  c += vec3(.05, .035, .025);
+  return c;
+}
+vec3 shadeOpaque(vec3 p, vec3 rd, int m){
+  vec3 n = oN(p), V = -rd, R = reflect(rd, n);
+  vec3 L = lightAt(p, n);
+  if (m == 1) {        // blowpipe: steel, scaled and blued near the hot end
+    vec3 q = toG(p);
+    vec3 alb = mix(vec3(.07, .065, .06), vec3(.16, .1, .06), smoothstep(-.5, 0., q.x)) * (.7 + .5 * vnoise2(vec2(q.x * 25., (atan(q.z, q.y) + uRoll) * 3.)));
+    return alb * L + shop(p, R) * schlick(max(dot(n, V), 0.), .5) * .45 + vec3(1., .3, .05) * 1.2 * smoothstep(-.06, 0., q.x) * clamp(uHeat.x, 0., 1.);
+  }
+  if (m == 2) {        // bench arms: worn steel, polished on top where the pipe rolls
+    float top = smoothstep(.6, .95, n.y);
+    vec3 alb = vec3(.12, .11, .1) * (.7 + .4 * vnoise2(p.xz * vec2(40., 4.)));
+    return alb * L + shop(p, R) * mix(.15, .55, top);
+  }
+  if (m == 3) {        // wet, charred cherry-wood block
+    vec3 alb = vec3(.09, .05, .03) * (.6 + .6 * vnoise2(p.xy * vec2(30., 6.)));
+    float char = smoothstep(.36, .3, length(p - vec3(uBlk.x, uBlk.y + .33, uZp)));
+    alb = mix(alb, vec3(.02, .015, .012), char);
+    return alb * L + shop(p, R) * .08 + vec3(1., .3, .05) * .6 * char * clamp(uHeat.x, 0., 1.) * smoothstep(.31, .3, length(p - vec3(uBlk.x, uBlk.y + .33, uZp)));
+  }
+  if (m == 4) {        // jacks: bright steel blades
+    vec3 alb = vec3(.25, .25, .26);
+    return alb * L * .5 + shop(p, R) * .75;
+  }
+  return vec3(0.);
+}
+vec3 steam(vec3 ro, vec3 rd, float tmax){
+  if (uBlk.w < .01) return vec3(0.);
+  vec3 acc = vec3(0.); float tr = 1.;
+  vec3 c0 = vec3(uBlk.x, -.1, uZp);
+  for (int i = 0; i < 28; i++){
+    float t = .3 + float(i) * .09; if (t > tmax) break;
+    vec3 p = ro + rd * t; vec3 q = p - c0;
+    if (abs(q.x) > .55 || q.y < -.25 || q.y > 1.1 || abs(q.z) > .55) continue;
+    float plume = exp(-dot(q.xz, q.xz) * 8. / (1. + q.y * 2.)) * smoothstep(-.25, .0, q.y);
+    float den = plume * smoothstep(.42, .75, fbm(p * 5. + vec3(0., -uT * 1.4, uT * .3))) * uBlk.w;
+    vec3 lc = vec3(1., .45, .12) * clamp(uHeat.x, 0., 1.) * 1.2 * exp(-length(q - vec3(0., .15, 0.)) * 2.) + vec3(.35, .38, .45) * .25;
+    acc += tr * lc * den * .09 * 1.5; tr *= 1. - den * .09;
+  }
+  return acc;
+}
+vec3 render(vec2 fc){
+  vec2 uv = (fc - .5 * uRes) / uRes.y * 2.;
+  uv += .0015 * clamp(uHeat.x, 0., 1.) * vec2(vnoise2(fc * .01 + vec2(0., uT * 5.)) - .5, vnoise2(fc * .01 + vec2(3., uT * 6.)) - .5);
+  mat3 cm = camMat(uRo, uTa, 0.);
+  vec3 rd = normalize(cm * vec3(uv, uF)), p = uRo, rd0 = rd;
+  vec3 acc = vec3(0.), thr = vec3(1.);
+  bool inG = false; float firstD = -1.;
+  float hot = clamp(uHeat.x, 0., 1.2);
+  vec3 ABS = mix(vec3(.2, .06, .1), vec3(6.), smoothstep(.1, .8, hot));   // hot glass: opaque with its own glow
+  for (int b = 0; b < 8; b++){
+    float tt = 0.; bool hit = false; int what = 0, om = 0;
+    for (int i = 0; i < 220; i++){
+      vec3 q = p + rd * tt;
+      float dg = glassSD(q);
+      if (inG) {
+        float dd = -dg;
+        if (dd < .0005) { hit = true; what = 1; break; }
+        float st = clamp(dd * .7, .0025, .04);
+        vec3 ql = toG(q);
+        acc += thr * emis(dd, ql) * st;
+        float Tl = tempAt(dd, ql);
+        thr *= exp(-mix(vec3(.2, .06, .1), vec3(15.), smoothstep(.1, .8, Tl)) * st);
+        tt += st;
+      } else {
+        int m; float dO = opaqueSD(q, m); float d = min(dg, dO);
+        if (d < .0005) { hit = true; what = dg < dO ? 1 : 2; om = m; break; }
+        tt += d * .9; if (tt > 30.) break;
+      }
+    }
+    if (firstD < 0.) firstD = hit ? tt : 30.;
+    if (!hit) { acc += thr * shop(p, rd); break; }
+    p += rd * tt;
+    if (what == 2) {
+      if (om == 5) {        // the marver: polished steel, mirrors the glass
+        vec3 n = normalize(oN(p) + vec3(vnoise2(p.xz * 60.) - .5, 0., vnoise2(p.xz * 60. + 3.) - .5) * .015);
+        float F = .55 + .45 * pow(1. - max(dot(n, -rd), 0.), 5.);
+        acc += thr * vec3(.05, .045, .04) * lightAt(p, n);
+        thr *= F * vec3(.85, .86, .88); rd = reflect(rd, n); p += n * .002; continue;
+      }
+      acc += thr * shadeOpaque(p, rd, om); break;
+    }
+    vec3 n = gN(p);
+    vec3 nn = inG ? -n : n;
+    float cosi = clamp(-dot(rd, nn), 0., 1.);
+    float F = schlick(cosi, .04);
+    vec3 rr = reflect(rd, nn);
+    vec3 tr = refract(rd, nn, inG ? 1.5 : 1. / 1.5);
+    if (dot(tr, tr) < .01) { rd = rr; p += nn * .002; continue; }
+    if (!inG) acc += thr * F * shop(p, rr);
+    else acc += thr * F * .35 * shop(p, rr);
+    thr *= 1. - F;
+    rd = tr; inG = !inG; p -= nn * .0025;
+  }
+  acc += steam(uRo, rd0, firstD);
+  gDepth = firstD;
+  return acc;
+}`,
+});
+
+/* ---------------- the glass through time ---------------- */
+const sm = (u) => u * u * (3 - 2 * u);
+const puff = (t, t0, d = 0.24) => { const u = clamp((t - t0) / d); return 1 - Math.pow(1 - u, 3); };
+const L2 = (a, b, u) => a.map((v, i) => lerp(v, b[i], u));
+function glass(t) {
+  const I = (puff(t, 1.0) + puff(t, 1.5) + puff(t, 2.0)) / 3;          // three breaths
+  const g = {};
+  g.bel = [lerp(0.33, 0.47, I), lerp(0.33, 0.47, I), lerp(0.27, 0.42, I), lerp(0.31, 0.055, Math.pow(sm(clamp(I / 0.35)), 0.8) * 0.55 + 0.45 * Math.pow(I, 0.7))];   // the cavity opens from a point
+  // jacks pinch a neck (2.35-2.75): the far end becomes a little closed nose; then it is opened and flared (3.0-3.7)
+  const pinch = sm(inv(2.35, 2.75, t)), open = sm(inv(3.0, 3.7, t));
+  g.cut = [pinch > 0.01 ? 1 : 0, lerp(0.04, 0.115, pinch), 0.82, 0];
+  const noseA = [0.12, 0.84, 0.12, 0.97], noseB = [0.0, 1.02];
+  const lipA = [0.12, 0.84, 0.092, 1.1], lipB = [0.25, 1.24];
+  const A0 = [0.06, 0.9, 0.04, 0.93], B0 = [0.0, 0.94];
+  const A = open > 0 ? L2(noseA, lipA, open) : L2(A0, noseA, pinch), B = open > 0 ? L2(noseB, lipB, open) : L2(B0, noseB, pinch);
+  g.lipA = A; g.lipB = [B[0], B[1], lerp(0.03, 0.013, open), pinch > 0.01 ? 1 : 0];
+  // heat: kept by reheats until 3.95, then it cools in front of the fire (thin first)
+  g.T = t < 3.95 ? 1.05 : lerp(1.05, -0.9, E.inOutSine(inv(3.95, 5.3, t)));
+  g.sag = t < 3.95 ? 0.035 * (1 - 0.5 * I) : lerp(0.02, 0, inv(3.95, 4.4, t));
+  return g;
+}
+// the gaffer rolls the pipe back and forth along the arms: it travels a little in z and turns
+const RP = 0.058;
+function rollZ(t) {
+  const amp = t < 4.2 ? 0.11 : lerp(0.11, 0.05, inv(4.2, 7.0, t));
+  const ph = t * Math.PI * 1.0;                        // one stroke per beat pair
+  const fade = t < 7.2 ? 1 : 1 - E.inOutSine(inv(7.2, 8.0, t));
+  return amp * Math.sin(ph) * fade + (t >= 8.0 ? 0 : 0);
+}
+const JK = Track([
+  { t: 1.95, v: [2.1, 0.12, 1.25, 0, 0.0, 1, 0.12] },
+  { t: 2.45, v: [0.86, 0.0, 0.15, 0, 0.0, 1, 0.13] },
+  { t: 2.75, v: [0.86, 0.0, -0.12, 0, 0.0, 1, 0.085] },
+  { t: 2.95, v: [1.3, 0.05, 0.25, 1, 0.1, 0.4, 0.03] },
+  { t: 3.2, v: [1.0, 0.0, 0.0, 1, 0.08, 0.2, 0.04] },
+  { t: 3.65, v: [1.05, 0.0, 0.0, 1, 0.12, 0.25, 0.2] },
+  { t: 3.95, v: [3.2, 0.15, 0.6, 1, 0.3, 0.6, 0.25] },
+]);
+const CAM = Track([
+  { t: 0.0, v: [0.62, 0.42, 2.05, 0.32, -0.08, 0.0, 2.45] },
+  { t: 1.5, v: [0.72, 0.38, 2.15, 0.42, -0.04, 0.0, 2.45] },
+  { t: 2.6, v: [0.9, 0.32, 2.3, 0.6, -0.02, 0.0, 2.45] },
+  { t: 3.6, v: [1.55, 0.4, 2.0, 0.75, 0.0, 0.0, 2.5] },
+  { t: 4.6, v: [1.0, 0.22, 2.35, 0.62, 0.0, 0.0, 2.55] },
+  { t: 6.6, v: [1.8, 0.45, 1.6, 0.66, 0.0, 0.0, 2.55] },
+  { t: 8.0, v: [1.22, 0.34, 2.25, 0.64, 0.0, 0.0, 2.55], stop: true },
+  { t: 10.0, v: [1.219, 0.34, 2.248, 0.64, 0.0, 0.0, 2.552] },
+]);
+
+Reel.scene({
+  duration: 10, fps: 30,
+  cues: [
+    { t: 0.0, sfx: 'furnace_roar', gain: 0.6 }, { t: 0.2, sfx: 'block_steam', gain: 0.6 },
+    { t: 1.0, sfx: 'blow_puff', gain: 0.7 }, { t: 1.5, sfx: 'blow_puff', gain: 0.7 }, { t: 2.0, sfx: 'blow_puff', gain: 0.75 },
+    { t: 2.5, sfx: 'jacks_ring', gain: 0.6 }, { t: 3.0, sfx: 'jacks_ring', gain: 0.5 }, { t: 3.5, sfx: 'flare_whoosh', gain: 0.55 },
+    { t: 4.0, sfx: 'cool_hiss', gain: 0.8 }, { t: 4.5, sfx: 'glass_ting', gain: 0.7 },
+    { t: 8.0, sfx: 'glint_ring', gain: 0.85 },
+  ],
+  render(t) {
+    const g = glass(t);
+    const zp = rollZ(t), roll = -zp / RP + (t < 8 ? 0 : 0);
+    const cv = CAM(t), ro = [cv[0], cv[1], cv[2]], ta = [cv[3], cv[4], cv[5] + zp * 0.6];
+    // the wet block cups the gather until 0.85, then drops away
+    const bk = inv(0.85, 1.6, t);
+    const blk = [0.33 - 2.9 * E.inOutSine(bk), -0.36 - 0.1 * E.inOutSine(bk), t < 1.6 ? 1 : 0, clamp(1 - inv(0.9, 1.7, t))];   // the gaffer draws the block away toward himself
+    const j = JK(t), jOn = t > 1.95 && t < 3.95 ? 1 : 0;
+    const gl8 = inv(7.85, 8.55, t);
+    rm.set('uRo', ro).set('uTa', ta).set('uF', cv[6]).set('uT', t)
+      .set('uZp', zp).set('uRoll', roll)
+      .set('uBel', g.bel).set('uCut', g.cut).set('uLipA', g.lipA).set('uLipB', g.lipB)
+      .set('uHeat', [g.T, g.sag, lerp(0, Math.PI * 2, E.inOutSine(gl8)), Math.sin(Math.PI * gl8) * (gl8 > 0 && gl8 < 1 ? 1 : 0)])
+      .set('uBlk', blk)
+      .set('uJT', [j[0], j[1], j[2] + zp]).set('uJD', j[3] > 0.5 ? [1, j[4], j[5]] : [0.15, 0.25, 1]).set('uJA', j[3] > 0.5 ? [0, 0, 1] : [0, 1, 0]).set('uJO', j[6]).set('uJOn', jOn);
+    const focus = Math.hypot(ro[0] - ta[0], ro[1] - ta[1], ro[2] - ta[2]);
+    rm.render(t, { focus, aperture: 14, maxCoc: 16 });
+  },
+});
+</script></body></html>

@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>56 肥皂泡 · Soap Film</title>
+<script src="../../lib/core.js"></script><script src="../../lib/track.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 56 肥皂泡 · Soap Film =====
+   Real world: a sunny garden on a late afternoon, the sun low behind the bubbles. A bubble is a few hundred nanometres of water: almost perfectly transparent, so you see
+   the black backdrop straight through it. All you see of it is what it reflects: the studio's softboxes, bent by the
+   sphere into curved windows (the outer surface shows them upright, the inner back surface shows them small and
+   inverted), and the edge, where reflection climbs toward 100% at grazing angles (Fresnel) and the lights placed behind
+   and above catch a bright, coloured rim. Inside those reflections the colour is thin-film interference, computed with
+   the Airy formula over 24 wavelengths and the CIE observer, from a film that drains (black at the top) and swirls.
+   0–1.3 s: a flat film in a steel wand ring, aimed so it mirrors the key softbox over its whole disc: a full circle of
+   flowing bands. 1.5: a breath bulges it, the camera swings to the side to see the dome grow; it pinches off on 2.5.
+   3.0: a second bubble drifts in. Hook 4.0: they touch and snap into a double bubble; the shared wall between them is
+   a flat film, born thick and thinning into bands. 8.0: the second bubble bursts: a hole opens and the film runs back
+   from it behind a hair-thin bright rim, flinging a fine mist that is gone in a few frames; the first stays, centred. */
+const { E, clamp, inv, lerp } = Reel;
+const stage = Reel.makeStage('#000000');
+Reel.ownJitter = true;
+const C = Reel.cfg({});
+
+const rm = Reel.RM(stage, {
+  bloom: 0.22, th: 1.2, expo: 1.0, vig: 0.3, grain: 0.022, ca: 0.6, contrast: 1.03, sat: 1.04, bands: 4,
+  uniforms: `
+uniform vec3 uRo, uTa; uniform float uFL, uT;
+uniform vec3 uRC, uRN; uniform float uRA, uHC, uWob, uRingOn;
+uniform vec4 uA, uB;            // bubbles: centre xyz, radius
+uniform vec4 uAB;               // x: A on, y: B on, z: double bubble, w: wall age
+uniform vec4 uBurst;            // x: hole angle on B, y: mist age
+uniform vec3 uHole;
+uniform vec4 uRot;`,
+  scene: `
+#define uRotA (rotX(uRot.x) * rotY(uRot.y))
+#define uRotB (rotX(uRot.z) * rotY(uRot.w))
+const vec3 KEY = normalize(vec3(-.38,.34,1.));
+
+/* ---------- a sunny garden, late afternoon: blue sky and clouds, a backlit tree line with sun sparkling through the
+   leaves, a low band of flowering shrubs, a lawn. 'soft' > 0 is the out-of-focus version used for the background. ---------- */
+const vec3 SUN = normalize(vec3(.3,.7,-1.));
+vec2 h22(vec2 p){ return vec2(hash12(p), hash12(p + 19.7)); }
+vec3 garden(vec3 r, float soft){
+  float el = r.y, az = atan(r.x, -r.z);
+  float sd = max(dot(r, SUN), 0.);
+  vec3 sky = mix(vec3(.45,.62,.92), vec3(.3,.5,.9), smoothstep(-.02, .5, el)) * mix(1.15, 1.6, smoothstep(.1, .8, el));
+  sky += vec3(1.,.8,.5) * (1.4 * pow(sd, 5.) + 2.6 * pow(sd, 30.));                         // the glow around a low sun
+  vec2 cp = r.xz / max(el + .3, .06);
+  float cl = fbm(vec3(cp * .8, 7.));
+  sky = mix(sky, vec3(1.,.96,.9) * (1.6 + 2. * pow(sd, 4.)), smoothstep(.45, .7, cl) * smoothstep(.06, .28, el) * .9);
+  sky += vec3(1.,.92,.75) * 60. * smoothstep(.9993, .9997, sd) * (1. - soft);
+  // a big sunlit cumulus behind the camera (what the wand film and the bubbles' faces mirror)
+  float kc = dot(r, KEY);
+  sky = mix(sky, vec3(1.,.97,.92) * (1.5 + .6 * fbm(r * 5. + 2.)), smoothstep(.74, .95, kc + .16 * (fbm(r * 3. + 9.) - .5)) * smoothstep(-.05, .1, el));
+  vec3 c = sky;
+  // the tree line: canopies by azimuth, leaf-ragged unless out of focus, rim-lit where the sun is behind them
+  float can = .13 + .2 * fbm2(vec2(az * 1.3, 3.)) + .07 * abs(sin(az * 6. + 3. * fbm2(vec2(az * 2., 8.))));   // rounded crowns
+  float lf = fbm2(vec2(az * 55., el * 55.));
+  float edge = .006 + .05 * soft;
+  float tr = smoothstep(can + edge, can - edge, el + (lf - .5) * .04 * (1. - soft));
+  vec3 tree = mix(vec3(.02,.04,.014), vec3(.07,.12,.03), smoothstep(.3, .75, mix(lf, fbm2(vec2(az * 5., el * 5.)), soft)));
+  tree *= .8 + .4 * smoothstep(can - .25, can, el);                                        // the crowns' tops are lit, their feet in shade
+  tree += vec3(.95,.78,.35) * smoothstep(can - .07, can, el) * pow(sd, 2.5) * .9;
+  c = mix(c, tree, tr * step(-.08, el));
+  // the sun through the leaves: round out-of-focus sparkles
+  vec2 gq = vec2(az * 16., el * 16.); vec2 gi = floor(gq), gf = fract(gq) - .5;
+  float hh = hash12(gi);
+  if (hh > .9 && el > can - .2) {
+    vec2 o = (h22(gi) - .5) * .5; float rr = .14 + .22 * hash12(gi + 3.);
+    float disc = smoothstep(rr, rr - .02 - .06 * soft, length(gf - o)) * (.8 + .2 * smoothstep(rr * .5, rr, length(gf - o)));
+    c += vec3(1.,.82,.5) * disc * (.2 + .5 * hash12(gi + 7.)) * (.4 + 1.6 * pow(sd, 1.5)) * tr;
+  }
+  // flowering shrubs along the foot of the trees
+  float bh = .035 + .03 * fbm2(vec2(az * 4., 2.));
+  float bush = smoothstep(bh + edge, bh - edge, el) * smoothstep(-.07, -.03, el);
+  float ff = mix(30., 9., soft);
+  vec3 fl = mix(vec3(.04,.075,.025), vec3(.7,.25,.38), .8 * smoothstep(.6, .8, fbm2(vec2(az * ff, el * ff))));
+  fl = mix(fl, vec3(.85,.75,.35), .7 * smoothstep(.68, .85, fbm2(vec2(az * ff, el * ff) + 9.)));
+  c = mix(c, fl * (.7 + .5 * pow(sd, 2.)), bush);
+  // the lawn
+  if (el < -.03) {
+    float gd = smoothstep(-.03, -.5, el);
+    vec3 grass = mix(vec3(.1,.17,.04), vec3(.03,.06,.014), gd) * (.75 + .5 * fbm2(vec2(az * 4., el * 14.)));
+    grass *= .7 + .5 * smoothstep(.35, .65, fbm2(vec2(az * 1.5, el * 4.) + 4.));               // sun and tree shadow on the lawn
+    grass += vec3(.4,.34,.1) * pow(sd, 1.5) * .2 * (1. - gd);
+    c = mix(grass, c, smoothstep(-.06, -.03, el));
+  }
+  return c;
+}
+vec3 env(vec3 r){ return garden(r, .65); }
+
+/* ---------- thin-film interference: Airy reflectance over 24 wavelengths -> CIE -> linear sRGB ---------- */
+float g3(float x, float m, float s1, float s2){ float s = x < m ? s1 : s2; float t = (x - m) / s; return exp(-.5 * t * t); }
+vec3 cmf(float l){
+  float X = 1.056 * g3(l, 599.8, 37.9, 31.) + .362 * g3(l, 442., 16., 26.7) - .065 * g3(l, 501.1, 20.4, 26.2);
+  float Y = .821 * g3(l, 568.8, 46.9, 40.5) + .286 * g3(l, 530.9, 16.3, 31.1);
+  float Z = 1.217 * g3(l, 437., 11.8, 36.) + .681 * g3(l, 459., 26., 13.8);
+  return vec3(3.2406 * X - 1.5372 * Y - .4986 * Z, -.9689 * X + 1.8758 * Y + .0415 * Z, .0557 * X - .204 * Y + 1.057 * Z);
+}
+vec3 film(float d, float ci){
+  const float n = 1.335;
+  ci = clamp(abs(ci), .02, 1.);
+  float ct = sqrt(1. - (1. - ci * ci) / (n * n));
+  float rs = (ci - n * ct) / (ci + n * ct), rp = (n * ci - ct) / (n * ci + ct);
+  float rs2 = rs * rs, rp2 = rp * rp;
+  vec3 acc = vec3(0.), wsum = vec3(0.);
+  for (int i = 0; i < 24; i++) {
+    float l = 395. + 320. * (float(i) + .5) / 24.;
+    float cd = cos(4. * PI * n * d * ct / l);
+    float Rs = 2. * rs2 * (1. - cd) / (1. + rs2 * rs2 - 2. * rs2 * cd);
+    float Rp = 2. * rp2 * (1. - cd) / (1. + rp2 * rp2 - 2. * rp2 * cd);
+    vec3 w = cmf(l);
+    acc += .5 * (Rs + Rp) * w; wsum += w;
+  }
+  return max(acc / wsum, 0.);
+}
+
+/* ---------- film thickness (nm): drainage bands + Marangoni eddies ---------- */
+vec3 rodr(vec3 q, vec3 k, float a){ return q * cos(a) + cross(k, q) * sin(a) + k * dot(k, q) * (1. - cos(a)); }
+float thick(vec3 q, float hgt, float T, float seed, float black){
+  for (int i = 0; i < 3; i++) {
+    vec3 c = normalize(hash33(vec3(seed, float(i), 1.3)) - .5);
+    float dd = length(q - c * length(q));
+    float om = (1.6 + 1.2 * hash11(seed + float(i))) * (mod(float(i), 2.) < .5 ? 1. : -1.);
+    q = rodr(q, c, om * .7 * (T + 2.) * exp(-dd * dd / .2));
+  }
+  vec3 w = q * 1.05 + vec3(seed, seed * 1.7, -seed);
+  w += .5 * vec3(fbm(w + vec3(0., T * .2, 0.)), fbm(w + vec3(5.2, 1.3 - T * .16, 2.)), fbm(w + vec3(2., 7., T * .18))) - .25;
+  float sw = fbm(w * 1.25);
+  float h2 = hgt * .55 + .75 * (sw - .5) + .25 * (fbm(w * 2.6 + vec3(0., T * .25, 0.)) - .5);
+  float lo = clamp(.5 - .5 * h2, 0., 1.);
+  float d = 140. + 650. * pow(lo, 1.25) + 260. * (sw - .5);
+  d *= mix(1., .05, smoothstep(black - .1, black + .1, h2));
+  return max(d, 0.);
+}
+
+/* one film crossing: what the film reflects, coloured by interference; the rest passes straight through */
+vec3 shadeFilm(vec3 n, vec3 rd, float d){
+  float ci = dot(n, -rd);
+  vec3 nn = ci < 0. ? -n : n;
+  return film(d, ci) * env(reflect(rd, nn));
+}
+vec2 sph(vec3 ro, vec3 rd, vec4 s){
+  vec3 oc = ro - s.xyz; float b = dot(oc, rd), c = dot(oc, oc) - s.w * s.w, h = b * b - c;
+  if (h < 0.) return vec2(-1.);
+  h = sqrt(h); return vec2(-b - h, -b + h);
+}
+float inS(vec3 p, vec4 s){ return length(p - s.xyz) - s.w; }
+
+vec3 render(vec2 fc){
+  vec2 uv = (2. * fc - uRes) / uRes.y;
+  vec3 w = normalize(uTa - uRo), u = normalize(cross(w, vec3(0.,1.,0.))), v = cross(u, w);
+  vec3 rd = mat3(u, v, w) * normalize(vec3(uv, uFL));
+  vec3 ro = uRo;
+  vec3 acc = vec3(0.); float near = 1e4;
+  float T = uT;
+
+  // ---- the wand: a dark steel ring with its handle, raymarched ----
+  float tRing = 1e9;
+  vec3 N = uRN, U0 = normalize(cross(N, vec3(0.,1.,0.))), V0 = cross(U0, N);
+  #define RD(P) (min(length(vec2(length(vec2(dot(P - uRC, U0), dot(P - uRC, V0))) - uRA, dot(P - uRC, N))) - .06, sdCapsule(vec3(dot(P - uRC, U0), dot(P - uRC, V0), dot(P - uRC, N)), vec3(-.3, -uRA - .02, 0.), vec3(-1.5, -uRA - 9., 0.), .075)))
+  if (uRingOn > .5) {
+    float t = .5;
+    for (int i = 0; i < 90; i++) { vec3 p = ro + rd * t; float d = RD(p); if (d < .0015) { tRing = t; break; } t += d; if (t > 40.) break; }
+    vec3 Q0 = ro - uRC;
+    if (uHC < .02) {
+      float dn = dot(rd, N);
+      if (abs(dn) > 1e-4) {
+        float t2 = -dot(Q0, N) / dn; vec3 p = ro + rd * t2; vec3 q = p - uRC;
+        vec2 l = vec2(dot(q, U0), dot(q, V0));
+        if (t2 > 0. && t2 < tRing && length(l) < uRA) {
+          float rr = length(l) / uRA;
+          vec3 nf = normalize(N - (U0 * l.x + V0 * l.y) / uRA * uWob * 2.4 * (1. - rr * rr * .5));
+          float d = thick(vec3(l / uRA, 0.) * 1.2, l.y / uRA, T, 1.3, .55 - .3 * T / 2.5) * (1. - .25 * uWob);
+          acc += shadeFilm(nf, rd, d); near = min(near, t2);
+        }
+      }
+    } else {
+      float Rc = (uRA * uRA + uHC * uHC) / (2. * uHC);
+      vec4 S = vec4(uRC + N * (uHC - Rc), Rc);
+      vec2 h = sph(ro, rd, S);
+      for (int k = 0; k < 2; k++) {
+        float t2 = k == 0 ? h.x : h.y;
+        if (t2 <= 0. || t2 > tRing) continue;
+        vec3 p = ro + rd * t2;
+        if (dot(p - uRC, N) < 0.) continue;
+        vec3 n = normalize(p - S.xyz);
+        vec2 l = vec2(dot(p - uRC, U0), dot(p - uRC, V0));
+        float d = thick(vec3(l / uRA, dot(p - uRC, N) / uRA) * 1.2, n.y, T, 1.3, .55 - .3 * T / 2.5) / (1. + .5 * uHC / uRA);
+        acc += shadeFilm(n, rd, d); near = min(near, t2);
+      }
+    }
+  }
+
+  // ---- bubbles A and B; while they are a double bubble the outer walls stop at the shared one ----
+  bool dbl = uAB.z > .5 && uAB.x > .5 && uAB.y > .5;
+  vec3 ax = normalize(uB.xyz - uA.xyz);
+  float dd = length(uB.xyz - uA.xyz);
+  float x0 = (dd * dd + uA.w * uA.w - uB.w * uB.w) / (2. * dd);
+  float rho = sqrt(max(uA.w * uA.w - x0 * x0, 0.));
+  for (int k = 0; k < 2; k++) {
+    vec4 S = k == 0 ? uA : uB, O = k == 0 ? uB : uA;
+    if ((k == 0 ? uAB.x : uAB.y) < .5) continue;
+    mat3 R = k == 0 ? uRotA : uRotB;
+    vec2 h = sph(ro, rd, S);
+    for (int j = 0; j < 2; j++) {
+      float t2 = j == 0 ? h.x : h.y;
+      if (t2 <= 0. || t2 > tRing) continue;
+      vec3 p = ro + rd * t2;
+      if (dbl && inS(p, O) < 0.) continue;
+      vec3 n = normalize(p - S.xyz);
+      float d = thick(R * n, n.y, T + float(k) * 3.1, k == 0 ? 4.7 : 9.2, .62 + .25 * smoothstep(3., 9., T));
+      if (k == 1 && uBurst.x > 0.) {
+        float ang = acos(clamp(dot(n, uHole), -1., 1.));
+        // the film runs back behind a thin rim of collected liquid. The rim travels ~0.4 rad during one frame's
+        // shutter: draw it (and the film's cut edge) as wide, soft bands so the motion-blur sub-frames melt together.
+        float w = .085;
+        float rim = smoothstep(w, 0., abs(ang - uBurst.x));
+        acc += rim * (env(reflect(rd, n)) * .3 + vec3(.45,.47,.5)) * .3;
+        float keep = smoothstep(uBurst.x - .02, uBurst.x + w, ang);
+        if (keep <= 0.) continue;
+        acc += shadeFilm(n, rd, d) * keep; near = min(near, t2);
+        continue;
+      }
+      acc += shadeFilm(n, rd, d); near = min(near, t2);
+    }
+  }
+  // the shared wall: a flat film across the circle where the two spheres meet
+  if (dbl) {
+    vec3 c0 = uA.xyz + ax * x0;
+    float dn = dot(rd, ax);
+    if (abs(dn) > 1e-4) {
+      float t2 = dot(c0 - ro, ax) / dn; vec3 p = ro + rd * t2;
+      float rr = length(p - c0) / max(rho, 1e-3);
+      if (t2 > 0. && rr < 1. && uBurst.x < .01) {
+        float age = uAB.w;
+        vec3 q = uRotA * (p - c0) / max(rho, 1e-3);
+        // born thick at its rim where the two films met, thinning in bands that run inward and drain downward
+        float dw = 1250. * exp(-age * 1.1) * (1. - .45 * rr * rr) + 220. + 260. * (fbm(q * 1.4 + vec3(0., age * .3, 1.)) - .5)
+                 + 120. * sin(rr * 7. - age * 4. + 2.5 * fbm(q * .8)) + 160. * clamp(-(p.y - c0.y) / rho, -1., 1.);
+        acc += shadeFilm(ax, rd, max(dw, 0.)); near = min(near, t2);
+      }
+    }
+  }
+  // ---- the burst's mist: very fine droplets thrown off the running rim, gone within a few frames ----
+  if (uBurst.y > 0. && uBurst.y < .35) {
+    float age = uBurst.y;
+    for (int i = 0; i < 260; i++) {
+      float fi = float(i);
+      vec3 dir = normalize(hash33(vec3(fi, 3.1, 7.7)) - .5);
+      float born = acos(clamp(dot(dir, uHole), -1., 1.)) / 24.;           // released when the rim passes
+      float a2 = age - born; if (a2 <= 0.) continue;
+      vec3 tang = normalize(dir - uHole * dot(dir, uHole));
+      vec3 c = uB.xyz + dir * uB.w + (tang * .7 + dir * .5) * (3.5 + 2.5 * hash11(fi * 1.7)) * a2;
+      float rad = .004 + .004 * hash11(fi * 3.3);
+      vec3 oc = ro - c; float b = dot(oc, rd);
+      float m = length(oc - rd * b) / (rad * 2.5);
+      if (b < 0.) acc += vec3(1.,.9,.7) * 2.4 * exp(-a2 * 12.) * smoothstep(1., 0., m) * (.4 + .6 * hash11(fi * 5.3));
+    }
+  }
+  // ---- background: the garden, out of focus ----
+  vec3 col = garden(rd, 1.);
+  float far = 60.;
+  if (tRing < 1e8) {
+    vec3 p = ro + rd * tRing;
+    vec2 e = vec2(.002, 0.);
+    vec3 n = normalize(vec3(RD(p + e.xyy) - RD(p - e.xyy), RD(p + e.yxy) - RD(p - e.yxy), RD(p + e.yyx) - RD(p - e.yyx)));
+    // glossy pink plastic, lit by the sky and back-lit by the sun (it glows a little where it is thin)
+    vec3 alb = vec3(.85,.12,.4);
+    float F = .04 + .96 * pow(1. - max(dot(n, -rd), 0.), 5.);
+    vec3 sky = vec3(.5,.6,.8) * (.55 + .45 * n.y);
+    col = alb * (sky * .6 + vec3(1.,.85,.6) * 2.2 * max(dot(n, SUN), 0.)) + alb * vec3(1.,.6,.5) * .5 * pow(max(dot(rd, SUN), 0.), 4.);
+    col += env(reflect(rd, n)) * F;
+    far = tRing;
+  }
+  gDepth = min(near, far);
+  return col + acc;
+}`,
+});
+
+/* ---------------- timeline ---------------- */
+const RING = { C: [0, 0, 0], a: 2.2 };
+const norm = (v) => { const l = Math.hypot(...v); return v.map((x) => x / l); };
+const KEYJS = norm([-0.38, 0.34, 1]);
+const CAM0 = [-1.2, 0.55, 6.4];
+// the ring is aimed so the film mirrors the key softbox straight into the lens: the whole disc lights up
+const RN = norm(norm(CAM0).map((x, i) => x + KEYJS[i]));
+function cap(t) {
+  if (t < 1.5) return { hc: 0, wob: 0.012 * Math.sin(t * 5.1) * Track.easeRange(t, 0, 0.6) };
+  if (Math.round(t * 30) < 75) { const u = Track.ease(inv(1.5, 2.5, t)); return { hc: 1.7 * RING.a * Math.pow(u, 1.2), wob: 0 }; }
+  const a = t - 2.5;
+  return { hc: 0, wob: 0.08 * Math.exp(-a * 3.2) * Math.cos(a * 22) };
+}
+const v3 = { add: (a, b) => a.map((x, i) => x + b[i]), mul: (a, k) => a.map((x) => x * k), lerp: (a, b, u) => a.map((x, i) => x + (b[i] - x) * u) };
+const rA = 1.07 * RING.a, rB = 2.2;
+const dEq = Math.sqrt(rA * rA + rB * rB - rA * rB);
+const PA = Track([
+  { t: 2.5, v: [RN[0] * 2.7, RN[1] * 2.7 + 0.05, RN[2] * 2.7] },
+  { t: 4.0, v: [1.6, 0.7, 2.2] },
+  { t: 6.0, v: [0.9, 1.05, 1.4] },
+  { t: 8.0, v: [0.3, 1.25, 0.7] },
+  { t: 8.5, v: [0.05, 1.28, 0.33], stop: true },
+  { t: 10.0, v: [0.04, 1.285, 0.32] },
+], { easeIn: false });
+function pairAxis(t) {
+  const a = lerp(-0.45, -0.75, Track.easeRange(t, 3.6, 8.2));
+  return norm([Math.cos(a), 0.08 + 0.08 * Math.sin(t * 0.6), -Math.sin(a)]);
+}
+function sep(t) {
+  if (t < 4.0) return rA + rB + 2.4 * Math.pow(4.0 - t, 1.2) + (t < 3.0 ? 3.5 * (3.0 - t) + 5. * Math.pow(3.0 - t, 2) : 0);
+  const a = t - 4.0, k = 1 - Math.exp(-a * 9) * (Math.cos(a * 24) + 0.4 * Math.sin(a * 24));
+  return lerp(rA + rB, dEq, clamp(k, 0, 1.3));
+}
+const CAM = Track([
+  // [pos xyz, target xyz, focal]
+  { t: 0.0, v: [...CAM0, 0.0, 0.05, 0.0, 2.0] },
+  { t: 1.3, v: [-0.5, 0.6, 6.3, 0.1, 0.1, 0.3, 2.0] },
+  { t: 2.35, v: [6.2, 1.0, 3.2, 0.0, 0.3, 1.5, 2.0] },
+  { t: 3.3, v: [7.0, 1.2, 9.6, 1.9, 0.65, 1.9, 2.0] },
+  { t: 4.0, v: [4.9, 1.2, 9.7, 2.4, 0.8, 1.9, 2.05] },
+  { t: 4.8, v: [4.3, 1.2, 9.0, 2.5, 0.9, 1.6, 2.1] },
+  { t: 6.5, v: [-0.6, 1.5, 9.2, 1.8, 1.1, 1.0, 2.05] },
+  { t: 8.0, v: [-1.5, 1.6, 9.0, 0.9, 1.25, 0.5, 2.05] },
+  { t: 8.5, v: [-0.5, 1.45, 8.1, 0.05, 1.3, 0.3, 2.15], stop: true },
+  { t: 10.0, v: [-0.47, 1.45, 8.05, 0.04, 1.3, 0.29, 2.15] },
+]);
+
+Reel.scene({
+  duration: 10, fps: 30,
+  cues: [
+    { t: 0.0, sfx: 'garden_air', gain: 0.7 },
+    { t: 1.5, sfx: 'breath_blow', gain: 0.85 }, { t: 2.5, sfx: 'film_pinch', gain: 0.8 },
+    { t: 3.0, sfx: 'bubble_drift', gain: 0.5 },
+    { t: 4.0, sfx: 'bubble_kiss', gain: 0.95 }, { t: 4.5, sfx: 'film_shimmer', gain: 0.7 },
+    { t: 8.0, sfx: 'bubble_pop', gain: 0.95 },
+  ],
+  render(t) {
+    const f = Math.round(t * 30);
+    const c = CAM(t);
+    const cp = cap(t);
+    const ringOn = t < 3.6 ? 1 : 0;
+    const aOn = f >= 75 ? 1 : 0;
+    const axn = pairAxis(t);
+    const pa = PA(Math.max(t, 2.5));
+    const wobA = f >= 75 ? 0.03 * Math.exp(-(t - 2.5) * 3) * Math.sin((t - 2.5) * 20) : 0;
+    // B drifts in from the right and from behind, then snaps against A along the pair axis
+    const sp = sep(t), touch = rA + rB;
+    const pb = v3.add(v3.add(pa, v3.mul(axn, Math.min(sp, touch))), v3.mul(norm([1, 0.05, -0.75]), Math.max(0, sp - touch)));
+    const bOn = 1;                                                     // B is always there: it drifts in from off-frame
+    // the burst: the hole opens on the beat frame's shutter and sweeps the film away in ~4 frames
+    const burst = f >= 240;
+    const hole = burst ? Math.min(Math.PI + 0.1, Math.max(0.03, (t - 7.97) * 24)) : 0;
+    const mist = t >= 7.97 ? t - 7.97 : 0;
+    const bAlive = bOn && hole < Math.PI + 0.05;
+    rm.set('uRo', c.slice(0, 3)).set('uTa', c.slice(3, 6)).set('uFL', c[6]).set('uT', t)
+      .set('uRC', RING.C).set('uRN', RN).set('uRA', RING.a).set('uHC', aOn ? 0 : cp.hc).set('uWob', cp.wob).set('uRingOn', ringOn)
+      .set('uA', [...pa, rA * (1 + wobA)]).set('uB', [...pb, rB]).set('uAB', [aOn, bAlive ? 1 : 0, t >= 4.0 && bAlive ? 1 : 0, Math.max(0, t - 4.0)])
+      .set('uBurst', [hole, mist, 0, 0]).set('uHole', axn)
+      .set('uRot', [0.3 + t * 0.12, 1.1 + t * 0.21, 1.2 - t * 0.15, 0.4 + t * 0.17]);
+    const focusP = t < 2.0 ? RING.C : t < 2.6 ? v3.add(RING.C, v3.mul(RN, cp.hc * 0.6)) : t < 4.0 ? pa : t < 8.0 ? v3.lerp(pa, pb, 0.4) : pa;
+    const focus = Math.hypot(c[0] - focusP[0], c[1] - focusP[1], c[2] - focusP[2]) - (t < 2.6 ? 0.2 : rA * 0.85);
+    rm.render(t, { focus, aperture: 18, maxCoc: 12 });
+  },
+});
+</script></body></html>
